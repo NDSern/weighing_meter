@@ -5,9 +5,9 @@ __pycache__/
 AGENTS.md
 
 # Runtime data
-logs/
-storage/
-captures/
+/logs/
+/storage/
+/captures/
 *.db
 *.db-shm
 *.db-wal
@@ -26,5 +26,4 @@ run_patched.py
 nhap.py
 demo
 
-services/blurry_alert/
 yolov5lpr/model/*.rknn
