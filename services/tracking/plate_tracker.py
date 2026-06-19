@@ -56,7 +56,7 @@ class PlateTracker:
                     self._plate_images.pop(weakest, None)
                 self._plate_images[plate_text] = (frame.copy(), camera_name, det_conf)
             if det_conf > self._image_conf:
-                self._image_frame = frame
+                self._image_frame = frame.copy()
                 self._image_plate = plate_text
                 self._image_camera = camera_name
                 self._image_conf = det_conf

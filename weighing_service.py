@@ -10,6 +10,7 @@ Weighing Service — DETECT-FIRST architecture.
 
 import ctypes
 import os
+import re
 import signal
 import sys
 import threading
@@ -127,6 +128,10 @@ def log(level: str, msg: str):
         fp.flush()
 
 
+def mask_url_secret(url: str):
+    return re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", str(url))
+
+
 # ── MinIO client ──────────────────────────────────────────────────
 _minio = Minio(
     MINIO_ENDPOINT,
@@ -233,9 +238,9 @@ def main():
     log("INFO", "=" * 60)
     log("INFO", "Weighing Service starting (DETECT-FIRST architecture)")
     log("INFO", f"Scale: {SERIAL_PORT} @ {BAUD_RATE}")
-    log("INFO", f"Camera 1 (full-frame LPR/result):  {RTSP_URL}")
-    log("INFO", f"Camera 3 (full-frame LPR/result):  {RTSP_URL_3}")
-    log("INFO", f"Camera 2 (rear result crop={CAM2_RESULT_CROP}):  {RTSP_URL_2}")
+    log("INFO", f"Camera 1 (full-frame LPR/result):  {mask_url_secret(RTSP_URL)}")
+    log("INFO", f"Camera 3 (full-frame LPR/result):  {mask_url_secret(RTSP_URL_3)}")
+    log("INFO", f"Camera 2 (rear result crop={CAM2_RESULT_CROP}):  {mask_url_secret(RTSP_URL_2)}")
     log("INFO", f"LPR detector: {LPR_DETECTOR_MODEL}")
     log("INFO", f"LPR OCR: {LPR_RECOGNIZER_MODEL}")
     log("INFO", f"Captures: {CAPTURE_DIR}")

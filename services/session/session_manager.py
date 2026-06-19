@@ -510,18 +510,19 @@ class SessionManager:
             log_fn("ERROR", f"Publish skipped — image capture failed for plate={plate}")
             return False
 
+        image_object_keys = result.pop("_image_object_keys", [])
+        image_paths = result.pop("_image_paths", [])
+        save_items = result.pop("_image_save_items", [])
+        if save_items and not ImageSaveWorker.save_and_enqueue_upload(save_items):
+            log_fn("ERROR", f"Publish skipped — local image save failed for plate={plate}")
+            return False
+
         saved_count = saveConfirmedLicensePlate(plate)
         if saved_count is not None:
             log_fn("PLATE_DB", f"Saved confirmed plate={plate} recognition_count={saved_count}")
 
-        image_object_keys = result.pop("_image_object_keys", [])
-        image_paths = result.pop("_image_paths", [])
-        save_items = result.pop("_image_save_items", [])
         if MQTT_ENABLED and self.mqtt_svc:
             PublishOutbox.enqueue(result, image_object_keys=image_object_keys, image_paths=image_paths)
-        if save_items and not ImageSaveWorker.save_and_enqueue_upload(save_items):
-            log_fn("WARNING", f"Publish queued offline — local image save incomplete for plate={plate}")
-        else:
             log_fn("OFFLINE", f"Publish queued offline id={result.get('offline_event_id')} plate={plate}")
 
         with self._publish_lock:
@@ -645,8 +646,10 @@ class SessionManager:
             unchosen_frame = self.session.lpr_start_frames.get(unchosen_camera)
             unchosen_key = f"unchosen_{unchosen_camera}"
             if unchosen_frame is not None and unchosen_key in paths:
-                ImageSaveWorker._encode_save_local(paths[unchosen_key][0], unchosen_frame)
-                log_fn("SAVE", f"Saved local-only unchosen LPR start image camera={unchosen_camera} plate={plate}")
+                if ImageSaveWorker.save_local_only(paths[unchosen_key][0], unchosen_frame):
+                    log_fn("SAVE", f"Saved local-only unchosen LPR start image camera={unchosen_camera} plate={plate}")
+                else:
+                    log_fn("WARNING", f"Failed local-only unchosen LPR start image camera={unchosen_camera} plate={plate}")
 
         result["photos"] = photos
         result["_image_object_keys"] = [item[2] for item in save_items]

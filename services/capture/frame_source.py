@@ -2,6 +2,7 @@
 
 import threading
 import time
+import re
 
 import cv2
 
@@ -20,6 +21,10 @@ def log(level: str, msg: str):
     """Log using the configured log function."""
     if _log_fn:
         _log_fn(level, msg)
+
+
+def mask_url_secret(url: str):
+    return re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", str(url))
 
 
 class _LatestFrameSource:
@@ -108,9 +113,9 @@ class FrameGrabber(_LatestFrameSource):
     def __init__(self, url: str):
         super().__init__(
             url=url,
-            start_log=f"FrameGrabber started. RTSP: {url}",
-            open_fail_log=f"FrameGrabber: cannot open {url}.",
-            connect_log=f"FrameGrabber: stream connected ({url})",
+            start_log=f"FrameGrabber started. RTSP: {mask_url_secret(url)}",
+            open_fail_log=f"FrameGrabber: cannot open {mask_url_secret(url)}.",
+            connect_log=f"FrameGrabber: stream connected ({mask_url_secret(url)})",
             grab_fail_log="FrameGrabber: frame grab failed — reconnecting...",
         )
 
@@ -124,7 +129,7 @@ class CameraGrabber(_LatestFrameSource):
         self.ocr = ocr
         super().__init__(
             url=url,
-            start_log=f"CameraGrabber [{name}] started. RTSP: {url}",
+            start_log=f"CameraGrabber [{name}] started. RTSP: {mask_url_secret(url)}",
             open_fail_log=f"[{name}] Cannot open RTSP stream.",
             connect_log=f"[{name}] RTSP stream connected.",
             grab_fail_log=f"[{name}] Frame grab failed — reconnecting...",

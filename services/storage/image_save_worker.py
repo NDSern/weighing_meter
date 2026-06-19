@@ -117,6 +117,14 @@ class ImageSaveWorker:
         return ok
 
     @staticmethod
+    def save_local_only(fpath, frame):
+        """Persist one image locally without adding a MinIO upload task."""
+        ImageSaveWorker._ensure_worker()
+        if frame is None:
+            return False
+        return ImageSaveWorker._encode_save_local(fpath, frame)
+
+    @staticmethod
     def _get_sync_executor():
         global _sync_executor
         with _sync_executor_lock:
