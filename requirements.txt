@@ -1,0 +1,8 @@
+minio
+numpy
+opencv-python-headless
+paho-mqtt
+pyserial
+python-dotenv
+requests
+rknn-toolkit-lite2

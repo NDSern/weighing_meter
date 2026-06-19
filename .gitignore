@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.log
+*.bak
+AGENTS.md
+
+# Runtime data
+logs/
+storage/
+captures/
+*.db
+*.db-shm
+*.db-wal
+
+# Host-local config
+config.local.py
+weighing_service.service
+
+# Local tooling and experiments
+.claude/
+backup/
+diagnostics/
+patches/
+tmp_*.py
+run_patched.py
+nhap.py
+demo
+
+services/blurry_alert/
+yolov5lpr/model/*.rknn
