@@ -133,9 +133,9 @@ class DetectCoordinator:
                 )
                 crop_parts = p["crop_size"].split("x")
                 cw, ch = int(crop_parts[0]), int(crop_parts[1])
-                self._tracker.add_observation(plate_text, p["det_conf"], cw, ch)
+                self._tracker.add_observation(plate_text, p["det_conf"], cw, ch, source="selected")
                 for alt_plate, _ in p.get("valid_candidates", [])[1:]:
-                    self._tracker.add_observation(alt_plate, p["det_conf"] * 0.5, cw, ch)
+                    self._tracker.add_observation(alt_plate, p["det_conf"] * 0.5, cw, ch, source="candidate")
                     self._tracker.update_image(alt_plate, p["det_conf"] * 0.5, full_frame, cam.name)
                 if p["det_conf"] > best_conf:
                     best_conf = p["det_conf"]
@@ -150,7 +150,7 @@ class DetectCoordinator:
                 crop_parts = p["crop_size"].split("x")
                 cw, ch = int(crop_parts[0]), int(crop_parts[1])
                 for alt_plate, _ in p.get("valid_candidates", []):
-                    self._tracker.add_observation(alt_plate, p["det_conf"] * 0.75, cw, ch)
+                    self._tracker.add_observation(alt_plate, p["det_conf"] * 0.75, cw, ch, source="candidate")
                     self._tracker.update_image(alt_plate, p["det_conf"] * 0.75, full_frame, cam.name)
                     if best_plate is None:
                         best_plate = alt_plate

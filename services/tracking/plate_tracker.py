@@ -1,6 +1,7 @@
 """PlateTracker — accumulates plate observations across a session."""
 
 import threading
+import time
 
 
 def _clean_plate(plate_text: str) -> str:
@@ -30,7 +31,7 @@ class PlateTracker:
     """Accumulates plate observations across a session and returns the most frequent plate."""
 
     def __init__(self):
-        self._observations = []  # list of (plate_text, weight)
+        self._observations = []  # list of (plate_text, weight, source, timestamp)
         self._lock = threading.Lock()
         self._image_frame = None  # full frame for saving on publish
         self._image_plate = None  # plate text associated with saved frame
@@ -40,11 +41,12 @@ class PlateTracker:
         self._undetectable_frame = None  # first "unknown" frame for undetectable save
         self._undetectable_saved = False  # only save once per session
 
-    def add_observation(self, plate_text: str, det_conf: float, crop_w: int, crop_h: int):
+    def add_observation(self, plate_text: str, det_conf: float, crop_w: int, crop_h: int, source: str = "selected"):
         crop_score = min(1.0, (crop_w * crop_h) / (200.0 * 60.0))
         weight = det_conf * crop_score
+        ts = time.time()
         with self._lock:
-            self._observations.append((plate_text, weight))
+            self._observations.append((plate_text, weight, source, ts))
 
     def update_image(self, plate_text: str, det_conf: float, frame, camera_name: str):
         """Store the best-confidence frame. Caller transfers ownership (no copy made)."""
@@ -63,20 +65,34 @@ class PlateTracker:
 
     def get_confirmed_plate(self):
         """Returns the most frequent session plate if it appears at least PLATE_CONFIRM_THRESHOLD times."""
-        from config import PLATE_CONFIRM_THRESHOLD
+        from config import MIN_PLATE_OBSERVATION_SPAN_SECONDS, MIN_SELECTED_PLATE_HITS, PLATE_CONFIRM_THRESHOLD
 
         with self._lock:
             scores = {}
             counts = {}
-            for plate, weight in self._observations:
+            selected_counts = {}
+            first_seen = {}
+            last_seen = {}
+            for plate, weight, source, ts in self._observations:
                 scores[plate] = scores.get(plate, 0.0) + weight
                 counts[plate] = counts.get(plate, 0) + 1
+                if source == "selected":
+                    selected_counts[plate] = selected_counts.get(plate, 0) + 1
+                first_seen[plate] = min(first_seen.get(plate, ts), ts)
+                last_seen[plate] = max(last_seen.get(plate, ts), ts)
 
         if not scores:
             return None, 0.0, 0
 
+        eligible = [
+            plate for plate in counts
+            if counts[plate] >= PLATE_CONFIRM_THRESHOLD
+            and selected_counts.get(plate, 0) >= MIN_SELECTED_PLATE_HITS
+            and (last_seen.get(plate, 0.0) - first_seen.get(plate, 0.0)) >= MIN_PLATE_OBSERVATION_SPAN_SECONDS
+        ]
         best = max(counts, key=lambda plate: (counts[plate], scores.get(plate, 0.0)))
-        if counts[best] >= PLATE_CONFIRM_THRESHOLD:
+        if eligible:
+            best = max(eligible, key=lambda plate: (counts[plate], scores.get(plate, 0.0)))
             return _prefer_detailed_variant(best, counts, scores)
         return None, scores[best], counts.get(best, 0)
 
@@ -84,7 +100,7 @@ class PlateTracker:
         """Returns {plate: count} for all plate observations in the current session."""
         with self._lock:
             counts = {}
-            for plate, weight in self._observations:
+            for plate, weight, _source, _ts in self._observations:
                 counts[plate] = counts.get(plate, 0) + 1
         return counts
 

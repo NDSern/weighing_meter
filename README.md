@@ -93,6 +93,7 @@ storage/undetectable/                 unknown plate evidence
 ## Plate Confirmation
 
 Plate observations are accumulated during active weighing sessions. A plate is confirmed when tracker count reaches `PLATE_CONFIRM_THRESHOLD`.
+Confirmation also requires the plate to be selected as the main OCR result at least `MIN_SELECTED_PLATE_HITS` times and observed across at least `MIN_PLATE_OBSERVATION_SPAN_SECONDS`. Alternate OCR candidates can support a selected plate, but cannot confirm a plate by themselves.
 
 Post-processing order:
 
