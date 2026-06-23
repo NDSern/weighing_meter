@@ -16,7 +16,7 @@ from services.storage.publish_outbox import PublishOutbox, set_log_fn as set_pub
 from config import (
     CAPTURE_DIR,
     MQTT_ENABLED,
-    SESSION_END_WEIGHT_DROP_THRESHOLD,
+    SESSION_END_EMPTY_DWELL_SECONDS,
     SERVICE_DIR,
     STABLE_COUNT_THRESHOLD,
     WEIGHT_CHANGE_THRESHOLD,
@@ -241,6 +241,7 @@ class WeighingSessionState:
         self.vehicle_type = None
         self.vehicle_was_stable = False
         self.both_unstable_since = None
+        self.empty_since = None
         self.skipped_duplicate_publish = False
         self.rearm_block_until = 0.0
         self.rearm_block_reason = None
@@ -323,15 +324,25 @@ class SessionManager:
             if self.session.stable_weight > WEIGHT_THRESHOLD:
                 self.session.last_publish_weight = frame.weight
                 self.session.last_publish_decimal_pos = frame.decimal_pos
-                if not self.session.session_active and self._can_start_session(log_fn):
+                if (
+                    not self.session.session_active
+                    and self.session.stable_count >= STABLE_COUNT_THRESHOLD
+                    and self._can_start_session(log_fn)
+                ):
                     self._start_session(frame.decimal_pos, log_fn)
         else:
             self.session.stable_count = 0
 
-        if self.session.session_active and frame.weight <= WEIGHT_THRESHOLD:
-            self._end_session("scale_empty", log_fn)
-            self.session.stable_weight = frame.weight
-            return
+        if self.session.session_active:
+            if frame.weight <= WEIGHT_THRESHOLD:
+                if self.session.empty_since is None:
+                    self.session.empty_since = time.time()
+                elif (time.time() - self.session.empty_since) >= SESSION_END_EMPTY_DWELL_SECONDS:
+                    self._end_session("scale_empty", log_fn)
+                    self.session.stable_weight = frame.weight
+                    return
+            else:
+                self.session.empty_since = None
 
         if self.session.session_active and self.vehicle_tracker:
             summary = self._get_vehicle_summary()
@@ -353,20 +364,12 @@ class SessionManager:
             else:
                 self.session.both_unstable_since = None
 
-        if (
-            self.session.session_active
-            and self.session.last_publish_weight is not None
-            and frame.weight <= (self.session.last_publish_weight - SESSION_END_WEIGHT_DROP_THRESHOLD)
-        ):
-            self._end_session("weight_drop", log_fn)
-
     def on_status_change(self, frame, old_status: str, new_status: str, log_fn):
         """Transition callback."""
         if frame.weight > WEIGHT_THRESHOLD:
             log_fn("SIGNAL", f"{old_status} → {new_status}  wt={frame.weight:.{frame.decimal_pos}f} kg")
 
         if new_status == "STABLE" and frame.weight <= WEIGHT_THRESHOLD:
-            self._end_session("scale_empty", log_fn)
             self.session.stable_weight = frame.weight
 
     def _can_start_session(self, log_fn):
@@ -447,6 +450,7 @@ class SessionManager:
         self.session.vehicle_type = None
         self.session.vehicle_was_stable = False
         self.session.both_unstable_since = None
+        self.session.empty_since = None
         self.session.skipped_duplicate_publish = False
         self.session.lpr_start_frames = {}
 

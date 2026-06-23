@@ -421,9 +421,8 @@ def detect_plate_regions(frame, detector=None, imgsz=960, conf_thres=None, iou_t
         else:
             h, w = crop_img.shape[:2]
             if w < _MIN_TRACK_CROP_W or h < _MIN_TRACK_CROP_H:
-                ocr_status = f"tiny_crop:{w}x{h}"
-                crop_img = None
-                two_row = False
+                del crop_img
+                continue
             else:
                 plate_class = CLASS_NAMES[int(classes[idx])] if int(classes[idx]) < len(CLASS_NAMES) else ""
                 two_row = plate_class == "BSV" and w / max(h, 1) < 2.2

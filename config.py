@@ -48,6 +48,7 @@ MINIO_SECRET_KEY = "smartport123"
 MINIO_BUCKET = "smartport"
 MINIO_SECURE = False
 STABLE_COUNT_THRESHOLD = 3
+SESSION_END_EMPTY_DWELL_SECONDS = 2.0
 
 LP_DETECTOR_RKNN = os.path.join(LPR_DIR, "model", "LP_detector.rknn")
 LP_OCR_RKNN = os.path.join(LPR_DIR, "model", "LP_ocr.rknn")
