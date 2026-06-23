@@ -9,7 +9,6 @@ import uuid
 from datetime import datetime
 
 from config import SERVICE_DIR
-from .image_save_worker import ImageSaveWorker
 
 _log_fn = None
 
@@ -34,7 +33,7 @@ _mqtt_svc = None
 
 
 class PublishOutbox:
-    """Persist finalized sessions until images are uploaded and MQTT acks."""
+    """Persist finalized sessions until local images exist and MQTT acks."""
 
     @staticmethod
     def start(mqtt_svc):
@@ -127,15 +126,10 @@ class PublishOutbox:
             event = _pending_events.get(event_id)
         if not event:
             return
-        image_object_keys = event.get("image_object_keys") or []
         missing_paths = [p for p in event.get("image_paths") or [] if not os.path.exists(p)]
         if missing_paths:
             log("OFFLINE", f"Waiting for local images event id={event_id} missing={len(missing_paths)}")
             time.sleep(10.0)
-            _publish_queue.put(event_id)
-            return
-        if ImageSaveWorker.has_pending(image_object_keys):
-            time.sleep(5.0)
             _publish_queue.put(event_id)
             return
         if _mqtt_svc is None:

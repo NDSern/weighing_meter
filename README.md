@@ -125,7 +125,9 @@ ambiguous matches keep OCR result
 
 ## Publishing Guarantees
 
-Evidence images are saved locally before MQTT outbox enqueue. MinIO upload failures stay in `storage/upload_pending.jsonl` and retry in background. MQTT events stay in `storage/publish_pending.jsonl` until required local images exist, MinIO uploads finish, and MQTT publish receives acknowledgement.
+Evidence images are saved locally before MQTT outbox enqueue. MinIO upload failures stay in `storage/upload_pending.jsonl` and retry in background. MQTT events stay in `storage/publish_pending.jsonl` until required local images exist and MQTT publish receives acknowledgement. MQTT publish does not wait for MinIO upload completion, so event rows can arrive before photo URLs become available in MinIO.
+
+Local images with pending MinIO uploads are protected from retention cleanup until their upload succeeds.
 
 Unchosen LPR camera images are saved locally only. They are not uploaded to MinIO and are not included in MQTT payloads.
 

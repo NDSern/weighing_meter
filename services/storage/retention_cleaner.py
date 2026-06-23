@@ -1,10 +1,13 @@
 """Image retention cleanup for local storage."""
 
+import json
 import os
 import re
 import threading
 import time
 from datetime import date, datetime
+
+from config import SERVICE_DIR
 
 CLEANED_SUFFIX = "--Cleaned"
 COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[_-]")
@@ -99,6 +102,25 @@ class ImageRetentionCleaner:
             return parsed, "filename_date"
         return datetime.fromtimestamp(stat.st_mtime), "mtime"
 
+    def _pending_upload_paths(self):
+        pending_file = os.path.join(SERVICE_DIR, "storage", "upload_pending.jsonl")
+        paths = set()
+        if not os.path.exists(pending_file):
+            return paths
+        try:
+            with open(pending_file, "r") as fp:
+                for line in fp:
+                    try:
+                        task = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    fpath = task.get("fpath")
+                    if fpath:
+                        paths.add(os.path.abspath(fpath))
+        except OSError as exc:
+            self._log("WARNING", f"Image retention pending upload read failed: {exc}")
+        return paths
+
     def _tag_cleaned_directories(self):
         tagged = 0
         tag_failed = 0
@@ -135,6 +157,8 @@ class ImageRetentionCleaner:
         deleted_by_path_date = 0
         deleted_by_filename_date = 0
         deleted_by_mtime = 0
+        skipped_pending_uploads = 0
+        pending_upload_paths = self._pending_upload_paths()
 
         for root in self.roots:
             if not os.path.isdir(root):
@@ -147,6 +171,9 @@ class ImageRetentionCleaner:
                         continue
                     fpath = os.path.join(dirpath, filename)
                     if os.path.islink(fpath):
+                        continue
+                    if os.path.abspath(fpath) in pending_upload_paths:
+                        skipped_pending_uploads += 1
                         continue
                     scanned += 1
                     try:
@@ -184,6 +211,7 @@ class ImageRetentionCleaner:
             f"tagged={tagged} tag_failed={tag_failed} "
             f"deleted_by_path_date={deleted_by_path_date} "
             f"deleted_by_filename_date={deleted_by_filename_date} deleted_by_mtime={deleted_by_mtime} "
+            f"skipped_pending_uploads={skipped_pending_uploads} "
             f"reclaimed={reclaimed / (1024 * 1024):.1f}MB cutoff_days={self.retention_days}",
         )
         return {
@@ -196,4 +224,5 @@ class ImageRetentionCleaner:
             "deleted_by_path_date": deleted_by_path_date,
             "deleted_by_filename_date": deleted_by_filename_date,
             "deleted_by_mtime": deleted_by_mtime,
+            "skipped_pending_uploads": skipped_pending_uploads,
         }
