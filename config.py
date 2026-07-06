@@ -7,9 +7,9 @@ LPR_DIR = os.path.join(SERVICE_DIR, "yolov5lpr")
 
 SERIAL_PORT = "/dev/ttyS6"
 BAUD_RATE = 9600
-RTSP_URL = "rtsp://192.168.1.181:554/live/0/MAIN"
+RTSP_URL = "rtsp://admin:123456@192.168.1.181:554/ch01/0"
 RTSP_URL_2 = "rtsp://admin:123456@192.168.1.179:554/ch01/0"
-RTSP_URL_3 = "rtsp://192.168.1.177:554/live/0/MAIN"
+RTSP_URL_3 = "rtsp://admin:123456@192.168.1.177:554/ch01/0"
 
 WEIGHT_THRESHOLD = 100.0
 LOG_PRINT_INTERVAL = 1.0
