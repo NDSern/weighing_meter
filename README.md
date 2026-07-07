@@ -95,6 +95,57 @@ storage/undetectable/                 unknown plate evidence
 Plate observations are accumulated during active weighing sessions. A plate is confirmed when tracker count reaches `PLATE_CONFIRM_THRESHOLD`.
 Confirmation also requires the plate to be selected as the main OCR result at least `MIN_SELECTED_PLATE_HITS` times and observed across at least `MIN_PLATE_OBSERVATION_SPAN_SECONDS`. Alternate OCR candidates can support a selected plate, but cannot confirm a plate by themselves.
 
+## LPR Model Behavior
+
+The production pipeline currently uses the YOLOv8-OBB RKNN detector and PP-OCR RKNN recognizer:
+
+```text
+models/lpr/license_plate_detector.rknn      YOLOv8 oriented-box plate detector
+models/lpr/license_plate_recognizer.rknn    PP-OCR CTC plate recognizer
+```
+
+Observed behavior from the RK3588 comparison harness:
+
+```text
+normal/close plate crops       OBB detector is best
+high-resolution full scenes    old axis YOLO detector is more reliable
+```
+
+Normal or close plate images work well with the OBB detector because the plate remains large enough after resize to `LPR_IMAGE_SIZE = 960`. The OBB crop also preserves rotation and improves OCR on compact or two-row plates.
+
+High-resolution weighbridge frames, such as 2880x1620 full-scene camera images, shrink the plate heavily before OBB inference. In the remote test harness, OBB scene detection missed all evaluated sessions even with scene tiling, while the older axis-aligned YOLO detector found usable low-confidence boxes when combined with geometry filters and session voting.
+
+Remote high-resolution comparison summary:
+
+```text
+OBB scene profile       0/5 valid session majorities
+axis YOLO scene profile 5/5 valid session majorities
+```
+
+Axis YOLO scene results from the remote harness:
+
+```text
+session_01 -> 14C-017.80
+session_04 -> 14C-017.80
+session_05 -> 24H-5016
+session_08 -> 14C-017.80
+session_10 -> 34H-605.21
+```
+
+Practical guidance:
+
+```text
+Keep OBB as primary for normal/close plates.
+Use old axis YOLO only as a high-resolution full-frame fallback when OBB misses.
+Do not lower detector confidence globally without geometry filters and session voting.
+```
+
+Relevant old axis detector path already exists in config:
+
+```python
+LP_DETECTOR_RKNN = os.path.join(LPR_DIR, "model", "LP_detector.rknn")
+```
+
 Post-processing order:
 
 ```text
