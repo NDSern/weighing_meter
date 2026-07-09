@@ -246,6 +246,7 @@ class WeighingSessionState:
         self.rearm_block_until = 0.0
         self.rearm_block_reason = None
         self.lpr_start_frames = {}
+        self.rear_start_frame = None
 
 
 class SessionManager:
@@ -386,6 +387,7 @@ class SessionManager:
         self.session.rearm_block_until = 0.0
         self.session.rearm_block_reason = None
         self.session.lpr_start_frames = self._capture_lpr_start_frames(log_fn)
+        self.session.rear_start_frame = self._capture_rear_start_frame(log_fn)
         self.session.session_active = True
         self.session.session_had_weight = True
         self.session.stable_decimal_pos = decimal_pos
@@ -409,6 +411,17 @@ class SessionManager:
             status = " ".join(f"{name}={'yes' if name in frames else 'no'}" for name in sorted(self.lpr_grabbers))
             log_fn("EVENT", f"Session start snapshots {status}")
         return frames
+
+    def _capture_rear_start_frame(self, log_fn):
+        if not self.rear_grabber:
+            return None
+        try:
+            frame = self.rear_grabber.peek_latest_frame(copy_frame=True)
+        except Exception as exc:
+            log_fn("ERROR", f"Session start rear snapshot failed camera=cam2: {exc}")
+            return None
+        log_fn("EVENT", f"Session start rear snapshot cam2={'yes' if frame is not None else 'no'}")
+        return frame
 
     def _end_session(self, reason: str, log_fn):
         if not self.session.session_active:
@@ -453,6 +466,7 @@ class SessionManager:
         self.session.empty_since = None
         self.session.skipped_duplicate_publish = False
         self.session.lpr_start_frames = {}
+        self.session.rear_start_frame = None
 
     def _publish_on_session_end(self, reason: str, log_fn):
         if self.session.published_this_stop:
@@ -622,7 +636,9 @@ class SessionManager:
         now = datetime.now()
         captured_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         paths = self._prepare_capture_paths(now, plate)
-        rear_frame = self.rear_grabber.get_latest_frame() if self.rear_grabber else None
+        rear_frame = self.session.rear_start_frame
+        if rear_frame is None and self.rear_grabber:
+            rear_frame = self.rear_grabber.get_latest_frame()
         if rear_frame is not None:
             rear_frame = self._crop_cam2_result_image(rear_frame)
         front_img, merged_img, rear_img = self._build_publish_images(
