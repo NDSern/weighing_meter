@@ -48,7 +48,9 @@ sys.path.insert(0, LPR_DIR)
 
 from config import (
     BAUD_RATE,
+    CAM1_LPR_CROP,
     CAM2_RESULT_CROP,
+    CAM3_LPR_CROP,
     CAPTURE_DIR,
     DETECT_FPS,
     IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
@@ -238,8 +240,8 @@ def main():
     log("INFO", "=" * 60)
     log("INFO", "Weighing Service starting (DETECT-FIRST architecture)")
     log("INFO", f"Scale: {SERIAL_PORT} @ {BAUD_RATE}")
-    log("INFO", f"Camera 1 (full-frame LPR/result):  {mask_url_secret(RTSP_URL)}")
-    log("INFO", f"Camera 3 (full-frame LPR/result):  {mask_url_secret(RTSP_URL_3)}")
+    log("INFO", f"Camera 1 (LPR crop={CAM1_LPR_CROP}, full-frame result):  {mask_url_secret(RTSP_URL)}")
+    log("INFO", f"Camera 3 (LPR crop={CAM3_LPR_CROP}, full-frame result):  {mask_url_secret(RTSP_URL_3)}")
     log("INFO", f"Camera 2 (rear result crop={CAM2_RESULT_CROP}):  {mask_url_secret(RTSP_URL_2)}")
     log("INFO", f"LPR detector: {LPR_DETECTOR_MODEL}")
     log("INFO", f"LPR OCR: {LPR_RECOGNIZER_MODEL}")
