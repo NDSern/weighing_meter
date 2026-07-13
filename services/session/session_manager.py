@@ -17,8 +17,10 @@ from config import (
     CAPTURE_DIR,
     MQTT_ENABLED,
     SESSION_END_EMPTY_DWELL_SECONDS,
+    SESSION_MIN_DURATION_SECONDS,
     SERVICE_DIR,
     STABLE_COUNT_THRESHOLD,
+    VEHICLE_LEFT_DWELL_SECONDS,
     WEIGHT_CHANGE_THRESHOLD,
     WEIGHT_THRESHOLD,
 )
@@ -247,6 +249,7 @@ class WeighingSessionState:
         self.rearm_block_reason = None
         self.lpr_start_frames = {}
         self.rear_start_frame = None
+        self.started_at = None
 
 
 class SessionManager:
@@ -358,9 +361,12 @@ class SessionManager:
 
             both_unstable = summary["cam1_truck_unstable"] and summary["cam3_truck_unstable"]
             if self.session.vehicle_was_stable and both_unstable:
-                if self.session.both_unstable_since is None:
+                session_age = time.time() - (self.session.started_at or time.time())
+                if session_age < SESSION_MIN_DURATION_SECONDS:
+                    self.session.both_unstable_since = None
+                elif self.session.both_unstable_since is None:
                     self.session.both_unstable_since = time.time()
-                elif (time.time() - self.session.both_unstable_since) > 0.5:
+                elif (time.time() - self.session.both_unstable_since) >= VEHICLE_LEFT_DWELL_SECONDS:
                     self._end_session("vehicle_left", log_fn)
             else:
                 self.session.both_unstable_since = None
@@ -389,6 +395,7 @@ class SessionManager:
         self.session.lpr_start_frames = self._capture_lpr_start_frames(log_fn)
         self.session.rear_start_frame = self._capture_rear_start_frame(log_fn)
         self.session.session_active = True
+        self.session.started_at = time.time()
         self.session.session_had_weight = True
         self.session.stable_decimal_pos = decimal_pos
         self.session.last_publish_weight = self.session.stable_weight
@@ -467,6 +474,7 @@ class SessionManager:
         self.session.skipped_duplicate_publish = False
         self.session.lpr_start_frames = {}
         self.session.rear_start_frame = None
+        self.session.started_at = None
 
     def _publish_on_session_end(self, reason: str, log_fn):
         if self.session.published_this_stop:
