@@ -123,10 +123,11 @@ class FrameGrabber(_LatestFrameSource):
 class CameraGrabber(_LatestFrameSource):
     """Latest-frame RTSP source for LPR cameras. Detection is handled externally."""
 
-    def __init__(self, url: str, name: str = "cam1", detector=None, ocr=None):
+    def __init__(self, url: str, name: str = "cam1", detector=None, ocr=None, lpr_crop: str = "full"):
         self.name = name
         self.detector = detector
         self.ocr = ocr
+        self.lpr_crop = lpr_crop
         super().__init__(
             url=url,
             start_log=f"CameraGrabber [{name}] started. RTSP: {mask_url_secret(url)}",

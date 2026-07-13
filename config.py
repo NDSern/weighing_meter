@@ -77,7 +77,7 @@ MIN_PLATE_OBSERVATION_SPAN_SECONDS = 1.0
 WEIGHT_CHANGE_THRESHOLD = 500.0
 SESSION_END_WEIGHT_DROP_THRESHOLD = 300.0
 
-# Main pipeline uses full cam1/cam3 frames. Only cam2 rear result image is cropped.
+# Main pipeline defaults to full cam1/cam3 frames. Crop modes apply only to LPR inference.
 CAM2_RESULT_CROP = "left"  # "left", "right", or "full"
 
 # Kept for scripts that still import these names; production cam1/cam3 use full frames.

@@ -256,10 +256,10 @@ def main():
     else:
         log("INFO", "MQTT disabled (MQTT_ENABLED=False)")
 
-    cam1 = CameraGrabber(url=RTSP_URL, name="cam1", detector=rknn_detector, ocr=rknn_ocr)
+    cam1 = CameraGrabber(url=RTSP_URL, name="cam1", detector=rknn_detector, ocr=rknn_ocr, lpr_crop=CAM1_LPR_CROP)
     cam1.start()
 
-    cam3 = CameraGrabber(url=RTSP_URL_3, name="cam3", detector=rknn_detector_2, ocr=rknn_ocr_2)
+    cam3 = CameraGrabber(url=RTSP_URL_3, name="cam3", detector=rknn_detector_2, ocr=rknn_ocr_2, lpr_crop=CAM3_LPR_CROP)
     cam3.start()
 
     detect_coord = DetectCoordinator(

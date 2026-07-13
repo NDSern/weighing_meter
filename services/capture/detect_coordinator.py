@@ -5,6 +5,34 @@ import time
 
 from config import DETECT_FPS, YOLO26_DETECT_FPS
 
+
+def crop_lpr_frame(frame, mode):
+    h, w = frame.shape[:2]
+    if mode == "full":
+        return frame, 0, 0
+    x2 = (2 * w) // 3
+    y_mid = h // 2
+    if mode == "bottom_left_two_thirds":
+        return frame[y_mid:h, :x2], 0, y_mid
+    if mode == "top_left_two_thirds":
+        return frame[:y_mid, :x2], 0, 0
+    raise ValueError(f"Invalid LPR crop mode: {mode!r}")
+
+
+def remap_lpr_regions(regions, dx, dy):
+    if not dx and not dy:
+        return regions
+    remapped = []
+    for region in regions:
+        item = dict(region)
+        if item.get("bbox"):
+            item["bbox"] = [item["bbox"][0] + dx, item["bbox"][1] + dy,
+                             item["bbox"][2] + dx, item["bbox"][3] + dy]
+        if item.get("obb"):
+            item["obb"] = [[point[0] + dx, point[1] + dy] for point in item["obb"]]
+        remapped.append(item)
+    return remapped
+
 _log_fn = None
 
 
@@ -228,10 +256,13 @@ class DetectCoordinator:
         """Run detection for one camera. Feeds tracker directly."""
         t0 = time.time()
         if self._detect_regions_fn and self._recognize_regions_fn:
-            regions = self._detect_regions_fn(full_frame, detector=cam.detector)
+            lpr_frame, dx, dy = crop_lpr_frame(full_frame, cam.lpr_crop)
+            regions = self._detect_regions_fn(lpr_frame, detector=cam.detector)
+            regions = remap_lpr_regions(regions, dx, dy)
             elapsed_ms = (time.time() - t0) * 1000
-            if regions:
-                log("TIMING", f"[{cam.name}] Detect: {elapsed_ms:.0f}ms  regions={len(regions)}")
+            log("TIMING", f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
+                           f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
+                           f"input={lpr_frame.shape[1]}x{lpr_frame.shape[0]}")
             self._submit_ocr_job(cam, full_frame, regions, t0)
             return
         plates = self._detect_plates_fn(full_frame, detector=cam.detector, ocr=cam.ocr)
