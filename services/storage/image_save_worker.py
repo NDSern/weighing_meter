@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import cv2
 from minio import Minio
@@ -18,9 +19,11 @@ from config import (
     MINIO_ENDPOINT,
     MINIO_SECRET_KEY,
     MINIO_SECURE,
+    PENDING_RETENTION_DAYS,
     RESULT_JPEG_QUALITY,
     SERVICE_DIR,
 )
+from services.storage.dead_letter import append_dead_letter, is_expired
 
 _log_fn = None
 
@@ -144,6 +147,24 @@ class ImageSaveWorker:
         return False
 
     @staticmethod
+    def stop(timeout=5.0):
+        """Stop background workers after pending tasks have been persisted."""
+        global _worker_started, _worker_thread, _sync_executor
+        _stop_event.set()
+        if _worker_thread:
+            _worker_thread.join(timeout=timeout)
+            if _worker_thread.is_alive():
+                return False
+        with _worker_lock:
+            _worker_started = False
+            _worker_thread = None
+        with _sync_executor_lock:
+            if _sync_executor is not None:
+                _sync_executor.shutdown(wait=True)
+                _sync_executor = None
+        return True
+
+    @staticmethod
     def has_pending(object_keys):
         ImageSaveWorker._ensure_worker()
         with _pending_lock:
@@ -167,7 +188,8 @@ class ImageSaveWorker:
         fname = os.path.basename(fpath)
         try:
             os.makedirs(os.path.dirname(fpath), exist_ok=True)
-            cv2.imwrite(fpath, frame)
+            if not cv2.imwrite(fpath, frame):
+                raise OSError("cv2.imwrite returned false")
             log("SAVE", f"Saved {fname}")
             return True
         except Exception as exc:
@@ -274,12 +296,22 @@ class ImageSaveWorker:
                     try:
                         task = json.loads(line)
                     except json.JSONDecodeError:
+                        append_dead_letter("malformed", {"raw": line.rstrip()}, "invalid upload JSON", "malformed")
                         continue
                     fpath = task.get("fpath")
                     object_key = task.get("object_key")
-                    if not fpath or not object_key or not os.path.exists(fpath):
+                    if not fpath or not object_key:
+                        append_dead_letter("malformed", task, "incomplete upload record", "malformed")
                         continue
-                    _pending_tasks[object_key] = {"fpath": fpath, "object_key": object_key}
+                    if not os.path.exists(fpath):
+                        append_dead_letter("minio", task, "local file missing", "missing_file")
+                        continue
+                    _pending_tasks[object_key] = {
+                        "fpath": fpath,
+                        "object_key": object_key,
+                        "created_at": task.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+                    }
+            ImageSaveWorker._persist_pending_locked()
             for task in _pending_tasks.values():
                 _upload_queue.put(task)
         if _pending_tasks:
@@ -298,7 +330,11 @@ class ImageSaveWorker:
 
     @staticmethod
     def _enqueue_upload(fpath, object_key):
-        task = {"fpath": fpath, "object_key": object_key}
+        task = {
+            "fpath": fpath,
+            "object_key": object_key,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
         with _pending_lock:
             _pending_tasks[object_key] = task
             ImageSaveWorker._persist_pending_locked()
@@ -319,6 +355,10 @@ class ImageSaveWorker:
                 continue
             try:
                 ImageSaveWorker._upload_task(task)
+            except Exception as exc:
+                log("ERROR", f"MinIO upload worker error: {exc}")
+                time.sleep(2.0)
+                _upload_queue.put(task)
             finally:
                 _upload_queue.task_done()
 
@@ -330,8 +370,15 @@ class ImageSaveWorker:
             pending = _pending_tasks.get(object_key)
             if pending != task:
                 return
+        if is_expired(task.get("created_at"), PENDING_RETENTION_DAYS):
+            append_dead_letter("minio", task, "pending upload exceeded retry retention", "expired")
+            ImageSaveWorker._mark_uploaded(object_key)
+            log("ERROR", f"Moved expired upload to dead letter: {object_key}")
+            return
         if not os.path.exists(fpath):
             log("ERROR", f"MinIO upload skipped; local file missing: {fpath}")
+            append_dead_letter("minio", task, "local file missing", "missing_file")
+            ImageSaveWorker._mark_uploaded(object_key)
             return
 
         log("MINIO", f"Uploading {object_key} ...")

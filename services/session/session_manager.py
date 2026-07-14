@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections import Counter, deque
 from datetime import datetime, timezone
 
 import cv2
@@ -18,6 +19,10 @@ from config import (
     MQTT_ENABLED,
     SESSION_END_EMPTY_DWELL_SECONDS,
     SESSION_MIN_DURATION_SECONDS,
+    SESSION_REARM_DELAY_SECONDS,
+    SESSION_STABLE_WEIGHT_WINDOW,
+    SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS,
+    SESSION_WEIGHT_DEPARTURE_KG,
     SERVICE_DIR,
     STABLE_COUNT_THRESHOLD,
     VEHICLE_LEFT_DWELL_SECONDS,
@@ -33,6 +38,7 @@ _registry_mtime = None
 _registry_exact = {}
 _registry_family = {}
 _registry_active_count = 0
+MAX_STABLE_WEIGHT_CANDIDATES = 256
 
 
 def set_log_fn(log_fn):
@@ -237,6 +243,14 @@ class WeighingSessionState:
         self.last_publish_weight = None
         self.last_publish_decimal_pos = 0
         self.stable_count = 0
+        self.stable_weight_counts = Counter()
+        self.stable_weight_last_seen = {}
+        self.stable_weight_decimal_pos = {}
+        self.stable_weight_history = deque(maxlen=SESSION_STABLE_WEIGHT_WINDOW)
+        self.stable_weight_sequence = 0
+        self.latest_stable_weight = None
+        self.weight_departure_since = None
+        self.weight_departure_baseline = None
         self.session_active = False
         self.published_this_stop = False
         self.session_had_weight = False
@@ -247,9 +261,70 @@ class WeighingSessionState:
         self.skipped_duplicate_publish = False
         self.rearm_block_until = 0.0
         self.rearm_block_reason = None
+        self.rearm_reference_weight = None
         self.lpr_start_frames = {}
         self.rear_start_frame = None
         self.started_at = None
+
+    def record_stable_weight(self, weight, decimal_pos):
+        self.latest_stable_weight = weight
+        if not self.session_active:
+            self.weight_departure_baseline = weight
+            self.stable_weight = weight
+            self.stable_decimal_pos = decimal_pos
+            return
+
+        self.stable_weight_sequence += 1
+        if len(self.stable_weight_history) == self.stable_weight_history.maxlen:
+            expired_weight, _expired_decimal_pos = self.stable_weight_history.popleft()
+            self.stable_weight_counts[expired_weight] -= 1
+            if self.stable_weight_counts[expired_weight] <= 0:
+                self.stable_weight_counts.pop(expired_weight, None)
+                self.stable_weight_last_seen.pop(expired_weight, None)
+                self.stable_weight_decimal_pos.pop(expired_weight, None)
+        self.stable_weight_history.append((weight, decimal_pos))
+        self.stable_weight_counts[weight] += 1
+        self.stable_weight_last_seen[weight] = self.stable_weight_sequence
+        self.stable_weight_decimal_pos[weight] = decimal_pos
+        if len(self.stable_weight_counts) > MAX_STABLE_WEIGHT_CANDIDATES:
+            oldest_weakest = min(
+                self.stable_weight_counts,
+                key=lambda value: (
+                    self.stable_weight_counts[value],
+                    self.stable_weight_last_seen[value],
+                ),
+            )
+            self.stable_weight_counts.pop(oldest_weakest)
+            self.stable_weight_last_seen.pop(oldest_weakest, None)
+        self.stable_weight = max(
+            self.stable_weight_counts,
+            key=lambda value: (
+                self.stable_weight_counts[value],
+                self.stable_weight_last_seen[value],
+            ),
+        )
+        self.stable_decimal_pos = self.stable_weight_decimal_pos[self.stable_weight]
+
+    def start_stable_weight_history(self):
+        self.stable_weight_counts.clear()
+        self.stable_weight_last_seen.clear()
+        self.stable_weight_decimal_pos.clear()
+        self.stable_weight_history.clear()
+        self.stable_weight_sequence = 1
+        self.stable_weight_history.append((self.stable_weight, self.stable_decimal_pos))
+        self.stable_weight_counts[self.stable_weight] = 1
+        self.stable_weight_last_seen[self.stable_weight] = 1
+        self.stable_weight_decimal_pos[self.stable_weight] = self.stable_decimal_pos
+
+    def clear_stable_weight_history(self):
+        self.stable_weight_counts.clear()
+        self.stable_weight_last_seen.clear()
+        self.stable_weight_decimal_pos.clear()
+        self.stable_weight_history.clear()
+        self.stable_weight_sequence = 0
+        self.latest_stable_weight = None
+        self.weight_departure_since = None
+        self.weight_departure_baseline = None
 
 
 class SessionManager:
@@ -285,8 +360,6 @@ class SessionManager:
         self._publish_lock = threading.Lock()
         self._vehicle_summary_cache = None
         self._vehicle_summary_ts = 0.0
-        if MQTT_ENABLED and self.mqtt_svc:
-            PublishOutbox.start(self.mqtt_svc)
 
     def _get_vehicle_summary(self, max_age=0.25):
         if not self.vehicle_tracker:
@@ -322,54 +395,102 @@ class SessionManager:
     def on_frame(self, frame, log_fn):
         """Per-frame callback (fires on every scale frame)."""
         if frame.status == "STABLE":
-            self.session.stable_weight = frame.weight
-            self.session.stable_decimal_pos = frame.decimal_pos
-            self.session.stable_count += 1
-            if self.session.stable_weight > WEIGHT_THRESHOLD:
-                self.session.last_publish_weight = frame.weight
-                self.session.last_publish_decimal_pos = frame.decimal_pos
-                if (
-                    not self.session.session_active
-                    and self.session.stable_count >= STABLE_COUNT_THRESHOLD
-                    and self._can_start_session(log_fn)
-                ):
-                    self._start_session(frame.decimal_pos, log_fn)
+            self._handle_stable_frame(frame, log_fn)
         else:
             self.session.stable_count = 0
 
-        if self.session.session_active:
-            if frame.weight <= WEIGHT_THRESHOLD:
-                if self.session.empty_since is None:
-                    self.session.empty_since = time.time()
-                elif (time.time() - self.session.empty_since) >= SESSION_END_EMPTY_DWELL_SECONDS:
-                    self._end_session("scale_empty", log_fn)
-                    self.session.stable_weight = frame.weight
-                    return
-            else:
-                self.session.empty_since = None
+        if self._check_weight_departure(frame, log_fn):
+            return
+        if self._check_scale_empty(frame, log_fn):
+            return
+        self._update_vehicle_state(log_fn)
 
-        if self.session.session_active and self.vehicle_tracker:
-            summary = self._get_vehicle_summary()
-            if summary["vehicle_type"] and summary["vehicle_type"] != self.session.vehicle_type:
-                self.session.vehicle_type = summary["vehicle_type"]
-                log_fn("VEHICLE", f"Session vehicle_type={self.session.vehicle_type}")
+    def _handle_stable_frame(self, frame, log_fn):
+        stable_weight = frame.stable_weight if frame.stable_weight is not None else frame.weight
+        self.session.record_stable_weight(stable_weight, frame.decimal_pos)
+        self.session.stable_count += 1
+        if self.session.stable_weight <= WEIGHT_THRESHOLD:
+            return
 
-            if summary["cam1_truck_stable"] or summary["cam3_truck_stable"]:
-                if not self.session.vehicle_was_stable:
-                    log_fn("VEHICLE", "Session truck stabilized")
-                self.session.vehicle_was_stable = True
+        self.session.last_publish_weight = self.session.stable_weight
+        self.session.last_publish_decimal_pos = self.session.stable_decimal_pos
+        if (
+            not self.session.session_active
+            and self.session.stable_count >= STABLE_COUNT_THRESHOLD
+            and self._can_start_session(log_fn)
+        ):
+            self._start_session(frame.decimal_pos, log_fn)
 
-            both_unstable = summary["cam1_truck_unstable"] and summary["cam3_truck_unstable"]
-            if self.session.vehicle_was_stable and both_unstable:
-                session_age = time.time() - (self.session.started_at or time.time())
-                if session_age < SESSION_MIN_DURATION_SECONDS:
-                    self.session.both_unstable_since = None
-                elif self.session.both_unstable_since is None:
-                    self.session.both_unstable_since = time.time()
-                elif (time.time() - self.session.both_unstable_since) >= VEHICLE_LEFT_DWELL_SECONDS:
-                    self._end_session("vehicle_left", log_fn)
-            else:
-                self.session.both_unstable_since = None
+    def _check_weight_departure(self, frame, log_fn):
+        if not self.session.session_active:
+            return False
+
+        if (
+            self.session.weight_departure_baseline is None
+            or frame.weight <= WEIGHT_THRESHOLD
+        ):
+            self.session.weight_departure_since = None
+            return False
+
+        departure_weight = self.session.weight_departure_baseline - SESSION_WEIGHT_DEPARTURE_KG
+        if frame.weight > departure_weight:
+            self.session.weight_departure_since = None
+            self.session.weight_departure_baseline = max(
+                self.session.weight_departure_baseline,
+                self.session.latest_stable_weight,
+            )
+            return False
+        if self.session.weight_departure_since is None:
+            self.session.weight_departure_since = time.time()
+            return False
+        if (time.time() - self.session.weight_departure_since) < SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS:
+            return False
+
+        self._end_session("weight_departure", log_fn)
+        return True
+
+    def _check_scale_empty(self, frame, log_fn):
+        if not self.session.session_active:
+            return False
+        if frame.weight > WEIGHT_THRESHOLD:
+            self.session.empty_since = None
+            return False
+        if self.session.empty_since is None:
+            self.session.empty_since = time.time()
+            return False
+        if (time.time() - self.session.empty_since) < SESSION_END_EMPTY_DWELL_SECONDS:
+            return False
+
+        self._end_session("scale_empty", log_fn)
+        self.session.stable_weight = frame.weight
+        return True
+
+    def _update_vehicle_state(self, log_fn):
+        if not self.session.session_active or not self.vehicle_tracker:
+            return
+
+        summary = self._get_vehicle_summary()
+        if summary["vehicle_type"] and summary["vehicle_type"] != self.session.vehicle_type:
+            self.session.vehicle_type = summary["vehicle_type"]
+            log_fn("VEHICLE", f"Session vehicle_type={self.session.vehicle_type}")
+
+        if summary["cam1_truck_stable"] or summary["cam3_truck_stable"]:
+            if not self.session.vehicle_was_stable:
+                log_fn("VEHICLE", "Session truck stabilized")
+            self.session.vehicle_was_stable = True
+
+        both_unstable = summary["cam1_truck_unstable"] and summary["cam3_truck_unstable"]
+        if not self.session.vehicle_was_stable or not both_unstable:
+            self.session.both_unstable_since = None
+            return
+
+        session_age = time.time() - (self.session.started_at or time.time())
+        if session_age < SESSION_MIN_DURATION_SECONDS:
+            self.session.both_unstable_since = None
+        elif self.session.both_unstable_since is None:
+            self.session.both_unstable_since = time.time()
+        elif (time.time() - self.session.both_unstable_since) >= VEHICLE_LEFT_DWELL_SECONDS:
+            self._end_session("vehicle_left", log_fn)
 
     def on_status_change(self, frame, old_status: str, new_status: str, log_fn):
         """Transition callback."""
@@ -382,21 +503,30 @@ class SessionManager:
     def _can_start_session(self, log_fn):
         if self.session.rearm_block_until <= 0:
             return True
+        if time.time() < self.session.rearm_block_until:
+            return False
+        if (
+            self.session.rearm_reference_weight is not None
+            and abs(self.session.stable_weight - self.session.rearm_reference_weight) < SESSION_WEIGHT_DEPARTURE_KG
+        ):
+            return False
         if time.time() >= self.session.rearm_block_until:
             log_fn("EVENT", f"Session rearm after {self.session.rearm_block_reason or 'unknown'} timeout")
             self.session.rearm_block_until = 0.0
             self.session.rearm_block_reason = None
+            self.session.rearm_reference_weight = None
             return True
-        return False
 
     def _start_session(self, decimal_pos: int, log_fn):
         self.session.rearm_block_until = 0.0
         self.session.rearm_block_reason = None
+        self.session.rearm_reference_weight = None
         self.session.lpr_start_frames = self._capture_lpr_start_frames(log_fn)
         self.session.rear_start_frame = self._capture_rear_start_frame(log_fn)
         self.session.session_active = True
         self.session.started_at = time.time()
         self.session.session_had_weight = True
+        self.session.start_stable_weight_history()
         self.session.stable_decimal_pos = decimal_pos
         self.session.last_publish_weight = self.session.stable_weight
         self.session.last_publish_decimal_pos = decimal_pos
@@ -450,13 +580,15 @@ class SessionManager:
             f"publish_on_end={published_on_end} lpr=off =====",
         )
 
-        if reason == "vehicle_left" and (self.session.stable_weight or 0) > WEIGHT_THRESHOLD:
-            self.session.rearm_block_until = time.time() + 5.0
+        if reason in ("vehicle_left", "weight_departure") and (self.session.stable_weight or 0) > WEIGHT_THRESHOLD:
+            self.session.rearm_block_until = time.time() + SESSION_REARM_DELAY_SECONDS
             self.session.rearm_block_reason = reason
-            log_fn("EVENT", "Session rearm blocked for 5s after vehicle_left with weight still on scale")
+            self.session.rearm_reference_weight = self.session.stable_weight
+            log_fn("EVENT", f"Session rearm blocked for {SESSION_REARM_DELAY_SECONDS:g}s after {reason}")
         else:
             self.session.rearm_block_until = 0.0
             self.session.rearm_block_reason = None
+            self.session.rearm_reference_weight = None
 
         self.plate_tracker.clear()
         if self.detect_coord:
@@ -465,6 +597,7 @@ class SessionManager:
         self.session.published_this_stop = False
         self.session.session_had_weight = False
         self.session.stable_count = 0
+        self.session.clear_stable_weight_history()
         self.session.last_publish_weight = None
         self.session.last_publish_decimal_pos = 0
         self.session.vehicle_type = None
@@ -697,7 +830,8 @@ class SessionManager:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         fpath = os.path.join(self.undetectable_dir, f"{ts}_undetectable.jpg")
         try:
-            cv2.imwrite(fpath, frame_data)
+            if not cv2.imwrite(fpath, frame_data):
+                raise OSError("cv2.imwrite returned false")
             log_fn("SAVE", f"Undetectable saved: {fpath}")
             return True
         except Exception as exc:

@@ -18,10 +18,17 @@ import serial
 import time
 import sqlite3
 import threading
+from collections import Counter, deque
 from datetime import datetime
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Callable
+
+from config import (
+    SCALE_DATA_RETENTION_DAYS,
+    SQLITE_PASSIVE_CHECKPOINT_SECONDS,
+    SQLITE_TRUNCATE_CHECKPOINT_SECONDS,
+    SQLITE_WAL_TRUNCATE_BYTES,
+)
 
 
 # ─────────────────────────────────────────────
@@ -35,7 +42,7 @@ LOG_INTERVAL  = 1.0          # Ghi DB mỗi N giây (0 = ghi mọi frame)
 
 # Stability detection
 STABLE_COUNT     = 5         # Number of consecutive readings to check
-STABLE_TOLERANCE = 0.5       # kg — max spread to be considered stable
+STABLE_TOLERANCE = 20.0      # kg — max spread to be considered stable
 # ─────────────────────────────────────────────
 
 
@@ -49,6 +56,7 @@ class WeightFrame:
     checksum_ok:  bool
     digits_str:   str        # Raw 6-digit string (for overload detection)
     status:       str = "UNSTABLE"  # STABLE / UNSTABLE / OVERLOAD
+    stable_weight: Optional[float] = None  # Mode of qualifying window, newest wins ties
     timestamp:    datetime = field(default_factory=datetime.now)
 
     @property
@@ -183,6 +191,10 @@ class ScaleDatabase:
         self.db_file = db_file
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self._last_retention = 0.0
+        self._last_passive_checkpoint = 0.0
+        self._last_truncate_checkpoint = 0.0
+        self.last_maintenance_error = None
         self._init_db()
 
     def _init_db(self):
@@ -218,6 +230,43 @@ class ScaleDatabase:
                 frame.status,
             ))
             self._conn.commit()
+            try:
+                self._maintain_locked(time.time())
+                self.last_maintenance_error = None
+            except Exception as exc:
+                self.last_maintenance_error = str(exc)
+
+    def _maintain_locked(self, now):
+        if now - self._last_retention >= 24 * 60 * 60:
+            self._delete_expired_rows_locked(now)
+            self._last_retention = now
+
+        if now - self._last_passive_checkpoint >= SQLITE_PASSIVE_CHECKPOINT_SECONDS:
+            if self._checkpoint_locked("PASSIVE")[0] == 0:
+                self._last_passive_checkpoint = now
+
+        wal_path = self.db_file + "-wal"
+        wal_size = os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+        if (
+            now - self._last_truncate_checkpoint >= SQLITE_TRUNCATE_CHECKPOINT_SECONDS
+            or wal_size >= SQLITE_WAL_TRUNCATE_BYTES
+        ):
+            if self._checkpoint_locked("TRUNCATE")[0] == 0:
+                self._last_truncate_checkpoint = now
+
+    def _delete_expired_rows_locked(self, now):
+        cutoff = datetime.fromtimestamp(now - SCALE_DATA_RETENTION_DAYS * 86400).isoformat()
+        while True:
+            cursor = self._conn.execute(
+                "DELETE FROM weight_log WHERE id IN (SELECT id FROM weight_log WHERE timestamp < ? LIMIT 10000)",
+                (cutoff,),
+            )
+            self._conn.commit()
+            if cursor.rowcount < 10000:
+                return
+
+    def _checkpoint_locked(self, mode):
+        return self._conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
 
     def get_recent(self, limit: int = 20) -> list[dict]:
         with self._lock:
@@ -264,6 +313,8 @@ class D2008Reader:
         self._db       = ScaleDatabase(db_file)
         self._serial   = None
         self._running  = False
+        self.state = "stopped"
+        self.last_error = None
         self._thread   = None
         self._last_log   = 0.0
         self._last_print = 0.0
@@ -283,6 +334,7 @@ class D2008Reader:
     def start(self):
         """Bắt đầu đọc (non-blocking, chạy background thread)."""
         self._running = True
+        self.state = "starting"
         self._thread  = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         print(f"[READER] Đang kết nối {self.port} @ {self.baud} baud...")
@@ -290,8 +342,13 @@ class D2008Reader:
     def stop(self):
         """Dừng đọc."""
         self._running = False
+        if self._serial and self._serial.is_open:
+            self._serial.close()
         if self._thread:
             self._thread.join(timeout=3)
+            if self._thread.is_alive():
+                print("[WARNING] Reader thread did not stop; database left open")
+                return
         self._db.close()
         print("[READER] Đã dừng.")
 
@@ -310,6 +367,7 @@ class D2008Reader:
                 timeout=2,
             )
             print(f"[READER] Kết nối thành công: {self.port}")
+            self.state = "running"
 
             while self._running:
                 raw = self._serial.read(self._serial.in_waiting or 1)
@@ -321,9 +379,14 @@ class D2008Reader:
                     self._handle_frame(frame)
 
         except (serial.SerialException, TypeError, OSError) as e:
+            self.last_error = str(e)
+            self.state = "failed"
             if self._running:
                 print(f"[ERROR] Lỗi cổng serial: {e}")
         finally:
+            self._running = False
+            if self.state != "failed":
+                self.state = "stopped"
             if self._serial and self._serial.is_open:
                 self._serial.close()
 
@@ -360,6 +423,7 @@ class D2008Reader:
     def _get_status(self, frame: WeightFrame) -> str:
         """Determine scale status: OVERLOAD, STABLE, or UNSTABLE."""
         if frame.digits_str == "999999":
+            self._recent_weights.clear()
             return "OVERLOAD"
 
         self._recent_weights.append(frame.weight)
@@ -368,12 +432,23 @@ class D2008Reader:
             w_min = min(self._recent_weights)
             w_max = max(self._recent_weights)
             if (w_max - w_min) <= STABLE_TOLERANCE:
+                counts = Counter(self._recent_weights)
+                highest_count = max(counts.values())
+                frame.stable_weight = next(
+                    weight
+                    for weight in reversed(self._recent_weights)
+                    if counts[weight] == highest_count
+                )
                 return "STABLE"
 
         return "UNSTABLE"
 
     def _handle_frame(self, frame: WeightFrame):
         """Xử lý mỗi frame nhận được."""
+        if not frame.checksum_ok:
+            self._recent_weights.clear()
+            self._prev_status = "UNSTABLE"
+            return
         frame.status = self._get_status(frame)
         self.latest = frame
 
@@ -386,14 +461,20 @@ class D2008Reader:
             old_status = self._prev_status
             self._prev_status = frame.status
             if self.on_status_change:
-                self.on_status_change(frame, old_status, frame.status)
+                try:
+                    self.on_status_change(frame, old_status, frame.status)
+                except Exception as exc:
+                    print(f"[ERROR] Status callback failed: {exc}")
 
         now = time.time()
 
         # Throttled callback for logging/display (~1s)
         if now - self._last_print >= 1.0:
             if self.on_weight:
-                self.on_weight(frame)
+                try:
+                    self.on_weight(frame)
+                except Exception as exc:
+                    print(f"[ERROR] Weight callback failed: {exc}")
             self._last_print = now
 
         # Ghi DB theo interval

@@ -7,7 +7,14 @@ import threading
 import time
 from datetime import date, datetime
 
-from config import SERVICE_DIR
+from config import (
+    IMAGE_DEAD_LETTER_RETENTION_DAYS,
+    LOG_DIR,
+    LOG_FILE_PREFIX,
+    LOG_RETENTION_DAYS,
+    MQTT_DEAD_LETTER_RETENTION_DAYS,
+    SERVICE_DIR,
+)
 
 CLEANED_SUFFIX = "--Cleaned"
 COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[_-]")
@@ -44,7 +51,10 @@ class ImageRetentionCleaner:
 
     def _run_loop(self):
         while not self._stop_event.is_set():
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception as exc:
+                self._log("ERROR", f"Image retention failed: {exc}")
             self._stop_event.wait(self.check_interval_seconds)
 
     def _is_image_name(self, filename):
@@ -226,3 +236,82 @@ class ImageRetentionCleaner:
             "deleted_by_mtime": deleted_by_mtime,
             "skipped_pending_uploads": skipped_pending_uploads,
         }
+
+
+class StorageMaintenance:
+    """Apply age retention to logs and dead-letter records."""
+
+    def __init__(self, check_interval_seconds, log_fn=None):
+        self.check_interval_seconds = check_interval_seconds
+        self.log_fn = log_fn
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _log(self, level, msg):
+        if self.log_fn:
+            self.log_fn(level, msg)
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout=3.0):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    def _run_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception as exc:
+                self._log("ERROR", f"Storage maintenance failed: {exc}")
+            self._stop_event.wait(self.check_interval_seconds)
+
+    @staticmethod
+    def _remove_older_than(root, retention_days, predicate, now):
+        cutoff = now - retention_days * 86400
+        deleted = 0
+        if not os.path.isdir(root):
+            return deleted
+        for filename in os.listdir(root):
+            path = os.path.join(root, filename)
+            if not predicate(filename) or os.path.islink(path) or not os.path.isfile(path):
+                continue
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    deleted += 1
+            except OSError:
+                continue
+        return deleted
+
+    def run_once(self, now=None):
+        now = time.time() if now is None else now
+        current_log = f"{LOG_FILE_PREFIX}_{datetime.fromtimestamp(now):%Y-%m-%d}.log"
+        log_deleted = self._remove_older_than(
+            LOG_DIR,
+            LOG_RETENTION_DAYS,
+            lambda name: name.startswith(f"{LOG_FILE_PREFIX}_") and name.endswith(".log") and name != current_log,
+            now,
+        )
+        dead_letter_dir = os.path.join(SERVICE_DIR, "storage", "dead-letter")
+        mqtt_deleted = self._remove_older_than(
+            dead_letter_dir,
+            MQTT_DEAD_LETTER_RETENTION_DAYS,
+            lambda name: name.startswith("mqtt-") and name.endswith(".jsonl"),
+            now,
+        )
+        image_deleted = self._remove_older_than(
+            dead_letter_dir,
+            IMAGE_DEAD_LETTER_RETENTION_DAYS,
+            lambda name: (name.startswith("minio-") or name.startswith("malformed-")) and name.endswith(".jsonl"),
+            now,
+        )
+        self._log(
+            "INFO",
+            f"Storage maintenance complete: logs_deleted={log_deleted} "
+            f"mqtt_dead_letters_deleted={mqtt_deleted} image_dead_letters_deleted={image_deleted}",
+        )
+        return {"logs_deleted": log_deleted, "mqtt_deleted": mqtt_deleted, "image_deleted": image_deleted}

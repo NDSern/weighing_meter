@@ -2,6 +2,7 @@
 
 import threading
 import time
+from collections import deque
 
 
 def _clean_plate(plate_text: str) -> str:
@@ -31,7 +32,7 @@ class PlateTracker:
     """Accumulates plate observations across a session and returns the most frequent plate."""
 
     def __init__(self):
-        self._observations = []  # list of (plate_text, weight, source, timestamp)
+        self._observations = deque(maxlen=5000)  # (plate_text, weight, source, timestamp)
         self._lock = threading.Lock()
         self._image_frame = None  # full frame for saving on publish
         self._image_plate = None  # plate text associated with saved frame

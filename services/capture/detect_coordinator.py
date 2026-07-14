@@ -96,6 +96,7 @@ class DetectCoordinator:
         log("INFO", f"DetectCoordinator started with {len(self._cameras)} cameras")
 
     def stop(self, timeout=5.0):
+        deadline = time.time() + timeout
         self._running = False
         for event in self._ocr_events.values():
             event.set()
@@ -107,10 +108,12 @@ class DetectCoordinator:
                 self._ocr_jobs[name] = None
         for thread in (self._detect_thread, self._worker_thread):
             if thread and thread.is_alive():
-                thread.join(timeout=timeout / 2)
+                thread.join(timeout=max(0.0, deadline - time.time()))
         for thread in self._ocr_threads:
             if thread and thread.is_alive():
-                thread.join(timeout=timeout / 2)
+                thread.join(timeout=max(0.0, deadline - time.time()))
+        threads = [self._detect_thread, self._worker_thread, *self._ocr_threads]
+        return all(not thread or not thread.is_alive() for thread in threads)
 
     def set_enabled(self, enabled: bool):
         with self._state_lock:
@@ -330,6 +333,7 @@ class VehicleDetectCoordinator:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
+        return not self._thread or not self._thread.is_alive()
 
     def _detect_loop(self):
         interval = 1.0 / YOLO26_DETECT_FPS

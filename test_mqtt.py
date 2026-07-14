@@ -13,7 +13,7 @@ from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-from config import CAPTURE_DIR, SERVICE_DIR
+from config import CAPTURE_DIR, SERVICE_DIR, WEIGHT_THRESHOLD
 
 
 # MQTT Broker Config
@@ -81,10 +81,11 @@ def get_latest_scale_row(db_path):
             """
             SELECT id, timestamp, weight_kg, sign, decimal_pos, checksum_ok, status
             FROM weight_log
-            WHERE checksum_ok = 1 AND weight_kg > 0
+            WHERE checksum_ok = 1 AND status = 'STABLE' AND weight_kg > ?
             ORDER BY id DESC
             LIMIT 1
-            """
+            """,
+            (WEIGHT_THRESHOLD,),
         ).fetchone()
         if row is None:
             row = conn.execute(

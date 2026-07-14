@@ -39,6 +39,8 @@ class _LatestFrameSource:
         self._running = False
         self._latest_frame = None
         self._frame_lock = threading.Lock()
+        self._capture_lock = threading.Lock()
+        self._capture = None
         self._thread = None
 
     def start(self):
@@ -49,10 +51,14 @@ class _LatestFrameSource:
 
     def stop(self, timeout=3.0):
         self._running = False
+        with self._capture_lock:
+            if self._capture is not None:
+                self._capture.release()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
         with self._frame_lock:
             self._latest_frame = None
+        return not self._thread or not self._thread.is_alive()
 
     def get_latest_frame(self):
         with self._frame_lock:
@@ -72,10 +78,16 @@ class _LatestFrameSource:
         cam_frame_time = 1.0 / 25
         while self._running:
             cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+            with self._capture_lock:
+                self._capture = cap
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
                 log("WARNING", f"{self._open_fail_log} Retry in {RECONNECT_DELAY}s...")
+                cap.release()
+                with self._capture_lock:
+                    if self._capture is cap:
+                        self._capture = None
                 time.sleep(RECONNECT_DELAY)
                 continue
 
@@ -103,6 +115,9 @@ class _LatestFrameSource:
                 grab_took = time.time() - t_grab
                 time.sleep(max(0.0, cam_frame_time - grab_took))
             cap.release()
+            with self._capture_lock:
+                if self._capture is cap:
+                    self._capture = None
             if self._running:
                 time.sleep(RECONNECT_DELAY)
 

@@ -8,7 +8,8 @@ import time
 import uuid
 from datetime import datetime
 
-from config import SERVICE_DIR
+from config import PENDING_RETENTION_DAYS, SERVICE_DIR
+from services.storage.dead_letter import append_dead_letter, is_expired
 
 _log_fn = None
 
@@ -29,6 +30,8 @@ _pending_events = {}
 _publish_queue = queue.Queue()
 _worker_lock = threading.Lock()
 _worker_started = False
+_worker_thread = None
+_stop_event = threading.Event()
 _mqtt_svc = None
 
 
@@ -37,16 +40,31 @@ class PublishOutbox:
 
     @staticmethod
     def start(mqtt_svc):
-        global _worker_started, _mqtt_svc
+        global _worker_started, _worker_thread, _mqtt_svc
         _mqtt_svc = mqtt_svc
         with _worker_lock:
             if _worker_started:
                 return
             os.makedirs(os.path.dirname(_outbox_file), exist_ok=True)
             PublishOutbox._load_pending()
-            thread = threading.Thread(target=PublishOutbox._publish_loop, daemon=True)
-            thread.start()
+            _stop_event.clear()
+            _worker_thread = threading.Thread(target=PublishOutbox._publish_loop, daemon=True)
+            _worker_thread.start()
             _worker_started = True
+
+    @staticmethod
+    def stop(timeout=5.0):
+        global _worker_started, _worker_thread, _mqtt_svc
+        _stop_event.set()
+        if _worker_thread:
+            _worker_thread.join(timeout=timeout)
+            if _worker_thread.is_alive():
+                return False
+        with _worker_lock:
+            _worker_started = False
+            _worker_thread = None
+            _mqtt_svc = None
+        return True
 
     @staticmethod
     def enqueue(session_result, image_object_keys=None, image_paths=None):
@@ -81,11 +99,14 @@ class PublishOutbox:
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
+                        append_dead_letter("malformed", {"raw": line.rstrip()}, "invalid MQTT JSON", "malformed")
                         continue
                     event_id = event.get("id")
                     if not event_id or not event.get("session_result"):
+                        append_dead_letter("malformed", event, "incomplete MQTT record", "malformed")
                         continue
                     _pending_events[event_id] = event
+            PublishOutbox._persist_locked()
             for event_id in _pending_events:
                 _publish_queue.put(event_id)
         if _pending_events:
@@ -110,13 +131,17 @@ class PublishOutbox:
 
     @staticmethod
     def _publish_loop():
-        while True:
+        while not _stop_event.is_set():
             try:
                 event_id = _publish_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             try:
                 PublishOutbox._publish_event(event_id)
+            except Exception as exc:
+                log("ERROR", f"Publish worker error event id={event_id}: {exc}")
+                if not _stop_event.wait(10.0):
+                    _publish_queue.put(event_id)
             finally:
                 _publish_queue.task_done()
 
@@ -126,15 +151,18 @@ class PublishOutbox:
             event = _pending_events.get(event_id)
         if not event:
             return
+        if is_expired(event.get("created_at"), PENDING_RETENTION_DAYS):
+            append_dead_letter("mqtt", event, "pending event exceeded retry retention", "expired")
+            PublishOutbox._mark_published(event_id)
+            log("ERROR", f"Moved expired publish event to dead letter id={event_id}")
+            return
         missing_paths = [p for p in event.get("image_paths") or [] if not os.path.exists(p)]
         if missing_paths:
-            log("OFFLINE", f"Waiting for local images event id={event_id} missing={len(missing_paths)}")
-            time.sleep(10.0)
-            _publish_queue.put(event_id)
-            return
+            log("ERROR", f"Publishing without missing local images event id={event_id} missing={len(missing_paths)}")
+            event["image_paths"] = [p for p in event.get("image_paths") or [] if p not in missing_paths]
         if _mqtt_svc is None:
-            time.sleep(5.0)
-            _publish_queue.put(event_id)
+            if not _stop_event.wait(5.0):
+                _publish_queue.put(event_id)
             return
         ok = _mqtt_svc.publish_weighbridge_event(
             event["session_result"],
@@ -145,5 +173,5 @@ class PublishOutbox:
             PublishOutbox._mark_published(event_id)
             log("OFFLINE", f"Published queued event id={event_id}")
             return
-        time.sleep(10.0)
-        _publish_queue.put(event_id)
+        if not _stop_event.wait(10.0):
+            _publish_queue.put(event_id)
