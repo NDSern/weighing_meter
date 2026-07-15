@@ -78,6 +78,9 @@ class PublishOutbox:
             "session_result": session_result,
         }
         with _pending_lock:
+            if event_id in _pending_events:
+                log("OFFLINE", f"Publish event already queued id={event_id}")
+                return event_id
             _pending_events[event_id] = event
             PublishOutbox._persist_locked()
         _publish_queue.put(event_id)
@@ -172,6 +175,10 @@ class PublishOutbox:
         if ok:
             PublishOutbox._mark_published(event_id)
             log("OFFLINE", f"Published queued event id={event_id}")
+            log("METRIC", json.dumps(
+                {"event": "session_publish_acknowledged", "id": event_id},
+                separators=(",", ":"), sort_keys=True,
+            ))
             return
         if not _stop_event.wait(10.0):
             _publish_queue.put(event_id)

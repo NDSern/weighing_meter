@@ -41,7 +41,7 @@ SERIAL_DUMP_FILE = None
 LOG_INTERVAL  = 1.0          # Ghi DB mỗi N giây (0 = ghi mọi frame)
 
 # Stability detection
-STABLE_COUNT     = 5         # Number of consecutive readings to check
+STABLE_COUNT     = 10        # Consecutive readings required for software stability
 STABLE_TOLERANCE = 20.0      # kg — max spread to be considered stable
 # ─────────────────────────────────────────────
 

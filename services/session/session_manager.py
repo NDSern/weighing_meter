@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from collections import Counter, deque
 from datetime import datetime, timezone
 
@@ -17,6 +18,10 @@ from services.storage.publish_outbox import PublishOutbox, set_log_fn as set_pub
 from config import (
     CAPTURE_DIR,
     MQTT_ENABLED,
+    NO_PLATE_DIR,
+    NO_STABLE_DIR,
+    SAME_PLATE_DUPLICATE_SECONDS,
+    SESSION_DEDUP_STATE_FILE,
     SESSION_END_EMPTY_DWELL_SECONDS,
     SESSION_MIN_DURATION_SECONDS,
     SESSION_REARM_DELAY_SECONDS,
@@ -52,6 +57,10 @@ def log(level: str, msg: str):
     """Log using the configured log function."""
     if _log_fn:
         _log_fn(level, msg)
+
+
+def log_metric(log_fn, event, **fields):
+    log_fn("METRIC", json.dumps({"event": event, **fields}, separators=(",", ":"), sort_keys=True))
 
 
 def saveConfirmedLicensePlate(license_plate):
@@ -263,8 +272,13 @@ class WeighingSessionState:
         self.rearm_block_reason = None
         self.rearm_reference_weight = None
         self.lpr_start_frames = {}
+        self.start_frame_paths = {}
         self.rear_start_frame = None
+        self.rear_start_path = None
         self.started_at = None
+        self.started_at_iso = None
+        self.session_id = None
+        self.spool_active = False
 
     def record_stable_weight(self, weight, decimal_pos):
         self.latest_stable_weight = weight
@@ -335,31 +349,68 @@ class SessionManager:
         plate_tracker,
         mqtt_svc=None,
         vehicle_tracker=None,
-        detect_coord=None,
         rear_grabber=None,
         lpr_grabbers=None,
         save_images_fn=None,
         undetectable_dir=None,
         cam2_result_crop="left",
+        frame_spool=None,
     ):
         if cam2_result_crop not in ("left", "right", "full"):
             raise ValueError(f"Invalid cam2 result crop mode: {cam2_result_crop!r}")
         self.plate_tracker = plate_tracker
         self.mqtt_svc = mqtt_svc
         self.vehicle_tracker = vehicle_tracker
-        self.detect_coord = detect_coord
         self.rear_grabber = rear_grabber
         self.lpr_grabbers = lpr_grabbers or {}
         self.save_images_fn = save_images_fn
         self.undetectable_dir = undetectable_dir
         self.cam2_result_crop = cam2_result_crop
+        self.frame_spool = frame_spool
 
         self.session = WeighingSessionState()
         self._last_publish_plate = None
         self._last_publish_weight = None
+        self._last_publish_session_end = None
         self._publish_lock = threading.Lock()
         self._vehicle_summary_cache = None
         self._vehicle_summary_ts = 0.0
+        self._attempt = None
+        self._attempt_departure_since = None
+        self._attempt_empty_since = None
+        self._attempt_rearm_low = None
+        self._attempt_wait_reference = None
+        self._load_dedup_state()
+
+    def _load_dedup_state(self):
+        try:
+            with open(SESSION_DEDUP_STATE_FILE, encoding="utf-8") as handle:
+                state = json.load(handle)
+            self._last_publish_plate = state.get("plate")
+            self._last_publish_weight = state.get("weight")
+            self._last_publish_session_end = state.get("ended_at")
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save_dedup_state(self):
+        os.makedirs(os.path.dirname(SESSION_DEDUP_STATE_FILE), exist_ok=True)
+        temp = SESSION_DEDUP_STATE_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump({
+                "plate": self._last_publish_plate,
+                "weight": self._last_publish_weight,
+                "ended_at": self._last_publish_session_end,
+            }, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, SESSION_DEDUP_STATE_FILE)
+
+    def shutdown(self, log_fn):
+        """Persist active capture state before sampler and inference workers stop."""
+        if self.session.session_active:
+            self._end_session("shutdown", log_fn)
+        elif self._attempt:
+            self._archive_no_stable(log_fn)
 
     def _get_vehicle_summary(self, max_age=0.25):
         if not self.vehicle_tracker:
@@ -394,6 +445,14 @@ class SessionManager:
 
     def on_frame(self, frame, log_fn):
         """Per-frame callback (fires on every scale frame)."""
+        if not self.session.session_active and self._attempt_wait_reference is not None:
+            if frame.weight <= WEIGHT_THRESHOLD:
+                self._attempt_wait_reference = None
+            elif abs(frame.weight - self._attempt_wait_reference) < SESSION_WEIGHT_DEPARTURE_KG:
+                return
+            else:
+                self._attempt_wait_reference = None
+        self._update_attempt(frame, log_fn)
         if frame.status == "STABLE":
             self._handle_stable_frame(frame, log_fn)
         else:
@@ -420,6 +479,112 @@ class SessionManager:
             and self._can_start_session(log_fn)
         ):
             self._start_session(frame.decimal_pos, log_fn)
+
+    def _update_attempt(self, frame, log_fn):
+        if self.session.session_active:
+            if self._attempt:
+                self._attempt["max_weight"] = max(self._attempt["max_weight"], frame.weight)
+            return
+        if self._attempt_rearm_low is not None:
+            self._attempt_rearm_low = min(self._attempt_rearm_low, frame.weight)
+            if frame.weight <= WEIGHT_THRESHOLD:
+                self._attempt_rearm_low = None
+            elif frame.weight - self._attempt_rearm_low < SESSION_WEIGHT_DEPARTURE_KG:
+                return
+            else:
+                self._attempt_rearm_low = None
+        if self._attempt is None and frame.weight > WEIGHT_THRESHOLD:
+            self._attempt = {
+                "id": uuid.uuid4().hex,
+                "started_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "max_weight": frame.weight,
+                "start_frames": self._capture_lpr_start_frames(log_fn),
+            }
+            self._attempt_departure_since = None
+            self._attempt_empty_since = None
+            log_fn("EVENT", f"Weight attempt start id={self._attempt['id']} wt={frame.weight:.{frame.decimal_pos}f}kg")
+            log_metric(
+                log_fn, "weight_attempt_start", id=self._attempt["id"],
+                started_at=self._attempt["started_at"], start_weight_kg=frame.weight,
+            )
+        if self._attempt is None:
+            return
+
+        self._attempt["max_weight"] = max(self._attempt["max_weight"], frame.weight)
+        now = time.time()
+        if frame.weight <= WEIGHT_THRESHOLD:
+            self._attempt_empty_since = self._attempt_empty_since or now
+            if now - self._attempt_empty_since >= SESSION_END_EMPTY_DWELL_SECONDS:
+                self._archive_no_stable(log_fn, require_new_rise=False)
+            return
+        self._attempt_empty_since = None
+        if self._attempt["max_weight"] - frame.weight >= SESSION_WEIGHT_DEPARTURE_KG:
+            self._attempt_departure_since = self._attempt_departure_since or now
+            if now - self._attempt_departure_since >= SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS:
+                self._archive_no_stable(log_fn, require_new_rise=True, current_weight=frame.weight)
+        else:
+            self._attempt_departure_since = None
+
+    def _archive_no_stable(self, log_fn, require_new_rise=False, current_weight=None):
+        attempt = self._attempt
+        if not attempt:
+            return
+        saved = self._save_diagnostic_frames(
+            NO_STABLE_DIR,
+            attempt["id"],
+            attempt["start_frames"],
+            {"reason": "no_stable_weight", "started_at": attempt["started_at"],
+             "ended_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+             "maximum_weight_kg": attempt["max_weight"]},
+            log_fn,
+        )
+        log_fn("EVENT", f"NO STABLE id={attempt['id']} max_wt={attempt['max_weight']:.1f}kg images={saved}")
+        log_metric(
+            log_fn, "no_stable_weight", id=attempt["id"],
+            started_at=attempt["started_at"],
+            ended_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            maximum_weight_kg=attempt["max_weight"], images=saved,
+            end_reason="weight_departure" if require_new_rise else "scale_empty",
+        )
+        self._clear_attempt()
+        if require_new_rise:
+            self._attempt_rearm_low = current_weight
+
+    def _clear_attempt(self):
+        self._attempt = None
+        self._attempt_departure_since = None
+        self._attempt_empty_since = None
+
+    @staticmethod
+    def _save_diagnostic_frames(root, item_id, frames, metadata, log_fn):
+        now = datetime.now()
+        target = os.path.join(root, now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as exc:
+            log_fn("ERROR", f"Diagnostic directory create failed id={item_id}: {exc}")
+            return False
+        saved = []
+        for camera, frame in frames.items():
+            path = os.path.join(target, f"{now:%H%M%S_%f}_{item_id}_{camera}.jpg")
+            if ImageSaveWorker.save_local_only(path, frame):
+                saved.append(path)
+            else:
+                log_fn("WARNING", f"Diagnostic image save failed camera={camera} id={item_id}")
+        metadata = dict(metadata, images=saved)
+        path = os.path.join(target, f"{now:%H%M%S_%f}_{item_id}.json")
+        temp = path + ".tmp"
+        metadata_saved = False
+        try:
+            with open(temp, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+            metadata_saved = True
+        except OSError as exc:
+            log_fn("ERROR", f"Diagnostic metadata save failed id={item_id}: {exc}")
+        return len(saved) if metadata_saved else False
 
     def _check_weight_departure(self, frame, log_fn):
         if not self.session.session_active:
@@ -521,18 +686,54 @@ class SessionManager:
         self.session.rearm_block_until = 0.0
         self.session.rearm_block_reason = None
         self.session.rearm_reference_weight = None
-        self.session.lpr_start_frames = self._capture_lpr_start_frames(log_fn)
+        if self._attempt is None:
+            self._attempt = {
+                "id": uuid.uuid4().hex,
+                "started_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "max_weight": self.session.stable_weight,
+                "start_frames": self._capture_lpr_start_frames(log_fn),
+            }
+        self.session.lpr_start_frames = self._attempt["start_frames"]
         self.session.rear_start_frame = self._capture_rear_start_frame(log_fn)
         self.session.session_active = True
         self.session.started_at = time.time()
+        self.session.session_id = self._attempt["id"]
+        self.session.started_at_iso = self._attempt["started_at"]
         self.session.session_had_weight = True
         self.session.start_stable_weight_history()
         self.session.stable_decimal_pos = decimal_pos
         self.session.last_publish_weight = self.session.stable_weight
         self.session.last_publish_decimal_pos = decimal_pos
-        if self.detect_coord:
-            self.detect_coord.set_enabled(True)
+        if self.frame_spool:
+            try:
+                session_dir = self.frame_spool.begin_session(
+                    self.session.session_id, self.session.lpr_start_frames
+                )
+                self.session.spool_active = True
+                self.session.start_frame_paths = {
+                    camera: os.path.join(session_dir, f"{camera}-000000-start.jpg")
+                    for camera in self.session.lpr_start_frames
+                    if os.path.exists(os.path.join(session_dir, f"{camera}-000000-start.jpg"))
+                }
+                if self.session.rear_start_frame is not None:
+                    self.session.rear_start_path = self.frame_spool.save_session_frame(
+                        self.session.session_id, "cam2-start.jpg", self.session.rear_start_frame
+                    )
+            except Exception as exc:
+                try:
+                    self.frame_spool.abort_session(self.session.session_id)
+                except Exception as abort_exc:
+                    log_fn("ERROR", f"Session frame spool abort failed: {abort_exc}")
+                self.session.spool_active = False
+                log_fn("ERROR", f"Session frame spool unavailable: {exc}")
+        self._clear_attempt()
         log_fn("EVENT", f"===== SESSION START wt={self.session.stable_weight:.{decimal_pos}f}kg lpr=on =====")
+        log_metric(
+            log_fn, "session_start", id=self.session.session_id,
+            attempt_started_at=self.session.started_at_iso,
+            stable_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            stable_weight_kg=self.session.stable_weight,
+        )
 
     def _capture_lpr_start_frames(self, log_fn):
         frames = {}
@@ -565,34 +766,43 @@ class SessionManager:
             return
 
         end_reason = reason
-        published_on_end = self._publish_on_session_end(reason, log_fn)
-        confirmed_plate, _, _ = self.plate_tracker.get_confirmed_plate()
-        saved_undetectable = False
-        if self.session.session_had_weight and not self.session.published_this_stop and confirmed_plate is None:
-            saved_undetectable = self._save_undetectable_frame(log_fn)
-
-        publish_state = "duplicate" if self.session.skipped_duplicate_publish else self.session.published_this_stop
+        metadata = self._snapshot_session(reason)
+        queued = False
+        if self.frame_spool and self.session.spool_active:
+            try:
+                self.frame_spool.end_session(self.session.session_id, metadata)
+                queued = True
+            except Exception as exc:
+                log_fn("ERROR", f"Session frame spool finalization failed: {exc}")
+        if not queued:
+            self._save_diagnostic_frames(
+                NO_PLATE_DIR, self.session.session_id, self.session.lpr_start_frames,
+                {"reason": "lpr_spool_unavailable", **metadata}, log_fn,
+            )
         log_fn(
             "EVENT",
             f"===== SESSION END reason={end_reason} wt={self.session.stable_weight or 0:.1f}kg "
-            f"plate={confirmed_plate or 'none'} published={publish_state} "
-            f"vehicle={self.session.vehicle_type or 'unknown'} undetectable={saved_undetectable} "
-            f"publish_on_end={published_on_end} lpr=off =====",
+            f"plate=pending published=pending vehicle={self.session.vehicle_type or 'unknown'} "
+            f"deferred_lpr={queued} lpr=off =====",
+        )
+        log_metric(
+            log_fn, "session_end", id=metadata["session_id"],
+            started_at=metadata["started_at"], ended_at=metadata["ended_at"],
+            end_reason=reason, stable_weight_kg=metadata["stable_weight"],
+            deferred_lpr=queued,
         )
 
         if reason in ("vehicle_left", "weight_departure") and (self.session.stable_weight or 0) > WEIGHT_THRESHOLD:
             self.session.rearm_block_until = time.time() + SESSION_REARM_DELAY_SECONDS
             self.session.rearm_block_reason = reason
             self.session.rearm_reference_weight = self.session.stable_weight
+            self._attempt_wait_reference = self.session.stable_weight
             log_fn("EVENT", f"Session rearm blocked for {SESSION_REARM_DELAY_SECONDS:g}s after {reason}")
         else:
             self.session.rearm_block_until = 0.0
             self.session.rearm_block_reason = None
             self.session.rearm_reference_weight = None
 
-        self.plate_tracker.clear()
-        if self.detect_coord:
-            self.detect_coord.set_enabled(False)
         self.session.session_active = False
         self.session.published_this_stop = False
         self.session.session_had_weight = False
@@ -606,8 +816,28 @@ class SessionManager:
         self.session.empty_since = None
         self.session.skipped_duplicate_publish = False
         self.session.lpr_start_frames = {}
+        self.session.start_frame_paths = {}
         self.session.rear_start_frame = None
         self.session.started_at = None
+        self.session.started_at_iso = None
+        self.session.session_id = None
+        self.session.rear_start_path = None
+        self.session.spool_active = False
+
+    def _snapshot_session(self, reason):
+        ended_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        return {
+            "session_id": self.session.session_id,
+            "started_at": self.session.started_at_iso,
+            "ended_at": ended_at,
+            "duration_s": max(0.0, time.time() - (self.session.started_at or time.time())),
+            "end_reason": reason,
+            "stable_weight": self.session.last_publish_weight,
+            "decimal_pos": self.session.last_publish_decimal_pos,
+            "vehicle_type": self.session.vehicle_type,
+            "rear_start_path": self.session.rear_start_path,
+            "start_frame_paths": dict(self.session.start_frame_paths),
+        }
 
     def _publish_on_session_end(self, reason: str, log_fn):
         if self.session.published_this_stop:
@@ -629,26 +859,72 @@ class SessionManager:
             log_fn("EVENT", f"Session end publish — reason={reason} plate={plate} score={score:.2f} hits={count}")
         return bool(published)
 
-    def _should_skip_duplicate_publish(self, plate, stable_weight):
+    def _should_skip_duplicate_publish(self, plate, stable_weight, session_started_at=None):
         with self._publish_lock:
             plate_same = plate is not None and plate == self._last_publish_plate
-            weight_similar = (
-                self._last_publish_weight is not None
-                and abs(stable_weight - self._last_publish_weight) < WEIGHT_CHANGE_THRESHOLD
-            )
-            if plate_same and weight_similar:
-                log(
-                    "MERGE",
-                    f"Same plate [{plate}] + similar weight [{stable_weight} vs {self._last_publish_weight}] — same vehicle, skipping",
-                )
+            recent = False
+            if plate_same and session_started_at and self._last_publish_session_end:
+                started = datetime.fromisoformat(session_started_at)
+                previous_end = datetime.fromisoformat(self._last_publish_session_end)
+                recent = 0 <= (started - previous_end).total_seconds() < SAME_PLATE_DUPLICATE_SECONDS
+            if recent:
+                log("MERGE", f"Same plate [{plate}] within {SAME_PLATE_DUPLICATE_SECONDS:g}s — skipping")
                 return True
         return False
 
-    def publish_result(self, stable_weight, decimal_pos, log_fn):
+    def finalize_deferred_session(self, metadata, tracker, log_fn=None):
+        """Finalize one immutable ended session after deferred LPR completes."""
+        log_fn = log_fn or log
+        plate, score, count = tracker.get_confirmed_plate()
+        if not plate:
+            frames = self._load_start_frames(metadata)
+            saved = self._save_diagnostic_frames(
+                NO_PLATE_DIR,
+                metadata["session_id"],
+                frames,
+                {"reason": "no_plate", **metadata},
+                log_fn,
+            )
+            if saved is False:
+                return False
+            log_fn("EVENT", f"DEFERRED END id={metadata['session_id']} plate=none published=False")
+            log_metric(
+                log_fn, "session_no_plate", id=metadata["session_id"],
+                started_at=metadata["started_at"], ended_at=metadata["ended_at"],
+                end_reason=metadata["end_reason"],
+                stable_weight_kg=metadata["stable_weight"], images=saved,
+            )
+            return True
+        result = self.publish_result(
+            metadata["stable_weight"], metadata["decimal_pos"], log_fn,
+            tracker=tracker, metadata=metadata,
+        )
+        state = "duplicate" if result == "duplicate" else bool(result)
+        log_fn("EVENT", f"DEFERRED END id={metadata['session_id']} plate={plate} published={state}")
+        event = "session_duplicate" if result == "duplicate" else "session_publish_queued"
+        log_metric(
+            log_fn, event, id=metadata["session_id"], plate=plate,
+            started_at=metadata["started_at"], ended_at=metadata["ended_at"],
+            stable_weight_kg=metadata["stable_weight"],
+        )
+        return result is not False
+
+    @staticmethod
+    def _load_start_frames(metadata):
+        frames = {}
+        for camera, path in metadata.get("start_frame_paths", {}).items():
+            frame = cv2.imread(path)
+            if frame is not None:
+                frames[camera] = frame
+        return frames
+
+    def publish_result(self, stable_weight, decimal_pos, log_fn, tracker=None, metadata=None):
         """Query PlateTracker and publish if plate is confirmed."""
-        plate, score, count = self.plate_tracker.get_confirmed_plate()
+        tracker = tracker or self.plate_tracker
+        metadata = metadata or {}
+        plate, score, count = tracker.get_confirmed_plate()
         image_lookup_plate = plate
-        all_plates = self.plate_tracker.get_all_plates_summary()
+        all_plates = tracker.get_all_plates_summary()
         preferred_plate = preferDetailedLicensePlateCandidate(plate, all_plates)
         if preferred_plate != plate:
             log_fn("PLATE", f"Canonicalized confirmed plate {plate} -> {preferred_plate} candidates={all_plates}")
@@ -659,13 +935,19 @@ class SessionManager:
         if registered_plate != plate:
             log_fn("REGISTRY", f"Corrected plate {plate} -> {registered_plate} reason={registry_reason}")
             plate = registered_plate
-        if self._should_skip_duplicate_publish(plate, stable_weight):
+        if self._should_skip_duplicate_publish(plate, stable_weight, metadata.get("started_at")):
             return "duplicate"
 
-        result = self._build_publish_result(stable_weight, plate, count, all_plates)
+        result = self._build_publish_result(stable_weight, plate, count, all_plates, metadata)
+        if metadata.get("session_id"):
+            result["offline_event_id"] = metadata["session_id"]
         self._log_publish_summary(stable_weight, decimal_pos, plate, score, count, all_plates, log_fn)
         image_aliases = [image_lookup_plate, *all_plates.keys()]
-        if not self._attach_publish_images(result, stable_weight, decimal_pos, plate, image_aliases, log_fn):
+        if not self._attach_publish_images(
+            result, stable_weight, decimal_pos, plate, image_aliases, log_fn,
+            tracker=tracker, rear_start_path=metadata.get("rear_start_path"),
+            start_frame_paths=metadata.get("start_frame_paths", {}),
+        ):
             log_fn("ERROR", f"Publish skipped — image capture failed for plate={plate}")
             return False
 
@@ -687,14 +969,26 @@ class SessionManager:
         with self._publish_lock:
             self._last_publish_plate = plate
             self._last_publish_weight = stable_weight
+            self._last_publish_session_end = metadata.get("ended_at")
+            try:
+                self._save_dedup_state()
+            except OSError as exc:
+                log_fn("ERROR", f"Session dedup state save failed: {exc}")
         return True
 
-    def _build_publish_result(self, stable_weight, plate, count, all_plates):
+    def _build_publish_result(self, stable_weight, plate, count, all_plates, metadata=None):
+        metadata = metadata or {}
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        start = metadata.get("started_at")
+        end = metadata.get("ended_at")
+        if start:
+            start = datetime.fromisoformat(start).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        if end:
+            end = datetime.fromisoformat(end).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         return {
-            "start": timestamp,
-            "end": timestamp,
-            "duration_s": 0,
+            "start": start or timestamp,
+            "end": end or timestamp,
+            "duration_s": metadata.get("duration_s", 0),
             "stable_weight": stable_weight,
             "official_plate": plate or "none",
             "official_plate_count": count,
@@ -764,11 +1058,15 @@ class SessionManager:
         merged_img = np.hstack([front_img, rear_resized])
         return front_img, merged_img, rear_resized
 
-    def _attach_publish_images(self, result, stable_weight, decimal_pos, plate, image_aliases, log_fn):
+    def _attach_publish_images(
+        self, result, stable_weight, decimal_pos, plate, image_aliases, log_fn,
+        tracker=None, rear_start_path=None, start_frame_paths=None,
+    ):
         import numpy as np
         attach_started_at = time.time()
 
-        frame, img_plate, camera_name = self.plate_tracker.get_image_frame(plate, aliases=image_aliases)
+        tracker = tracker or self.plate_tracker
+        frame, img_plate, camera_name = tracker.get_image_frame(plate, aliases=image_aliases)
         if frame is None or not plate:
             return False
         if img_plate != plate:
@@ -777,8 +1075,8 @@ class SessionManager:
         now = datetime.now()
         captured_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         paths = self._prepare_capture_paths(now, plate)
-        rear_frame = self.session.rear_start_frame
-        if rear_frame is None and self.rear_grabber:
+        rear_frame = cv2.imread(rear_start_path) if rear_start_path else self.session.rear_start_frame
+        if rear_frame is None and not rear_start_path and self.rear_grabber:
             rear_frame = self.rear_grabber.get_latest_frame()
         if rear_frame is not None:
             rear_frame = self._crop_cam2_result_image(rear_frame)
@@ -804,7 +1102,11 @@ class SessionManager:
         elif camera_name == "cam3":
             unchosen_camera = "cam1"
         if unchosen_camera:
-            unchosen_frame = self.session.lpr_start_frames.get(unchosen_camera)
+            unchosen_frame = None
+            if start_frame_paths and start_frame_paths.get(unchosen_camera):
+                unchosen_frame = cv2.imread(start_frame_paths[unchosen_camera])
+            elif not start_frame_paths:
+                unchosen_frame = self.session.lpr_start_frames.get(unchosen_camera)
             unchosen_key = f"unchosen_{unchosen_camera}"
             if unchosen_frame is not None and unchosen_key in paths:
                 if ImageSaveWorker.save_local_only(paths[unchosen_key][0], unchosen_frame):

@@ -56,6 +56,8 @@ from config import (
     LOG_FILE_PREFIX,
     LOG_FILE_PATH,
     MQTT_ENABLED,
+    NO_PLATE_DIR,
+    NO_STABLE_DIR,
     RTSP_URL,
     RTSP_URL_2,
     RTSP_URL_3,
@@ -63,8 +65,13 @@ from config import (
     SERVICE_DIR,
     LPR_CHARSET,
     LPR_DETECTOR_MODEL,
-    LPR_IMAGE_SIZE,
     LPR_RECOGNIZER_MODEL,
+    LPR_SPOOL_DIR,
+    SESSION_FRAME_DISK_CAP_BYTES,
+    SESSION_FRAME_INTERVAL_SECONDS,
+    SESSION_FRAME_JPEG_QUALITY,
+    SESSION_FRAME_MIN_FREE_BYTES,
+    SESSION_FRAME_QUEUE_SIZE,
     UNDETECTABLE_DIR,
     WEIGHT_THRESHOLD,
     YOLO26_ENABLED,
@@ -141,12 +148,14 @@ from d2008_scale_reader import D2008Reader
 from mqtt_service import MqttService
 
 from services.pipeline.inference import detect_vehicles_rknn
-from services.pipeline.license_plate_recognition import detect_license_plates, detect_plate_regions, load_lpr_charset, recognize_plate_regions
+from services.pipeline.license_plate_recognition import detect_plate_regions, load_lpr_charset, recognize_plate_regions
 
 from services.tracking import PlateTracker, VehicleTracker
 from services.tracking.vehicle_tracker import set_log_fn as set_vehicle_tracker_log
-from services.capture import FrameGrabber, CameraGrabber, DetectCoordinator, VehicleDetectCoordinator
+from services.capture import FrameGrabber, CameraGrabber, VehicleDetectCoordinator
 from services.capture.detect_coordinator import set_log_fn as set_detect_coordinator_log
+from services.capture.session_frame_spool import SessionFrameSpool
+from services.pipeline.deferred_lpr_worker import DeferredLprWorker
 from services.capture.frame_source import set_log_fn as set_frame_source_log
 from services.storage.image_save_worker import ImageSaveWorker
 from services.storage.image_save_worker import set_log_fn as set_image_save_log
@@ -173,7 +182,7 @@ def main():
         signal.SIGINT: signal.getsignal(signal.SIGINT),
     }
     models = mqtt_svc = cam1 = cam3 = grabber2 = None
-    detect_coord = vehicle_coord = reader = None
+    detect_coord = vehicle_coord = reader = frame_spool = deferred_lpr = None
     retention_cleaner = storage_maintenance = session_manager = plate_tracker = None
     mqtt_started = image_worker_started = outbox_started = False
     lpr_stopped = vehicle_stopped = True
@@ -208,15 +217,6 @@ def main():
             log_fn=log,
         )
 
-        def detect_plates_in_frame(frame, detector=None, ocr=None):
-            return detect_license_plates(
-                frame,
-                detector=detector,
-                ocr=ocr,
-                imgsz=LPR_IMAGE_SIZE,
-                charset=lpr_charset,
-            )
-
         plate_tracker = PlateTracker()
         if MQTT_ENABLED:
             mqtt_svc = MqttService(on_log=log)
@@ -232,10 +232,6 @@ def main():
         cam3.start()
         grabber2 = FrameGrabber(RTSP_URL_2)
         grabber2.start()
-
-        detect_coord = DetectCoordinator([cam1, cam3], plate_tracker, detect_plates_in_frame)
-        detect_coord.configure_split_pipeline(detect_plate_regions, recognize_plate_regions, lpr_charset)
-        detect_coord.start()
 
         vehicle_tracker = None
         if handles.vehicle is not None:
@@ -255,7 +251,7 @@ def main():
         storage_maintenance.start()
         if IMAGE_RETENTION_ENABLED:
             retention_cleaner = ImageRetentionCleaner(
-                [CAPTURE_DIR, UNDETECTABLE_DIR],
+                [CAPTURE_DIR, UNDETECTABLE_DIR, NO_STABLE_DIR, NO_PLATE_DIR],
                 IMAGE_RETENTION_DAYS,
                 IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
                 IMAGE_RETENTION_EXTENSIONS,
@@ -267,13 +263,34 @@ def main():
             plate_tracker=plate_tracker,
             mqtt_svc=mqtt_svc,
             vehicle_tracker=vehicle_tracker,
-            detect_coord=detect_coord,
             rear_grabber=grabber2,
             lpr_grabbers={"cam1": cam1, "cam3": cam3},
             save_images_fn=ImageSaveWorker.save_and_upload_now,
             undetectable_dir=UNDETECTABLE_DIR,
             cam2_result_crop=CAM2_RESULT_CROP,
         )
+        frame_spool = SessionFrameSpool(
+            LPR_SPOOL_DIR,
+            cam1,
+            cam3,
+            interval=SESSION_FRAME_INTERVAL_SECONDS,
+            jpeg_quality=SESSION_FRAME_JPEG_QUALITY,
+            notification_queue_size=SESSION_FRAME_QUEUE_SIZE,
+            disk_cap_bytes=SESSION_FRAME_DISK_CAP_BYTES,
+            min_free_bytes=SESSION_FRAME_MIN_FREE_BYTES,
+        )
+        session_manager.frame_spool = frame_spool
+        deferred_lpr = DeferredLprWorker(
+            frame_spool,
+            [cam1, cam3],
+            lpr_charset,
+            lambda metadata, tracker: session_manager.finalize_deferred_session(metadata, tracker, log),
+            detect_regions_fn=detect_plate_regions,
+            recognize_regions_fn=recognize_plate_regions,
+            log_fn=log,
+        )
+        frame_spool.start()
+        deferred_lpr.start()
         ImageSaveWorker.start_upload_worker()
         image_worker_started = True
         if MQTT_ENABLED and mqtt_svc:
@@ -294,8 +311,12 @@ def main():
         if reader:
             reader.on_weight = reader.on_frame = reader.on_status_change = None
             cleanup("scale_reader", reader.stop)
-        if detect_coord:
-            lpr_stopped = cleanup("lpr_coordinator", detect_coord.stop) is not False
+        if session_manager:
+            cleanup("session_manager", lambda: session_manager.shutdown(log))
+        if deferred_lpr:
+            lpr_stopped = cleanup("deferred_lpr", deferred_lpr.stop) is not False
+        if frame_spool:
+            cleanup("session_frame_spool", frame_spool.stop)
         if vehicle_coord:
             vehicle_stopped = cleanup("vehicle_coordinator", vehicle_coord.stop) is not False
         for name, camera in (("cam2", grabber2), ("cam3", cam3), ("cam1", cam1)):

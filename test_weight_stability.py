@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import sys
+import os
 from datetime import datetime, timedelta
 from unittest.mock import Mock
 
@@ -34,19 +35,19 @@ class WeightStabilityTests(unittest.TestCase):
         return frames
 
     def test_twenty_kg_spread_is_stable_at_window_mode(self):
-        frames = self.statuses([39120, 39120, 39130, 39130, 39120])
+        frames = self.statuses([39120, 39120, 39130, 39130, 39120] * 2)
 
         self.assertEqual(frames[-1].status, "STABLE")
         self.assertEqual(frames[-1].stable_weight, 39120)
 
     def test_latest_reading_breaks_window_mode_tie(self):
-        frames = self.statuses([39120, 39120, 39130, 39130, 39140])
+        frames = self.statuses([39120, 39120, 39130, 39130, 39140] * 2)
 
         self.assertEqual(frames[-1].status, "STABLE")
         self.assertEqual(frames[-1].stable_weight, 39130)
 
     def test_more_than_twenty_kg_spread_is_unstable(self):
-        frames = self.statuses([39120, 39120, 39130, 39130, 39150])
+        frames = self.statuses([39120, 39120, 39130, 39130, 39150] * 2)
 
         self.assertEqual(frames[-1].status, "UNSTABLE")
         self.assertIsNone(frames[-1].stable_weight)
@@ -60,6 +61,11 @@ class WeightStabilityTests(unittest.TestCase):
 
         self.reader.on_frame.assert_not_called()
         self.assertEqual(list(self.reader._recent_weights), [])
+
+    def test_nine_readings_do_not_reach_stability(self):
+        frames = self.statuses([39120] * 9)
+
+        self.assertTrue(all(frame.status == "UNSTABLE" for frame in frames))
 
     def test_scale_database_retains_one_year(self):
         now = datetime(2026, 7, 14, 12, 0, 0)
@@ -183,6 +189,77 @@ class SessionWeightTests(unittest.TestCase):
         self.manager.session.stable_weight = 38500
         with unittest.mock.patch("services.session.session_manager.time.time", return_value=12.0):
             self.assertTrue(self.manager._can_start_session(Mock()))
+
+    def test_recent_same_plate_skips_regardless_of_weight(self):
+        self.manager._last_publish_plate = "15C-326.77"
+        self.manager._last_publish_weight = 8500
+        self.manager._last_publish_session_end = "2026-07-15T06:26:48+00:00"
+
+        self.assertTrue(self.manager._should_skip_duplicate_publish(
+            "15C-326.77", 47500, "2026-07-15T06:26:52+00:00"
+        ))
+        self.assertFalse(self.manager._should_skip_duplicate_publish(
+            "16N-6554", 47500, "2026-07-15T06:26:52+00:00"
+        ))
+
+    def test_same_plate_at_ten_seconds_is_allowed(self):
+        self.manager._last_publish_plate = "15C-326.77"
+        self.manager._last_publish_weight = 8500
+        self.manager._last_publish_session_end = "2026-07-15T06:26:48+00:00"
+
+        self.assertFalse(self.manager._should_skip_duplicate_publish(
+            "15C-326.77", 47500, "2026-07-15T06:26:58+00:00"
+        ))
+
+    def test_chained_attempt_waits_for_500kg_change(self):
+        self.manager.session.session_active = False
+        self.manager._attempt_wait_reference = 10000
+        frame = make_frame(10300)
+        frame.status = "UNSTABLE"
+
+        self.manager.on_frame(frame, Mock())
+        self.assertIsNone(self.manager._attempt)
+
+        frame.weight = 10600
+        self.manager.on_frame(frame, Mock())
+        self.assertIsNotNone(self.manager._attempt)
+
+
+class AttemptArchiveTests(unittest.TestCase):
+    def test_unstable_attempt_archives_maximum_weight_after_empty_dwell(self):
+        manager = SessionManager(Mock(), lpr_grabbers={})
+        manager._save_diagnostic_frames = Mock(return_value=0)
+        unstable = make_frame(1000)
+        unstable.status = "UNSTABLE"
+        empty = make_frame(0)
+        empty.status = "UNSTABLE"
+
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time",
+            side_effect=[10.0, 11.0, 12.0, 14.0],
+        ):
+            manager.on_frame(unstable, Mock())
+            unstable.weight = 1600
+            manager.on_frame(unstable, Mock())
+            manager.on_frame(empty, Mock())
+            manager.on_frame(empty, Mock())
+
+        manager._save_diagnostic_frames.assert_called_once()
+        metadata = manager._save_diagnostic_frames.call_args.args[3]
+        self.assertEqual(metadata["maximum_weight_kg"], 1600)
+        self.assertIsNone(manager._attempt)
+
+    def test_stable_attempt_promotes_without_no_stable_archive(self):
+        manager = SessionManager(Mock(), lpr_grabbers={})
+        manager._archive_no_stable = Mock()
+        frame = make_frame(1200)
+        frame.status = "STABLE"
+        frame.stable_weight = 1200
+
+        manager.on_frame(frame, Mock())
+
+        self.assertTrue(manager.session.session_active)
+        manager._archive_no_stable.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

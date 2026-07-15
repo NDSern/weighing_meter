@@ -1,0 +1,172 @@
+import json
+import os
+import tempfile
+import time
+import unittest
+
+import sys
+from types import ModuleType
+
+try:
+    import cv2
+    import numpy as np
+except ModuleNotFoundError:
+    cv2 = ModuleType("cv2")
+    cv2.IMWRITE_JPEG_QUALITY = 1
+    sys.modules.setdefault("cv2", cv2)
+    np = None
+
+from services.capture.session_frame_spool import SessionFrameSpool
+
+
+class Grabber:
+    def __init__(self, value):
+        self.frame = Frame(value)
+        self.reads = 0
+
+    def peek_latest_frame(self, copy_frame=False):
+        self.reads += 1
+        return self.frame.copy() if copy_frame else self.frame
+
+
+class Frame:
+    def __init__(self, value):
+        self.value = value
+
+    def copy(self):
+        return Frame(self.value)
+
+
+class Encoded:
+    def __init__(self, data):
+        self.data = data
+
+    def tobytes(self):
+        return self.data
+
+
+class FakeCv2:
+    IMWRITE_JPEG_QUALITY = 1
+
+    @staticmethod
+    def imencode(_extension, frame, _options):
+        return True, Encoded(("jpeg:%s" % frame.value).encode())
+
+    @staticmethod
+    def imread(path):
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as handle:
+            return Frame(handle.read())
+
+
+class SessionFrameSpoolTests(unittest.TestCase):
+    def make_spool(self, root, **kwargs):
+        return SessionFrameSpool(
+            root, Grabber(40), Grabber(180), interval=0.03,
+            min_free_bytes=0, cv2_module=FakeCv2, **kwargs
+        )
+
+    def test_samples_active_session_as_jpegs_and_keeps_sessions_separate(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.start()
+            spool.begin_session("A", {"cam1": Frame(0)})
+            time.sleep(0.11)
+            job_a = spool.end_session("A", {"weight": 10})
+            with open(job_a, encoding="utf-8") as handle:
+                manifest_a = json.load(handle)
+
+            spool.begin_session("B")
+            time.sleep(0.07)
+            # Reading A while B captures must not block or mutate A.
+            for name in manifest_a["files"]:
+                self.assertIsNotNone(FakeCv2.imread(os.path.join(manifest_a["session_dir"], name)))
+            job_b = spool.end_session("B", {"weight": 20})
+            self.assertTrue(spool.stop(1))
+
+            with open(job_b, encoding="utf-8") as handle:
+                manifest_b = json.load(handle)
+            self.assertGreaterEqual(manifest_a["frame_counts"]["cam1"], 2)
+            self.assertGreaterEqual(manifest_b["frame_counts"]["cam3"], 1)
+            self.assertNotEqual(manifest_a["session_dir"], manifest_b["session_dir"])
+            self.assertEqual(manifest_a["metadata"], {"weight": 10})
+
+    def test_pending_jobs_recover_fifo_after_queue_overflow_and_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, notification_queue_size=1)
+            paths = []
+            for session_id in ("one", "two", "three"):
+                spool.begin_session(session_id)
+                paths.append(spool.end_session(session_id, {}))
+
+            restarted = self.make_spool(root, notification_queue_size=1)
+            recovered = []
+            for _ in paths:
+                path = restarted.get_pending_job(timeout=0)
+                recovered.append(path)
+                restarted.acknowledge_job(path)
+            self.assertEqual(recovered, paths)
+            self.assertIsNone(restarted.get_pending_job(timeout=0))
+
+    def test_disk_cap_marks_manifest_incomplete_without_frame_buffering(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, disk_cap_bytes=0)
+            spool.start()
+            spool.begin_session("full", {"cam1": Frame(0)})
+            time.sleep(0.05)
+            job = spool.end_session("full", {"reason": "test"})
+            spool.stop(1)
+
+            with open(job, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            self.assertTrue(manifest["incomplete"])
+            self.assertIn("disk cap reached", manifest["errors"])
+            self.assertEqual(manifest["files"], [])
+            self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(root)))
+
+    def test_rejects_overlapping_or_unsafe_sessions(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            with self.assertRaises(ValueError):
+                spool.begin_session("../escape")
+            spool.begin_session("safe")
+            with self.assertRaises(RuntimeError):
+                spool.begin_session("other")
+
+    def test_manifest_failure_keeps_session_active_for_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("retry")
+            original = spool._atomic_json
+            spool._atomic_json = lambda *_args: (_ for _ in ()).throw(OSError("disk"))
+            with self.assertRaises(OSError):
+                spool.end_session("retry", {})
+            spool._atomic_json = original
+
+            path = spool.end_session("retry", {})
+            self.assertTrue(os.path.exists(path))
+
+    def test_acknowledge_removes_manifest_and_session_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("done", {"cam1": Frame(1)})
+            path = spool.end_session("done", {})
+
+            spool.acknowledge_job(path)
+
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(os.path.exists(session_dir))
+
+    def test_abort_clears_partial_active_session(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("partial", {"cam1": Frame(1)})
+
+            self.assertTrue(spool.abort_session("partial"))
+            self.assertFalse(os.path.exists(session_dir))
+            spool.begin_session("next")
+
+
+if __name__ == "__main__":
+    unittest.main()

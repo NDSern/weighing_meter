@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from services.storage.dead_letter import is_expired
-from services.storage.retention_cleaner import StorageMaintenance
+from services.storage.retention_cleaner import ImageRetentionCleaner, StorageMaintenance
 
 
 class DeadLetterTests(unittest.TestCase):
@@ -38,6 +38,30 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(old_log))
             self.assertTrue(os.path.exists(recent_log))
             self.assertTrue(os.path.exists(unrelated))
+
+    def test_diagnostic_path_date_removes_images_and_metadata_after_30_days(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_dir = os.path.join(root, "2026", "06", "01")
+            recent_dir = os.path.join(root, "2026", "07", "14")
+            os.makedirs(old_dir)
+            os.makedirs(recent_dir)
+            old_image = os.path.join(old_dir, "attempt_cam1.jpg")
+            old_metadata = os.path.join(old_dir, "attempt.json")
+            recent_image = os.path.join(recent_dir, "session_cam1.jpg")
+            for path in (old_image, old_metadata, recent_image):
+                open(path, "w").close()
+            now = datetime(2026, 7, 15, 12, 0, 0).timestamp()
+            cleaner = ImageRetentionCleaner(
+                [root], 30, 86400, {".jpg", ".json"}
+            )
+
+            result = cleaner.run_once(now=now)
+
+            self.assertEqual(result["deleted"], 2)
+            self.assertEqual(result["deleted_by_path_date"], 2)
+            self.assertFalse(os.path.exists(old_image))
+            self.assertFalse(os.path.exists(old_metadata))
+            self.assertTrue(os.path.exists(recent_image))
 
 
 if __name__ == "__main__":

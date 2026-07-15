@@ -42,10 +42,13 @@ class PlateTracker:
         self._undetectable_frame = None  # first "unknown" frame for undetectable save
         self._undetectable_saved = False  # only save once per session
 
-    def add_observation(self, plate_text: str, det_conf: float, crop_w: int, crop_h: int, source: str = "selected"):
+    def add_observation(
+        self, plate_text: str, det_conf: float, crop_w: int, crop_h: int,
+        source: str = "selected", observed_at=None,
+    ):
         crop_score = min(1.0, (crop_w * crop_h) / (200.0 * 60.0))
         weight = det_conf * crop_score
-        ts = time.time()
+        ts = time.time() if observed_at is None else observed_at
         with self._lock:
             self._observations.append((plate_text, weight, source, ts))
 

@@ -1,0 +1,365 @@
+"""Bounded, durable JPEG capture for active weighing sessions."""
+
+import json
+import os
+import queue
+import shutil
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+
+import cv2
+
+
+class SessionFrameSpool:
+    """Periodically persist latest camera frames and queue finalized sessions."""
+
+    def __init__(
+        self,
+        root_dir,
+        cam1_grabber,
+        cam3_grabber,
+        interval=0.2,
+        jpeg_quality=90,
+        notification_queue_size=32,
+        disk_cap_bytes=None,
+        min_free_bytes=64 * 1024 * 1024,
+        cv2_module=cv2,
+    ):
+        if interval <= 0:
+            raise ValueError("interval must be positive")
+        self.root_dir = os.path.abspath(root_dir)
+        self.sessions_dir = os.path.join(self.root_dir, "sessions")
+        self.jobs_dir = os.path.join(self.root_dir, "pending")
+        self.cleanup_dir = os.path.join(self.root_dir, "cleanup")
+        self.failed_dir = os.path.join(self.root_dir, "failed")
+        self._grabbers = {"cam1": cam1_grabber, "cam3": cam3_grabber}
+        self._interval = interval
+        self._jpeg_quality = jpeg_quality
+        self._disk_cap_bytes = disk_cap_bytes
+        self._min_free_bytes = min_free_bytes
+        self._cv2 = cv2_module
+        self._notifications = queue.Queue(maxsize=notification_queue_size)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._active = None
+        self._sequence = 0
+        self._known_notifications = set()
+        self._bytes_written = 0
+
+        os.makedirs(self.sessions_dir, exist_ok=True)
+        os.makedirs(self.jobs_dir, exist_ok=True)
+        os.makedirs(self.cleanup_dir, exist_ok=True)
+        os.makedirs(self.failed_dir, exist_ok=True)
+        self._bytes_written = self._directory_size(self.sessions_dir)
+        self._recover_notifications()
+        self._remove_orphan_sessions()
+
+    def start(self):
+        """Start sampler thread. Safe to call more than once."""
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._capture_loop, name="session-frame-spool", daemon=True
+            )
+            self._thread.start()
+
+    def stop(self, timeout=3.0):
+        """Request sampler shutdown and report whether it stopped in time."""
+        self._stop_event.set()
+        thread = self._thread
+        if thread:
+            thread.join(timeout)
+        return not thread or not thread.is_alive()
+
+    def begin_session(self, session_id, start_frames=None):
+        """Begin one session, optionally persisting already-captured camera frames."""
+        session_id = str(session_id)
+        if not session_id or session_id in (".", "..") or os.path.basename(session_id) != session_id:
+            raise ValueError("session_id must be one path-safe segment")
+        with self._lock:
+            if self._active is not None:
+                raise RuntimeError("a session is already active")
+            session_dir = os.path.join(self.sessions_dir, session_id)
+            if os.path.exists(session_dir):
+                raise FileExistsError(session_dir)
+            os.makedirs(session_dir)
+            self._active = {
+                "session_id": session_id,
+                "session_dir": session_dir,
+                "started_at": self._now(),
+                "files": [],
+                "incomplete": False,
+                "errors": [],
+                "counts": {"cam1": 0, "cam3": 0},
+            }
+            for camera, frame in (start_frames or {}).items():
+                if camera in self._grabbers and frame is not None:
+                    self._save_frame_locked(camera, frame, "start")
+        return session_dir
+
+    def end_session(self, session_id, metadata):
+        """Finalize active session atomically and return durable job manifest path."""
+        with self._lock:
+            if self._active is None or self._active["session_id"] != str(session_id):
+                raise ValueError("session is not active")
+            active = self._active
+            self._sequence += 1
+            job_name = "%020d-%08d-%s.json" % (
+                time.time_ns(), self._sequence, uuid.uuid4().hex
+            )
+            manifest_path = os.path.join(self.jobs_dir, job_name)
+            manifest = {
+                "session_id": active["session_id"],
+                "session_dir": active["session_dir"],
+                "started_at": active["started_at"],
+                "ended_at": self._now(),
+                "files": list(active["files"]),
+                "frame_counts": dict(active["counts"]),
+                "capture_interval_seconds": self._interval,
+                "metadata": metadata,
+                "incomplete": active["incomplete"],
+                "errors": list(active["errors"]),
+            }
+            self._atomic_json(manifest_path, manifest)
+            self._active = None
+        self._notify(manifest_path)
+        return manifest_path
+
+    def get_pending_job(self, timeout=None):
+        """Return oldest pending manifest path; disk scan covers queue overflow/restart."""
+        self._recover_notifications()
+        try:
+            path = self._notifications.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        self._known_notifications.discard(path)
+        if os.path.exists(path):
+            return path
+        return self.get_pending_job(timeout=0)
+
+    def acknowledge_job(self, manifest_path):
+        """Remove a processed job marker and its captured session files."""
+        path = os.path.abspath(manifest_path)
+        if os.path.dirname(path) != self.jobs_dir:
+            raise ValueError("manifest is outside pending directory")
+        cleanup_path = os.path.join(self.cleanup_dir, os.path.basename(path))
+        os.replace(path, cleanup_path)
+        session_dir = None
+        try:
+            with open(cleanup_path, encoding="utf-8") as handle:
+                session_dir = json.load(handle).get("session_dir")
+        except (OSError, ValueError, TypeError):
+            pass
+        if session_dir:
+            session_dir = os.path.abspath(session_dir)
+            if os.path.dirname(session_dir) == self.sessions_dir:
+                try:
+                    size = self._directory_size(session_dir)
+                    shutil.rmtree(session_dir)
+                    self._bytes_written = max(0, self._bytes_written - size)
+                except OSError as exc:
+                    raise OSError("session cleanup failed: %s" % exc) from exc
+        try:
+            os.unlink(cleanup_path)
+        except FileNotFoundError:
+            pass
+        self._known_notifications.discard(path)
+
+    def abort_session(self, session_id):
+        """Discard one partially initialized active session."""
+        with self._lock:
+            if self._active is None or self._active["session_id"] != str(session_id):
+                return False
+            session_dir = self._active["session_dir"]
+            self._active = None
+            size = self._directory_size(session_dir)
+            shutil.rmtree(session_dir, ignore_errors=True)
+            self._bytes_written = max(0, self._bytes_written - size)
+            return True
+
+    def fail_job(self, manifest_path):
+        """Move a permanently failed manifest out of FIFO while preserving frames."""
+        path = os.path.abspath(manifest_path)
+        if os.path.dirname(path) != self.jobs_dir:
+            raise ValueError("manifest is outside pending directory")
+        target = os.path.join(self.failed_dir, os.path.basename(path))
+        os.replace(path, target)
+        self._known_notifications.discard(path)
+        return target
+
+    def save_session_frame(self, session_id, name, frame):
+        """Persist an auxiliary frame inside the active session directory."""
+        with self._lock:
+            if self._active is None or self._active["session_id"] != str(session_id):
+                raise ValueError("session is not active")
+            if os.path.basename(name) != name:
+                raise ValueError("name must be one path-safe segment")
+            path = os.path.join(self._active["session_dir"], name)
+            ok, encoded = self._cv2.imencode(
+                ".jpg", frame, [self._cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
+            )
+            if not ok:
+                raise OSError("JPEG encoding failed")
+            data = encoded.tobytes()
+            reason = self._space_failure(len(data))
+            if reason:
+                self._active["incomplete"] = True
+                if reason not in self._active["errors"]:
+                    self._active["errors"].append(reason)
+                return None
+            self._atomic_bytes(path, data)
+            self._bytes_written += len(data)
+            return path
+
+    def _remove_orphan_sessions(self):
+        referenced = set()
+        try:
+            manifests = [os.path.join(self.jobs_dir, name) for name in os.listdir(self.jobs_dir)
+                         if name.endswith(".json")]
+        except OSError:
+            return
+        for path in manifests:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    referenced.add(os.path.abspath(json.load(handle)["session_dir"]))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        try:
+            names = os.listdir(self.sessions_dir)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.abspath(os.path.join(self.sessions_dir, name))
+            if path not in referenced and os.path.isdir(path):
+                try:
+                    size = self._directory_size(path)
+                    shutil.rmtree(path)
+                    self._bytes_written = max(0, self._bytes_written - size)
+                except OSError:
+                    pass
+
+    def _capture_loop(self):
+        next_capture = time.monotonic()
+        while not self._stop_event.is_set():
+            delay = max(0.0, next_capture - time.monotonic())
+            if self._stop_event.wait(delay):
+                break
+            with self._lock:
+                if self._active is not None:
+                    for camera, grabber in self._grabbers.items():
+                        frame = self._read_frame(grabber)
+                        if frame is not None:
+                            self._save_frame_locked(camera, frame, "sample")
+            next_capture = max(next_capture + self._interval, time.monotonic())
+
+    @staticmethod
+    def _read_frame(grabber):
+        if grabber is None:
+            return None
+        peek = getattr(grabber, "peek_latest_frame", None)
+        if peek:
+            return peek(copy_frame=True)
+        if callable(grabber):
+            return grabber()
+        raise TypeError("grabber must be callable or expose peek_latest_frame")
+
+    def _save_frame_locked(self, camera, frame, kind):
+        active = self._active
+        index = active["counts"][camera]
+        name = "%s-%06d-%s.jpg" % (camera, index, kind)
+        path = os.path.join(active["session_dir"], name)
+        try:
+            ok, encoded = self._cv2.imencode(
+                ".jpg", frame, [self._cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
+            )
+            if not ok:
+                raise OSError("JPEG encoding failed")
+            data = encoded.tobytes()
+            reason = self._space_failure(len(data))
+            if reason:
+                active["incomplete"] = True
+                if reason not in active["errors"]:
+                    active["errors"].append(reason)
+                return False
+            self._atomic_bytes(path, data)
+            self._bytes_written += len(data)
+            active["counts"][camera] += 1
+            active["files"].append(os.path.relpath(path, active["session_dir"]))
+            return True
+        except Exception as exc:
+            active["incomplete"] = True
+            active["errors"].append("%s: %s" % (camera, exc))
+            return False
+
+    def _space_failure(self, size):
+        if self._disk_cap_bytes is not None and self._bytes_written + size > self._disk_cap_bytes:
+            return "disk cap reached"
+        try:
+            if shutil.disk_usage(self.root_dir).free - size < self._min_free_bytes:
+                return "minimum free space reached"
+        except OSError as exc:
+            return "free-space check failed: %s" % exc
+        return None
+
+    def _recover_notifications(self):
+        try:
+            paths = sorted(
+                os.path.join(self.jobs_dir, name)
+                for name in os.listdir(self.jobs_dir)
+                if name.endswith(".json")
+            )
+        except OSError:
+            return
+        for path in paths:
+            self._notify(path)
+
+    def _notify(self, path):
+        if path in self._known_notifications:
+            return
+        try:
+            self._notifications.put_nowait(path)
+            self._known_notifications.add(path)
+        except queue.Full:
+            pass
+
+    @staticmethod
+    def _atomic_bytes(path, data):
+        temp = path + ".tmp-" + uuid.uuid4().hex
+        try:
+            with open(temp, "xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        finally:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
+
+    @classmethod
+    def _atomic_json(cls, path, value):
+        cls._atomic_bytes(
+            path,
+            json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+        )
+
+    @staticmethod
+    def _directory_size(path):
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+        return total
+
+    @staticmethod
+    def _now():
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
