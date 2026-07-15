@@ -3,7 +3,14 @@ import os
 import queue
 import tempfile
 import unittest
+import sys
 from unittest.mock import patch
+from unittest.mock import Mock
+
+sys.modules.setdefault("cv2", Mock())
+sys.modules.setdefault("numpy", Mock())
+sys.modules.setdefault("minio", Mock())
+sys.modules.setdefault("minio.error", Mock())
 
 from services.storage import publish_outbox as module
 from services.storage.publish_outbox import PublishOutbox
@@ -68,6 +75,15 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
 
         self.assertTrue(session_module.isSessionFinalized("session-3"))
         self.assertFalse(session_module.isSessionFinalized("session-4"))
+
+    def test_plate_count_updates_once_per_session_id(self):
+        db_path = os.path.join(self.root.name, "plates.db")
+        with patch.object(session_module, "SERVICE_DIR", self.root.name):
+            first = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")
+            replay = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")
+
+        self.assertEqual(first, 1)
+        self.assertEqual(replay, 1)
 
 
 if __name__ == "__main__":

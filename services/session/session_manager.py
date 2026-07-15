@@ -89,7 +89,7 @@ def log_metric(log_fn, event, **fields):
     log_fn("METRIC", json.dumps({"event": event, **fields}, separators=(",", ":"), sort_keys=True))
 
 
-def saveConfirmedLicensePlate(license_plate):
+def saveConfirmedLicensePlate(license_plate, session_id=None):
     """Persist confirmed plate count once per confirmed session."""
     if not license_plate or license_plate == "none":
         return None
@@ -110,6 +110,26 @@ def saveConfirmedLicensePlate(license_plate):
                         last_seen_at TEXT NOT NULL
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS confirmed_plate_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        license_plate TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+                if session_id:
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO confirmed_plate_sessions "
+                        "(session_id, license_plate, created_at) VALUES (?, ?, ?)",
+                        (session_id, license_plate, now),
+                    )
+                    if cursor.rowcount == 0:
+                        row = conn.execute(
+                            "SELECT recognition_count FROM confirmed_license_plates WHERE license_plate = ?",
+                            (license_plate,),
+                        ).fetchone()
+                        conn.commit()
+                        return row[0] if row else None
                 conn.execute("""
                     INSERT INTO confirmed_license_plates (
                         license_plate,
