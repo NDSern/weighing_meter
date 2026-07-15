@@ -106,7 +106,10 @@ class SessionFrameSpoolTests(unittest.TestCase):
                 path = restarted.get_pending_job(timeout=0)
                 recovered.append(path)
                 restarted.acknowledge_job(path)
-            self.assertEqual(recovered, paths)
+            self.assertEqual([os.path.basename(path) for path in recovered],
+                             [os.path.basename(path) for path in paths])
+            self.assertTrue(all(os.path.dirname(path) == restarted.processing_dir
+                                for path in recovered))
             self.assertIsNone(restarted.get_pending_job(timeout=0))
 
     def test_disk_cap_marks_manifest_incomplete_without_frame_buffering(self):
@@ -166,6 +169,97 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertTrue(spool.abort_session("partial"))
             self.assertFalse(os.path.exists(session_dir))
             spool.begin_session("next")
+
+    def test_active_manifest_is_durable_and_metadata_updates(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("active")
+            marker = os.path.join(spool.active_dir, "active.json")
+            self.assertTrue(os.path.exists(marker))
+            spool.update_active_metadata("active", {"weight": 12})
+            with open(marker, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["metadata"], {"weight": 12})
+            pending = spool.end_session("active", {"weight": 13})
+            self.assertTrue(os.path.exists(pending))
+            self.assertFalse(os.path.exists(marker))
+
+    def test_restart_requeues_processing_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("claimed", {"cam1": Frame(1)})
+            pending = spool.end_session("claimed", {})
+            processing = spool.get_pending_job(timeout=0)
+            self.assertFalse(os.path.exists(pending))
+            self.assertEqual(os.path.dirname(processing), spool.processing_dir)
+
+            restarted = self.make_spool(root)
+            recovered = restarted.get_pending_job(timeout=0)
+            self.assertEqual(os.path.basename(recovered), os.path.basename(processing))
+
+    def test_restart_finishes_cleanup_without_requeue(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("cleanup", {"cam1": Frame(1)})
+            spool.end_session("cleanup", {})
+            processing = spool.get_pending_job(timeout=0)
+            cleanup = os.path.join(spool.cleanup_dir, os.path.basename(processing))
+            os.replace(processing, cleanup)
+
+            restarted = self.make_spool(root)
+            self.assertFalse(os.path.exists(cleanup))
+            self.assertFalse(os.path.exists(session_dir))
+            self.assertIsNone(restarted.get_pending_job(timeout=0))
+
+    def test_restart_recovers_active_frames_as_incomplete_pending(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("interrupted", {"cam1": Frame(1)})
+            spool.update_active_metadata("interrupted", {
+                "session_id": "interrupted",
+                "started_at": "2026-07-15T00:00:00+00:00",
+                "stable_weight": 9000,
+                "decimal_pos": 0,
+                "stability_rule": "exact_5",
+            })
+
+            restarted = self.make_spool(root)
+            processing = restarted.get_pending_job(timeout=0)
+            with open(processing, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            self.assertEqual(manifest["metadata"]["end_reason"], "machine_offline")
+            self.assertTrue(manifest["metadata"]["recovered_after_restart"])
+            self.assertTrue(manifest["metadata"]["incomplete"])
+            self.assertEqual(manifest["metadata"]["stable_weight"], 9000)
+            self.assertEqual(manifest["metadata"]["end_reason"], "machine_offline")
+            self.assertIn("ended_at", manifest["metadata"])
+            self.assertGreaterEqual(manifest["metadata"]["duration_s"], 0)
+            self.assertFalse(os.path.exists(os.path.join(restarted.active_dir,
+                                                         "interrupted.json")))
+
+    def test_orphans_and_corrupt_manifests_are_quarantined(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            orphan = os.path.join(spool.sessions_dir, "orphaned")
+            os.makedirs(orphan)
+            corrupt = os.path.join(spool.jobs_dir, "000-corrupt.json")
+            with open(corrupt, "w", encoding="utf-8") as handle:
+                handle.write("{")
+
+            restarted = self.make_spool(root)
+            self.assertTrue(os.path.isdir(os.path.join(restarted.orphan_dir, "orphaned")))
+            self.assertTrue(any(name.startswith("000-corrupt.json")
+                                for name in os.listdir(restarted.failed_dir)))
+
+    def test_failed_jobs_and_job_paths_use_processing_state_safely(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("failed")
+            spool.end_session("failed", {})
+            processing = spool.get_pending_job(timeout=0)
+            failed = spool.fail_job(processing)
+            self.assertEqual(os.path.dirname(failed), spool.failed_dir)
+            with self.assertRaises(ValueError):
+                spool.acknowledge_job(os.path.join(root, "outside.json"))
 
 
 if __name__ == "__main__":

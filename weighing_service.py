@@ -289,13 +289,13 @@ def main():
             recognize_regions_fn=recognize_plate_regions,
             log_fn=log,
         )
-        frame_spool.start()
-        deferred_lpr.start()
         ImageSaveWorker.start_upload_worker()
         image_worker_started = True
         if MQTT_ENABLED and mqtt_svc:
             PublishOutbox.start(mqtt_svc)
             outbox_started = True
+        frame_spool.start()
+        deferred_lpr.start()
 
         reader.on_weight = lambda frame: session_manager.on_weight(frame, log)
         reader.on_frame = lambda frame: session_manager.on_frame(frame, log)

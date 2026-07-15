@@ -22,6 +22,7 @@ from config import (
     NO_STABLE_DIR,
     SAME_PLATE_DUPLICATE_SECONDS,
     SESSION_DEDUP_STATE_FILE,
+    SESSION_FINALIZATION_DB,
     SESSION_END_EMPTY_DWELL_SECONDS,
     SESSION_MIN_DURATION_SECONDS,
     SESSION_REARM_DELAY_SECONDS,
@@ -57,6 +58,31 @@ def log(level: str, msg: str):
     """Log using the configured log function."""
     if _log_fn:
         _log_fn(level, msg)
+
+
+def isSessionFinalized(session_id):
+    try:
+        with sqlite3.connect(SESSION_FINALIZATION_DB) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS finalized_sessions "
+                         "(session_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, finalized_at TEXT NOT NULL)")
+            return conn.execute(
+                "SELECT 1 FROM finalized_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def markSessionFinalized(session_id, outcome):
+    os.makedirs(os.path.dirname(SESSION_FINALIZATION_DB), exist_ok=True)
+    with sqlite3.connect(SESSION_FINALIZATION_DB) as conn:
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("CREATE TABLE IF NOT EXISTS finalized_sessions "
+                     "(session_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, finalized_at TEXT NOT NULL)")
+        conn.execute(
+            "INSERT OR IGNORE INTO finalized_sessions (session_id, outcome, finalized_at) VALUES (?, ?, ?)",
+            (session_id, outcome, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
 
 
 def log_metric(log_fn, event, **fields):
@@ -562,7 +588,11 @@ class SessionManager:
 
     @staticmethod
     def _save_diagnostic_frames(root, item_id, frames, metadata, log_fn):
-        now = datetime.now()
+        started_at = metadata.get("started_at")
+        try:
+            now = datetime.fromisoformat(started_at).astimezone() if started_at else datetime.now()
+        except (TypeError, ValueError):
+            now = datetime.now()
         target = os.path.join(root, now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
         try:
             os.makedirs(target, exist_ok=True)
@@ -571,13 +601,13 @@ class SessionManager:
             return False
         saved = []
         for camera, frame in frames.items():
-            path = os.path.join(target, f"{now:%H%M%S_%f}_{item_id}_{camera}.jpg")
+            path = os.path.join(target, f"{item_id}_{camera}.jpg")
             if ImageSaveWorker.save_local_only(path, frame):
                 saved.append(path)
             else:
                 log_fn("WARNING", f"Diagnostic image save failed camera={camera} id={item_id}")
         metadata = dict(metadata, images=saved)
-        path = os.path.join(target, f"{now:%H%M%S_%f}_{item_id}.json")
+        path = os.path.join(target, f"{item_id}.json")
         temp = path + ".tmp"
         metadata_saved = False
         try:
@@ -712,7 +742,18 @@ class SessionManager:
         if self.frame_spool:
             try:
                 session_dir = self.frame_spool.begin_session(
-                    self.session.session_id, self.session.lpr_start_frames
+                    self.session.session_id,
+                    self.session.lpr_start_frames,
+                    metadata={
+                        "session_id": self.session.session_id,
+                        "started_at": self.session.started_at_iso,
+                        "stable_weight": self.session.last_publish_weight,
+                        "decimal_pos": self.session.last_publish_decimal_pos,
+                        "stability_rule": self.session.stability_rule,
+                        "vehicle_type": self.session.vehicle_type,
+                        "rear_start_path": None,
+                        "start_frame_paths": {},
+                    },
                 )
                 self.session.spool_active = True
                 self.session.start_frame_paths = {
@@ -724,6 +765,19 @@ class SessionManager:
                     self.session.rear_start_path = self.frame_spool.save_session_frame(
                         self.session.session_id, "cam2-start.jpg", self.session.rear_start_frame
                     )
+                self.frame_spool.update_active_metadata(
+                    self.session.session_id,
+                    {
+                        "session_id": self.session.session_id,
+                        "started_at": self.session.started_at_iso,
+                        "stable_weight": self.session.last_publish_weight,
+                        "decimal_pos": self.session.last_publish_decimal_pos,
+                        "stability_rule": self.session.stability_rule,
+                        "vehicle_type": self.session.vehicle_type,
+                        "rear_start_path": self.session.rear_start_path,
+                        "start_frame_paths": dict(self.session.start_frame_paths),
+                    },
+                )
             except Exception as exc:
                 try:
                     self.frame_spool.abort_session(self.session.session_id)
@@ -882,6 +936,10 @@ class SessionManager:
     def finalize_deferred_session(self, metadata, tracker, log_fn=None):
         """Finalize one immutable ended session after deferred LPR completes."""
         log_fn = log_fn or log
+        session_id = metadata["session_id"]
+        if isSessionFinalized(session_id) or PublishOutbox.has_event(session_id):
+            log_fn("EVENT", f"Deferred session already finalized id={session_id}")
+            return True
         plate, score, count = tracker.get_confirmed_plate()
         if not plate:
             frames = self._load_start_frames(metadata)
@@ -901,6 +959,7 @@ class SessionManager:
                 end_reason=metadata["end_reason"],
                 stable_weight_kg=metadata["stable_weight"], images=saved,
             )
+            markSessionFinalized(session_id, "no_plate")
             return True
         result = self.publish_result(
             metadata["stable_weight"], metadata["decimal_pos"], log_fn,
@@ -914,6 +973,8 @@ class SessionManager:
             started_at=metadata["started_at"], ended_at=metadata["ended_at"],
             stable_weight_kg=metadata["stable_weight"],
         )
+        if result is not False:
+            markSessionFinalized(session_id, "duplicate" if result == "duplicate" else "published")
         return result is not False
 
     @staticmethod
@@ -954,6 +1015,7 @@ class SessionManager:
             result, stable_weight, decimal_pos, plate, image_aliases, log_fn,
             tracker=tracker, rear_start_path=metadata.get("rear_start_path"),
             start_frame_paths=metadata.get("start_frame_paths", {}),
+            session_id=metadata.get("session_id"),
         ):
             log_fn("ERROR", f"Publish skipped — image capture failed for plate={plate}")
             return False
@@ -965,7 +1027,7 @@ class SessionManager:
             log_fn("ERROR", f"Publish skipped — local image save failed for plate={plate}")
             return False
 
-        saved_count = saveConfirmedLicensePlate(plate)
+        saved_count = saveConfirmedLicensePlate(plate, metadata.get("session_id"))
         if saved_count is not None:
             log_fn("PLATE_DB", f"Saved confirmed plate={plate} recognition_count={saved_count}")
 
@@ -1011,11 +1073,11 @@ class SessionManager:
             f"PUBLISH wt={stable_weight:.{decimal_pos}f}kg plate={plate_text} score={score:.2f} hits={count} candidates=[{candidates}]",
         )
 
-    def _prepare_capture_paths(self, now, plate):
+    def _prepare_capture_paths(self, now, plate, session_id=None):
         date_path = now.strftime("%Y/%m/%d")
         day_dir = os.path.join(CAPTURE_DIR, now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
         os.makedirs(day_dir, exist_ok=True)
-        ts = now.strftime("%Y%m%d_%H%M%S_%f")
+        ts = session_id or now.strftime("%Y%m%d_%H%M%S_%f")
 
         def _make(suffix):
             fname = f"{ts}_{plate}_{suffix}.jpg"
@@ -1068,6 +1130,7 @@ class SessionManager:
     def _attach_publish_images(
         self, result, stable_weight, decimal_pos, plate, image_aliases, log_fn,
         tracker=None, rear_start_path=None, start_frame_paths=None,
+        session_id=None,
     ):
         import numpy as np
         attach_started_at = time.time()
@@ -1081,7 +1144,7 @@ class SessionManager:
 
         now = datetime.now()
         captured_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        paths = self._prepare_capture_paths(now, plate)
+        paths = self._prepare_capture_paths(now, plate, session_id)
         rear_frame = cv2.imread(rear_start_path) if rear_start_path else self.session.rear_start_frame
         if rear_frame is None and not rear_start_path and self.rear_grabber:
             rear_frame = self.rear_grabber.get_latest_frame()

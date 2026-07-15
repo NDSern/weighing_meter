@@ -144,6 +144,14 @@ class DeferredLprWorker:
         metadata = job["metadata"]
         if not isinstance(files, list) or not isinstance(metadata, dict):
             raise ValueError("manifest files and metadata have invalid types")
+        if metadata.get("recovered_after_restart"):
+            self._log(
+                "METRIC",
+                json.dumps(
+                    {"event": "session_recovered_active", "id": job.get("session_id")},
+                    separators=(",", ":"), sort_keys=True,
+                ),
+            )
 
         tracker = self._tracker_factory()
         successful_frames = 0

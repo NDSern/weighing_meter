@@ -23,6 +23,7 @@ NO_STABLE_DIR = os.path.join(SERVICE_DIR, "storage", "no-stable")
 NO_PLATE_DIR = os.path.join(SERVICE_DIR, "storage", "no-plate")
 LPR_SPOOL_DIR = os.path.join(SERVICE_DIR, "storage", "lpr-spool")
 SESSION_DEDUP_STATE_FILE = os.path.join(SERVICE_DIR, "storage", "session-dedup-state.json")
+SESSION_FINALIZATION_DB = os.path.join(SERVICE_DIR, "storage", "session-finalization.db")
 MQTT_ENABLED = True
 MQTT_HOST = "103.75.184.185"
 MQTT_PORT = 1883
