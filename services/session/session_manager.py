@@ -279,6 +279,7 @@ class WeighingSessionState:
         self.started_at_iso = None
         self.session_id = None
         self.spool_active = False
+        self.stability_rule = None
 
     def record_stable_weight(self, weight, decimal_pos):
         self.latest_stable_weight = weight
@@ -438,6 +439,8 @@ class SessionManager:
             plates_info += f"  plate={tracker_plate}({tracker_score:.2f})"
         if self.session.stable_count > 0:
             plates_info += f"  stable_count={self.session.stable_count}/{STABLE_COUNT_THRESHOLD}"
+        if frame.stability_rule:
+            plates_info += f"  stable_rule={frame.stability_rule}"
         log_fn(
             "WEIGHT",
             f"{frame.weight:>10.{frame.decimal_pos}f} kg  {frame.status:<10}{plates_info}{vehicle_info}",
@@ -445,17 +448,18 @@ class SessionManager:
 
     def on_frame(self, frame, log_fn):
         """Per-frame callback (fires on every scale frame)."""
-        if not self.session.session_active and self._attempt_wait_reference is not None:
-            if frame.weight <= WEIGHT_THRESHOLD:
-                self._attempt_wait_reference = None
-            elif abs(frame.weight - self._attempt_wait_reference) < SESSION_WEIGHT_DEPARTURE_KG:
-                return
-            else:
-                self._attempt_wait_reference = None
-        self._update_attempt(frame, log_fn)
         if frame.status == "STABLE":
+            self._update_attempt(frame, log_fn, allow_chained_stable=True)
             self._handle_stable_frame(frame, log_fn)
         else:
+            if not self.session.session_active and self._attempt_wait_reference is not None:
+                if frame.weight <= WEIGHT_THRESHOLD:
+                    self._attempt_wait_reference = None
+                elif abs(frame.weight - self._attempt_wait_reference) < SESSION_WEIGHT_DEPARTURE_KG:
+                    return
+                else:
+                    self._attempt_wait_reference = None
+            self._update_attempt(frame, log_fn)
             self.session.stable_count = 0
 
         if self._check_weight_departure(frame, log_fn):
@@ -473,6 +477,7 @@ class SessionManager:
 
         self.session.last_publish_weight = self.session.stable_weight
         self.session.last_publish_decimal_pos = self.session.stable_decimal_pos
+        self.session.stability_rule = frame.stability_rule
         if (
             not self.session.session_active
             and self.session.stable_count >= STABLE_COUNT_THRESHOLD
@@ -480,7 +485,7 @@ class SessionManager:
         ):
             self._start_session(frame.decimal_pos, log_fn)
 
-    def _update_attempt(self, frame, log_fn):
+    def _update_attempt(self, frame, log_fn, allow_chained_stable=False):
         if self.session.session_active:
             if self._attempt:
                 self._attempt["max_weight"] = max(self._attempt["max_weight"], frame.weight)
@@ -489,7 +494,7 @@ class SessionManager:
             self._attempt_rearm_low = min(self._attempt_rearm_low, frame.weight)
             if frame.weight <= WEIGHT_THRESHOLD:
                 self._attempt_rearm_low = None
-            elif frame.weight - self._attempt_rearm_low < SESSION_WEIGHT_DEPARTURE_KG:
+            elif not allow_chained_stable and frame.weight - self._attempt_rearm_low < SESSION_WEIGHT_DEPARTURE_KG:
                 return
             else:
                 self._attempt_rearm_low = None
@@ -733,6 +738,7 @@ class SessionManager:
             attempt_started_at=self.session.started_at_iso,
             stable_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             stable_weight_kg=self.session.stable_weight,
+            stability_rule=self.session.stability_rule,
         )
 
     def _capture_lpr_start_frames(self, log_fn):
@@ -823,6 +829,7 @@ class SessionManager:
         self.session.session_id = None
         self.session.rear_start_path = None
         self.session.spool_active = False
+        self.session.stability_rule = None
 
     def _snapshot_session(self, reason):
         ended_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")

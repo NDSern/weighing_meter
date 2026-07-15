@@ -42,6 +42,7 @@ LOG_INTERVAL  = 1.0          # Ghi DB mỗi N giây (0 = ghi mọi frame)
 
 # Stability detection
 STABLE_COUNT     = 10        # Consecutive readings required for software stability
+EXACT_STABLE_COUNT = 5       # Exact repeated readings required for fast stability
 STABLE_TOLERANCE = 20.0      # kg — max spread to be considered stable
 # ─────────────────────────────────────────────
 
@@ -57,6 +58,8 @@ class WeightFrame:
     digits_str:   str        # Raw 6-digit string (for overload detection)
     status:       str = "UNSTABLE"  # STABLE / UNSTABLE / OVERLOAD
     stable_weight: Optional[float] = None  # Mode of qualifying window, newest wins ties
+    stability_rule: Optional[str] = None  # exact_5 / spread_10
+    same_weight_count: int = 0
     timestamp:    datetime = field(default_factory=datetime.now)
 
     @property
@@ -319,6 +322,8 @@ class D2008Reader:
         self._last_log   = 0.0
         self._last_print = 0.0
         self._recent_weights = deque(maxlen=STABLE_COUNT)
+        self._same_weight = None
+        self._same_weight_count = 0
         self._prev_status = "UNSTABLE"
 
         # Callback — fires every ~1s for logging/display
@@ -423,10 +428,21 @@ class D2008Reader:
     def _get_status(self, frame: WeightFrame) -> str:
         """Determine scale status: OVERLOAD, STABLE, or UNSTABLE."""
         if frame.digits_str == "999999":
-            self._recent_weights.clear()
+            self._reset_stability_history()
             return "OVERLOAD"
 
         self._recent_weights.append(frame.weight)
+        if frame.weight == self._same_weight:
+            self._same_weight_count += 1
+        else:
+            self._same_weight = frame.weight
+            self._same_weight_count = 1
+        frame.same_weight_count = self._same_weight_count
+
+        if self._same_weight_count >= EXACT_STABLE_COUNT:
+            frame.stable_weight = frame.weight
+            frame.stability_rule = "exact_5"
+            return "STABLE"
 
         if len(self._recent_weights) >= STABLE_COUNT:
             w_min = min(self._recent_weights)
@@ -439,14 +455,20 @@ class D2008Reader:
                     for weight in reversed(self._recent_weights)
                     if counts[weight] == highest_count
                 )
+                frame.stability_rule = "spread_10"
                 return "STABLE"
 
         return "UNSTABLE"
 
+    def _reset_stability_history(self):
+        self._recent_weights.clear()
+        self._same_weight = None
+        self._same_weight_count = 0
+
     def _handle_frame(self, frame: WeightFrame):
         """Xử lý mỗi frame nhận được."""
         if not frame.checksum_ok:
-            self._recent_weights.clear()
+            self._reset_stability_history()
             self._prev_status = "UNSTABLE"
             return
         frame.status = self._get_status(frame)

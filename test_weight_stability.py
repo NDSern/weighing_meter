@@ -62,8 +62,20 @@ class WeightStabilityTests(unittest.TestCase):
         self.reader.on_frame.assert_not_called()
         self.assertEqual(list(self.reader._recent_weights), [])
 
-    def test_nine_readings_do_not_reach_stability(self):
-        frames = self.statuses([39120] * 9)
+    def test_four_exact_readings_do_not_reach_stability(self):
+        frames = self.statuses([39120] * 4)
+
+        self.assertTrue(all(frame.status == "UNSTABLE" for frame in frames))
+
+    def test_five_exact_readings_use_fast_stability(self):
+        frames = self.statuses([39120] * 5)
+
+        self.assertEqual(frames[-1].status, "STABLE")
+        self.assertEqual(frames[-1].stable_weight, 39120)
+        self.assertEqual(frames[-1].stability_rule, "exact_5")
+
+    def test_nine_nonexact_readings_do_not_reach_stability(self):
+        frames = self.statuses([39120, 39130] * 4 + [39120])
 
         self.assertTrue(all(frame.status == "UNSTABLE" for frame in frames))
 
@@ -101,6 +113,17 @@ class WeightStabilityTests(unittest.TestCase):
 
         self.assertEqual(self.reader._get_status(overload), "OVERLOAD")
         self.assertEqual(list(self.reader._recent_weights), [])
+        self.assertEqual(self.reader._same_weight_count, 0)
+
+    def test_invalid_checksum_resets_exact_stability_count(self):
+        self.statuses([39120] * 4)
+        frame = make_frame(39120)
+        frame.checksum_ok = False
+        self.reader._handle_frame(frame)
+
+        next_frame = self.statuses([39120])[0]
+        self.assertEqual(next_frame.status, "UNSTABLE")
+        self.assertEqual(next_frame.same_weight_count, 1)
 
 
 class SessionWeightTests(unittest.TestCase):
@@ -212,17 +235,70 @@ class SessionWeightTests(unittest.TestCase):
         ))
 
     def test_chained_attempt_waits_for_500kg_change(self):
-        self.manager.session.session_active = False
-        self.manager._attempt_wait_reference = 10000
+        manager = SessionManager(Mock())
+        manager._attempt_wait_reference = 10000
         frame = make_frame(10300)
         frame.status = "UNSTABLE"
 
-        self.manager.on_frame(frame, Mock())
-        self.assertIsNone(self.manager._attempt)
+        manager.on_frame(frame, Mock())
+        self.assertIsNone(manager._attempt)
 
-        frame.weight = 10600
+        frame = make_frame(10600)
+        frame.status = "UNSTABLE"
+        manager.on_frame(frame, Mock())
+        self.assertIsNotNone(manager._attempt)
+
+    def test_stable_frame_promotes_before_chained_wait_gate(self):
+        manager = SessionManager(Mock())
+        manager.session.rearm_block_until = 11.0
+        manager.session.rearm_reference_weight = 10000
+        manager.session.rearm_block_reason = "vehicle_left"
+        manager._attempt_wait_reference = 10000
+        frame = self.stable_frame(10600)
+        frame.stability_rule = "exact_5"
+
+        with unittest.mock.patch("services.session.session_manager.time.time", return_value=12.0):
+            manager.on_frame(frame, Mock())
+
+        self.assertTrue(manager.session.session_active)
+        self.assertEqual(manager.session.stability_rule, "exact_5")
+
+    def test_stable_same_plateau_remains_blocked_after_rearm_delay(self):
+        manager = SessionManager(Mock())
+        manager.session.rearm_block_until = 11.0
+        manager.session.rearm_reference_weight = 10000
+        manager._attempt_wait_reference = 10000
+        frame = self.stable_frame(10000)
+        frame.stability_rule = "exact_5"
+
+        with unittest.mock.patch("services.session.session_manager.time.time", return_value=12.0):
+            manager.on_frame(frame, Mock())
+
+        self.assertFalse(manager.session.session_active)
+
+    def test_stable_frame_waits_for_two_second_rearm_delay(self):
+        manager = SessionManager(Mock())
+        manager.session.rearm_block_until = 12.0
+        manager.session.rearm_reference_weight = 10000
+        manager._attempt_wait_reference = 10000
+        frame = self.stable_frame(10600)
+        frame.stability_rule = "exact_5"
+
+        with unittest.mock.patch("services.session.session_manager.time.time", return_value=11.0):
+            manager.on_frame(frame, Mock())
+
+        self.assertFalse(manager.session.session_active)
+
+    def test_stable_frame_promotes_before_attempt_wait_gate_without_rearm(self):
+        self.manager.session.session_active = False
+        self.manager._attempt_wait_reference = 10000
+        frame = self.stable_frame(10300)
+        frame.stability_rule = "exact_5"
+
         self.manager.on_frame(frame, Mock())
-        self.assertIsNotNone(self.manager._attempt)
+
+        self.assertTrue(self.manager.session.session_active)
+        self.assertEqual(self.manager.session.stability_rule, "exact_5")
 
 
 class AttemptArchiveTests(unittest.TestCase):
