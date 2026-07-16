@@ -496,7 +496,17 @@ class SessionManager:
     def on_frame(self, frame, log_fn):
         """Per-frame callback (fires on every scale frame)."""
         if frame.status == "STABLE":
-            self._update_attempt(frame, log_fn, allow_chained_stable=True)
+            stable_weight = frame.stable_weight if frame.stable_weight is not None else frame.weight
+            blocked_tail = (
+                not self.session.session_active
+                and self._attempt_wait_reference is not None
+                and (
+                    time.time() < self.session.rearm_block_until
+                    or abs(stable_weight - self._attempt_wait_reference) < SESSION_WEIGHT_DEPARTURE_KG
+                )
+            )
+            if not blocked_tail:
+                self._update_attempt(frame, log_fn, allow_chained_stable=True)
             self._handle_stable_frame(frame, log_fn)
         else:
             if not self.session.session_active and self._attempt_wait_reference is not None:

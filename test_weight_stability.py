@@ -327,6 +327,22 @@ class SessionWeightTests(unittest.TestCase):
             manager.on_frame(frame, Mock())
 
         self.assertFalse(manager.session.session_active)
+        self.assertIsNone(manager._attempt)
+
+    def test_stable_same_plateau_does_not_create_attempt(self):
+        manager = SessionManager(Mock())
+        manager.session.rearm_block_until = 11.0
+        manager.session.rearm_reference_weight = 10000
+        manager._attempt_wait_reference = 10000
+        manager._post_session_low = 10000
+        frame = self.stable_frame(10200)
+        frame.stability_rule = "exact_5"
+
+        with unittest.mock.patch("services.session.session_manager.time.time", return_value=12.0):
+            manager.on_frame(frame, Mock())
+
+        self.assertFalse(manager.session.session_active)
+        self.assertIsNone(manager._attempt)
 
     def test_stable_frame_promotes_before_attempt_wait_gate_without_rearm(self):
         self.manager.session.session_active = False
