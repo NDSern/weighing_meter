@@ -234,19 +234,58 @@ class SessionWeightTests(unittest.TestCase):
             "15C-326.77", 47500, "2026-07-15T06:26:58+00:00"
         ))
 
-    def test_chained_attempt_waits_for_500kg_change(self):
+    def test_post_session_descent_does_not_start_chained_attempt(self):
         manager = SessionManager(Mock())
         manager._attempt_wait_reference = 10000
-        frame = make_frame(10300)
-        frame.status = "UNSTABLE"
+        manager._post_session_low = 10000
 
-        manager.on_frame(frame, Mock())
+        for weight in (9700, 9000, 8000, 5000):
+            frame = make_frame(weight)
+            frame.status = "UNSTABLE"
+            manager.on_frame(frame, Mock())
+
+        self.assertIsNone(manager._attempt)
+        self.assertEqual(manager._post_session_low, 5000)
+
+    def test_post_session_rebound_starts_chained_attempt(self):
+        manager = SessionManager(Mock())
+        manager._attempt_wait_reference = 10000
+        manager._post_session_low = 10000
+
+        for weight in (8000, 8400):
+            frame = make_frame(weight)
+            frame.status = "UNSTABLE"
+            manager.on_frame(frame, Mock())
         self.assertIsNone(manager._attempt)
 
-        frame = make_frame(10600)
+        frame = make_frame(8500)
         frame.status = "UNSTABLE"
         manager.on_frame(frame, Mock())
+
         self.assertIsNotNone(manager._attempt)
+
+    def test_direct_post_session_rise_starts_chained_attempt(self):
+        manager = SessionManager(Mock())
+        manager._attempt_wait_reference = 10000
+        manager._post_session_low = 10000
+        frame = make_frame(10500)
+        frame.status = "UNSTABLE"
+
+        manager.on_frame(frame, Mock())
+
+        self.assertIsNotNone(manager._attempt)
+
+    def test_empty_scale_clears_post_session_tail(self):
+        manager = SessionManager(Mock())
+        manager._attempt_wait_reference = 10000
+        manager._post_session_low = 8000
+        frame = make_frame(0)
+        frame.status = "UNSTABLE"
+
+        manager.on_frame(frame, Mock())
+
+        self.assertIsNone(manager._attempt_wait_reference)
+        self.assertIsNone(manager._post_session_low)
 
     def test_stable_frame_promotes_before_chained_wait_gate(self):
         manager = SessionManager(Mock())

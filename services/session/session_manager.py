@@ -427,6 +427,7 @@ class SessionManager:
         self._attempt_empty_since = None
         self._attempt_rearm_low = None
         self._attempt_wait_reference = None
+        self._post_session_low = None
         self._load_dedup_state()
 
     def _load_dedup_state(self):
@@ -501,10 +502,17 @@ class SessionManager:
             if not self.session.session_active and self._attempt_wait_reference is not None:
                 if frame.weight <= WEIGHT_THRESHOLD:
                     self._attempt_wait_reference = None
-                elif abs(frame.weight - self._attempt_wait_reference) < SESSION_WEIGHT_DEPARTURE_KG:
-                    return
+                    self._post_session_low = None
                 else:
+                    if self._post_session_low is None:
+                        self._post_session_low = self._attempt_wait_reference
+                    self._post_session_low = min(self._post_session_low, frame.weight)
+                    direct_rise = frame.weight - self._attempt_wait_reference
+                    rebound = frame.weight - self._post_session_low
+                    if max(direct_rise, rebound) < SESSION_WEIGHT_DEPARTURE_KG:
+                        return
                     self._attempt_wait_reference = None
+                    self._post_session_low = None
             self._update_attempt(frame, log_fn)
             self.session.stable_count = 0
 
@@ -741,6 +749,8 @@ class SessionManager:
         self.session.rearm_block_until = 0.0
         self.session.rearm_block_reason = None
         self.session.rearm_reference_weight = None
+        self._attempt_wait_reference = None
+        self._post_session_low = None
         if self._attempt is None:
             self._attempt = {
                 "id": uuid.uuid4().hex,
@@ -877,11 +887,14 @@ class SessionManager:
             self.session.rearm_block_reason = reason
             self.session.rearm_reference_weight = self.session.stable_weight
             self._attempt_wait_reference = self.session.stable_weight
+            self._post_session_low = self.session.stable_weight
             log_fn("EVENT", f"Session rearm blocked for {SESSION_REARM_DELAY_SECONDS:g}s after {reason}")
         else:
             self.session.rearm_block_until = 0.0
             self.session.rearm_block_reason = None
             self.session.rearm_reference_weight = None
+            self._attempt_wait_reference = None
+            self._post_session_low = None
 
         self.session.session_active = False
         self.session.published_this_stop = False
