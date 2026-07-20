@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
+from contextlib import closing
 from datetime import datetime, timezone
 
 import cv2
@@ -62,7 +63,7 @@ def log(level: str, msg: str):
 
 def isSessionFinalized(session_id):
     try:
-        with sqlite3.connect(SESSION_FINALIZATION_DB) as conn:
+        with closing(sqlite3.connect(SESSION_FINALIZATION_DB)) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS finalized_sessions "
                          "(session_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, finalized_at TEXT NOT NULL)")
             return conn.execute(
@@ -74,7 +75,7 @@ def isSessionFinalized(session_id):
 
 def markSessionFinalized(session_id, outcome):
     os.makedirs(os.path.dirname(SESSION_FINALIZATION_DB), exist_ok=True)
-    with sqlite3.connect(SESSION_FINALIZATION_DB) as conn:
+    with closing(sqlite3.connect(SESSION_FINALIZATION_DB)) as conn:
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("CREATE TABLE IF NOT EXISTS finalized_sessions "
                      "(session_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, finalized_at TEXT NOT NULL)")

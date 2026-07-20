@@ -32,7 +32,6 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         )
         self.finalization_patch.start()
         module._pending_events.clear()
-        module._published_ids.clear()
         while not module._publish_queue.empty():
             module._publish_queue.get_nowait()
 
@@ -42,8 +41,7 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         self.root.cleanup()
 
     def test_completed_session_id_is_not_enqueued_again(self):
-        module._published_ids.add("session-1")
-        PublishOutbox._persist_published_locked()
+        PublishOutbox._mark_completed("session-1")
 
         event_id = PublishOutbox.enqueue({"offline_event_id": "session-1"})
 
@@ -60,15 +58,21 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         }
         with open(self.pending, "w") as fp:
             fp.write(json.dumps(event) + "\n")
-        module._published_ids.add("session-2")
-        PublishOutbox._persist_published_locked()
+        PublishOutbox._mark_completed("session-2")
 
-        PublishOutbox._load_published_ids()
+        PublishOutbox._init_completed_db()
         PublishOutbox._load_pending()
 
         self.assertEqual(PublishOutbox.pending_count(), 0)
         with open(self.pending) as fp:
             self.assertEqual(fp.read(), "")
+
+    def test_completed_ledger_is_not_loaded_into_memory(self):
+        for index in range(1000):
+            PublishOutbox._mark_completed(f"session-{index}")
+
+        self.assertFalse(hasattr(module, "_published_ids"))
+        self.assertTrue(PublishOutbox.has_event("session-999"))
 
     def test_finalization_ledger_survives_restart(self):
         session_module.markSessionFinalized("session-3", "no_plate")

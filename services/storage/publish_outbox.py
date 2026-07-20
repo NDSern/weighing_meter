@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 
 from config import PENDING_RETENTION_DAYS, SERVICE_DIR
@@ -35,7 +36,6 @@ _worker_started = False
 _worker_thread = None
 _stop_event = threading.Event()
 _mqtt_svc = None
-_published_ids = set()
 
 
 class PublishOutbox:
@@ -49,7 +49,7 @@ class PublishOutbox:
             if _worker_started:
                 return
             os.makedirs(os.path.dirname(_outbox_file), exist_ok=True)
-            PublishOutbox._load_published_ids()
+            PublishOutbox._init_completed_db()
             PublishOutbox._load_pending()
             _stop_event.clear()
             _worker_thread = threading.Thread(target=PublishOutbox._publish_loop, daemon=True)
@@ -82,7 +82,7 @@ class PublishOutbox:
             "session_result": session_result,
         }
         with _pending_lock:
-            if event_id in _published_ids:
+            if PublishOutbox._is_published(event_id):
                 log("OFFLINE", f"Publish event already completed id={event_id}")
                 return event_id
             if event_id in _pending_events:
@@ -102,31 +102,36 @@ class PublishOutbox:
     @staticmethod
     def has_event(event_id):
         with _pending_lock:
-            return event_id in _pending_events or event_id in _published_ids
+            return event_id in _pending_events or PublishOutbox._is_published(event_id)
 
     @staticmethod
-    def _load_published_ids():
-        global _published_ids
-        try:
-            os.makedirs(os.path.dirname(_published_db), exist_ok=True)
-            with sqlite3.connect(_published_db) as conn:
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("CREATE TABLE IF NOT EXISTS completed_events "
-                             "(event_id TEXT PRIMARY KEY, completed_at TEXT NOT NULL)")
-                _published_ids = {row[0] for row in conn.execute("SELECT event_id FROM completed_events")}
-        except (OSError, sqlite3.Error):
-            _published_ids = set()
-
-    @staticmethod
-    def _persist_published_locked():
+    def _init_completed_db():
         os.makedirs(os.path.dirname(_published_db), exist_ok=True)
-        with sqlite3.connect(_published_db) as conn:
+        with closing(sqlite3.connect(_published_db)) as conn:
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("CREATE TABLE IF NOT EXISTS completed_events "
                          "(event_id TEXT PRIMARY KEY, completed_at TEXT NOT NULL)")
-            conn.executemany(
+            conn.commit()
+
+    @staticmethod
+    def _is_published(event_id):
+        try:
+            PublishOutbox._init_completed_db()
+            with closing(sqlite3.connect(_published_db)) as conn:
+                return conn.execute(
+                    "SELECT 1 FROM completed_events WHERE event_id = ?", (event_id,)
+                ).fetchone() is not None
+        except (OSError, sqlite3.Error):
+            return False
+
+    @staticmethod
+    def _mark_completed(event_id):
+        PublishOutbox._init_completed_db()
+        with closing(sqlite3.connect(_published_db)) as conn:
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute(
                 "INSERT OR IGNORE INTO completed_events (event_id, completed_at) VALUES (?, ?)",
-                ((event_id, datetime.now().isoformat(timespec="seconds")) for event_id in _published_ids),
+                (event_id, datetime.now().isoformat(timespec="seconds")),
             )
             conn.commit()
 
@@ -146,7 +151,7 @@ class PublishOutbox:
                     if not event_id or not event.get("session_result"):
                         append_dead_letter("malformed", event, "incomplete MQTT record", "malformed")
                         continue
-                    if event_id in _published_ids:
+                    if PublishOutbox._is_published(event_id):
                         continue
                     _pending_events[event_id] = event
             PublishOutbox._persist_locked()
@@ -213,9 +218,7 @@ class PublishOutbox:
             timeout=10.0,
         )
         if ok:
-            with _pending_lock:
-                _published_ids.add(event_id)
-                PublishOutbox._persist_published_locked()
+            PublishOutbox._mark_completed(event_id)
             PublishOutbox._mark_published(event_id)
             log("OFFLINE", f"Published queued event id={event_id}")
             log("METRIC", json.dumps(
