@@ -26,7 +26,6 @@ from config import (
     SESSION_FINALIZATION_DB,
     SESSION_END_EMPTY_DWELL_SECONDS,
     SESSION_MIN_DURATION_SECONDS,
-    SESSION_REARM_DELAY_SECONDS,
     SESSION_STABLE_WEIGHT_WINDOW,
     SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS,
     SESSION_WEIGHT_DEPARTURE_KG,
@@ -429,6 +428,8 @@ class SessionManager:
         self._attempt_rearm_low = None
         self._attempt_wait_reference = None
         self._post_session_low = None
+        self._waiting_for_empty = False
+        self._post_session_empty_since = None
         self._load_dedup_state()
 
     def _load_dedup_state(self):
@@ -496,6 +497,9 @@ class SessionManager:
 
     def on_frame(self, frame, log_fn):
         """Per-frame callback (fires on every scale frame)."""
+        if self._wait_for_empty_cycle(frame, log_fn):
+            self.session.stable_count = 0
+            return
         if frame.status == "STABLE":
             stable_weight = frame.stable_weight if frame.stable_weight is not None else frame.weight
             blocked_tail = (
@@ -532,6 +536,29 @@ class SessionManager:
         if self._check_scale_empty(frame, log_fn):
             return
         self._update_vehicle_state(log_fn)
+
+    def _wait_for_empty_cycle(self, frame, log_fn):
+        if not self._waiting_for_empty:
+            return False
+        if frame.weight > WEIGHT_THRESHOLD:
+            self._post_session_empty_since = None
+            return True
+        now = time.time()
+        if self._post_session_empty_since is None:
+            self._post_session_empty_since = now
+            return True
+        if now - self._post_session_empty_since < SESSION_END_EMPTY_DWELL_SECONDS:
+            return True
+        self._waiting_for_empty = False
+        self._post_session_empty_since = None
+        self.session.rearm_block_until = 0.0
+        self.session.rearm_block_reason = None
+        self.session.rearm_reference_weight = None
+        self._attempt_wait_reference = None
+        self._post_session_low = None
+        log_fn("EVENT", "Scale cycle rearmed after empty dwell")
+        log_metric(log_fn, "scale_cycle_rearmed", empty_dwell_s=SESSION_END_EMPTY_DWELL_SECONDS)
+        return False
 
     def _handle_stable_frame(self, frame, log_fn):
         stable_weight = frame.stable_weight if frame.stable_weight is not None else frame.weight
@@ -894,12 +921,18 @@ class SessionManager:
         )
 
         if reason in ("vehicle_left", "weight_departure") and (self.session.stable_weight or 0) > WEIGHT_THRESHOLD:
-            self.session.rearm_block_until = time.time() + SESSION_REARM_DELAY_SECONDS
+            self._waiting_for_empty = True
+            self._post_session_empty_since = None
+            self.session.rearm_block_until = 0.0
             self.session.rearm_block_reason = reason
             self.session.rearm_reference_weight = self.session.stable_weight
-            self._attempt_wait_reference = self.session.stable_weight
-            self._post_session_low = self.session.stable_weight
-            log_fn("EVENT", f"Session rearm blocked for {SESSION_REARM_DELAY_SECONDS:g}s after {reason}")
+            self._attempt_wait_reference = None
+            self._post_session_low = None
+            log_fn("EVENT", f"Scale cycle waiting for empty after {reason}")
+            log_metric(
+                log_fn, "scale_cycle_waiting_for_empty", reason=reason,
+                reference_weight_kg=self.session.stable_weight,
+            )
         else:
             self.session.rearm_block_until = 0.0
             self.session.rearm_block_reason = None

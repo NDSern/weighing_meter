@@ -247,45 +247,75 @@ class SessionWeightTests(unittest.TestCase):
         self.assertIsNone(manager._attempt)
         self.assertEqual(manager._post_session_low, 5000)
 
-    def test_post_session_rebound_starts_chained_attempt(self):
+    def test_post_session_rebound_remains_blocked_until_empty(self):
         manager = SessionManager(Mock())
-        manager._attempt_wait_reference = 10000
-        manager._post_session_low = 10000
+        manager._waiting_for_empty = True
 
-        for weight in (8000, 8400):
+        for weight in (8000, 8400, 8500, 12000):
             frame = make_frame(weight)
             frame.status = "UNSTABLE"
             manager.on_frame(frame, Mock())
+
+        self.assertIsNone(manager._attempt)
+        self.assertTrue(manager._waiting_for_empty)
+
+    def test_stable_post_session_plateau_remains_blocked_until_empty(self):
+        manager = SessionManager(Mock())
+        manager._waiting_for_empty = True
+        frame = self.stable_frame(10500)
+        frame.stability_rule = "exact_5"
+
+        manager.on_frame(frame, Mock())
+
+        self.assertFalse(manager.session.session_active)
         self.assertIsNone(manager._attempt)
 
-        frame = make_frame(8500)
-        frame.status = "UNSTABLE"
-        manager.on_frame(frame, Mock())
-
-        self.assertIsNotNone(manager._attempt)
-
-    def test_direct_post_session_rise_starts_chained_attempt(self):
+    def test_empty_dwell_rearms_scale_cycle(self):
         manager = SessionManager(Mock())
-        manager._attempt_wait_reference = 10000
-        manager._post_session_low = 10000
-        frame = make_frame(10500)
-        frame.status = "UNSTABLE"
-
-        manager.on_frame(frame, Mock())
-
-        self.assertIsNotNone(manager._attempt)
-
-    def test_empty_scale_clears_post_session_tail(self):
-        manager = SessionManager(Mock())
-        manager._attempt_wait_reference = 10000
-        manager._post_session_low = 8000
+        manager._waiting_for_empty = True
         frame = make_frame(0)
         frame.status = "UNSTABLE"
 
-        manager.on_frame(frame, Mock())
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time",
+            side_effect=[10.0, 11.9, 12.0],
+        ):
+            manager.on_frame(frame, Mock())
+            manager.on_frame(frame, Mock())
+            manager.on_frame(frame, Mock())
 
-        self.assertIsNone(manager._attempt_wait_reference)
-        self.assertIsNone(manager._post_session_low)
+        self.assertFalse(manager._waiting_for_empty)
+
+    def test_empty_dwell_resets_when_weight_rises(self):
+        manager = SessionManager(Mock())
+        manager._waiting_for_empty = True
+        empty = make_frame(0)
+        empty.status = "UNSTABLE"
+        loaded = make_frame(1000)
+        loaded.status = "UNSTABLE"
+
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time",
+            side_effect=[10.0, 12.0, 14.0],
+        ):
+            manager.on_frame(empty, Mock())
+            manager.on_frame(loaded, Mock())
+            manager.on_frame(empty, Mock())
+
+        self.assertTrue(manager._waiting_for_empty)
+
+    def test_session_end_requires_empty_cycle_for_rearm(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.session_id = "session-1"
+        manager.session.started_at = 1.0
+        manager.session.started_at_iso = "2026-07-20T00:00:00+00:00"
+        manager.session.stable_weight = 10000
+        manager.session.last_publish_weight = 10000
+
+        manager._end_session("weight_departure", Mock())
+
+        self.assertTrue(manager._waiting_for_empty)
 
     def test_stable_frame_promotes_before_chained_wait_gate(self):
         manager = SessionManager(Mock())
