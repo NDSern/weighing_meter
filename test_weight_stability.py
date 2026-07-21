@@ -497,7 +497,7 @@ class AttemptArchiveTests(unittest.TestCase):
 
         log.assert_any_call(
             "EVENT",
-            "Session start reason=10 weight frames within <=20 kg tolerance rule=spread_10",
+            "Session start reason=weights value within tolerance rule=spread_10",
         )
 
 if __name__ == "__main__":

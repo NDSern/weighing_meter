@@ -857,7 +857,7 @@ class SessionManager:
         log_fn("EVENT", f"===== SESSION START wt={self.session.stable_weight:.{decimal_pos}f}kg lpr=on =====")
         stability_reason = {
             "exact_5": "5 exact weight frames",
-            "spread_10": "10 weight frames within <=20 kg tolerance",
+            "spread_10": "weights value within tolerance",
         }.get(self.session.stability_rule, self.session.stability_rule or "unknown stability rule")
         log_fn(
             "EVENT",
