@@ -444,6 +444,55 @@ class SessionWeightTests(unittest.TestCase):
         self.assertEqual(self.manager.session.stability_rule, "exact_5")
 
 
+class PeakCandidateTests(unittest.TestCase):
+    def setUp(self):
+        self.manager = SessionManager(Mock(), lpr_grabbers={})
+        self.manager._save_diagnostic_frames = Mock(return_value=0)
+        self.log = Mock()
+
+    @staticmethod
+    def frame(weight, seconds, status="UNSTABLE"):
+        frame = make_frame(weight)
+        frame.status = status
+        frame.timestamp = datetime(2026, 7, 20) + timedelta(seconds=seconds)
+        return frame
+
+    def finish_peak(self):
+        self.manager.on_frame(self.frame(9500, 1), self.log)
+        self.manager.on_frame(self.frame(9500, 3), self.log)
+
+    def archived_metadata(self):
+        return self.manager._save_diagnostic_frames.call_args.args[3]
+
+    def test_unstable_departed_peak_is_archived_for_shadow_audit(self):
+        self.manager.on_frame(self.frame(10000, 0), self.log)
+        self.finish_peak()
+
+        metadata = self.archived_metadata()
+        self.assertEqual(metadata["category"], "unstable_local_peak")
+        self.assertEqual(metadata["peak_weight_kg"], 10000)
+        self.assertTrue(metadata["shadow_only"])
+
+    def test_waiting_for_empty_peak_records_block_reason(self):
+        self.manager._waiting_for_empty = True
+        self.manager.on_frame(self.frame(10000, 0), self.log)
+        self.finish_peak()
+
+        self.assertEqual(self.archived_metadata()["category"], "blocked_waiting_for_empty")
+
+    def test_active_session_peak_records_absorption_reason(self):
+        self.manager.session.session_active = True
+        self.manager.session.session_id = "session-1"
+        self.manager.session.weight_departure_baseline = 20000
+        self.manager.session.latest_stable_weight = 20000
+        self.manager.on_frame(self.frame(10000, 0), self.log)
+        self.finish_peak()
+
+        metadata = self.archived_metadata()
+        self.assertEqual(metadata["category"], "absorbed_active_session")
+        self.assertEqual(metadata["session_ids"], ["session-1"])
+
+
 class AttemptArchiveTests(unittest.TestCase):
     def test_unstable_attempt_archives_maximum_weight_after_empty_dwell(self):
         manager = SessionManager(Mock(), lpr_grabbers={})

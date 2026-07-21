@@ -21,6 +21,7 @@ from config import (
     MQTT_ENABLED,
     NO_PLATE_DIR,
     NO_STABLE_DIR,
+    PEAK_CANDIDATE_DIR,
     SAME_PLATE_DUPLICATE_SECONDS,
     SESSION_DEDUP_STATE_FILE,
     SESSION_FINALIZATION_DB,
@@ -430,6 +431,8 @@ class SessionManager:
         self._post_session_low = None
         self._waiting_for_empty = False
         self._post_session_empty_since = None
+        self._peak_candidate = None
+        self._peak_departure_since = None
         self._load_dedup_state()
 
     def _load_dedup_state(self):
@@ -457,6 +460,9 @@ class SessionManager:
 
     def shutdown(self, log_fn):
         """Persist active capture state before sampler and inference workers stop."""
+        if self._peak_candidate:
+            frame = type("PeakEndFrame", (), {"weight": self._peak_candidate["peak_weight_kg"]})()
+            self._archive_peak_candidate(frame, log_fn, "shutdown")
         if self.session.session_active:
             self._end_session("shutdown", log_fn)
         elif self._attempt:
@@ -497,6 +503,7 @@ class SessionManager:
 
     def on_frame(self, frame, log_fn):
         """Per-frame callback (fires on every scale frame)."""
+        self._update_peak_candidate(frame, log_fn)
         if self._wait_for_empty_cycle(frame, log_fn):
             self.session.stable_count = 0
             return
@@ -536,6 +543,96 @@ class SessionManager:
         if self._check_scale_empty(frame, log_fn):
             return
         self._update_vehicle_state(log_fn)
+
+    def _update_peak_candidate(self, frame, log_fn):
+        """Record shadow peak evidence without changing session behavior."""
+        now = frame.timestamp.timestamp()
+        if self._peak_candidate is None:
+            if frame.weight <= WEIGHT_THRESHOLD:
+                return
+            self._peak_candidate = {
+                "id": uuid.uuid4().hex,
+                "started_at": frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+                "peak_at": frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+                "peak_weight_kg": frame.weight,
+                "peak_status": frame.status,
+                "peak_stability_rule": frame.stability_rule,
+                "saw_stable": frame.status == "STABLE",
+                "blocked_waiting_for_empty": self._waiting_for_empty,
+                "absorbed_active_session": self.session.session_active,
+                "session_ids": [self.session.session_id] if self.session.session_id else [],
+                "start_frames": self._capture_lpr_start_frames(log_fn),
+            }
+            self._peak_departure_since = None
+            log_metric(
+                log_fn, "weight_peak_candidate", id=self._peak_candidate["id"],
+                started_at=self._peak_candidate["started_at"], start_weight_kg=frame.weight,
+                waiting_for_empty=self._waiting_for_empty,
+                session_active=self.session.session_active,
+            )
+            return
+
+        candidate = self._peak_candidate
+        candidate["saw_stable"] = candidate["saw_stable"] or frame.status == "STABLE"
+        candidate["blocked_waiting_for_empty"] = (
+            candidate["blocked_waiting_for_empty"] or self._waiting_for_empty
+        )
+        candidate["absorbed_active_session"] = (
+            candidate["absorbed_active_session"] or self.session.session_active
+        )
+        if self.session.session_id and self.session.session_id not in candidate["session_ids"]:
+            candidate["session_ids"].append(self.session.session_id)
+        if frame.weight >= candidate["peak_weight_kg"]:
+            candidate["peak_weight_kg"] = frame.weight
+            candidate["peak_at"] = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+            candidate["peak_status"] = frame.status
+            candidate["peak_stability_rule"] = frame.stability_rule
+
+        departed = candidate["peak_weight_kg"] - frame.weight >= SESSION_WEIGHT_DEPARTURE_KG
+        empty = frame.weight <= WEIGHT_THRESHOLD
+        if not departed and not empty:
+            self._peak_departure_since = None
+            return
+        if self._peak_departure_since is None:
+            self._peak_departure_since = now
+            return
+        if now - self._peak_departure_since < SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS:
+            return
+        self._archive_peak_candidate(frame, log_fn, "scale_empty" if empty else "weight_departure")
+
+    def _archive_peak_candidate(self, frame, log_fn, end_reason):
+        candidate = self._peak_candidate
+        if not candidate:
+            return
+        if candidate["blocked_waiting_for_empty"]:
+            category = "blocked_waiting_for_empty"
+        elif candidate["absorbed_active_session"]:
+            category = "absorbed_active_session"
+        elif candidate["saw_stable"]:
+            category = "stable_session"
+        else:
+            category = "unstable_local_peak"
+        metadata = {
+            key: value for key, value in candidate.items() if key != "start_frames"
+        }
+        metadata.update({
+            "category": category,
+            "ended_at": frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+            "end_reason": end_reason,
+            "end_weight_kg": frame.weight,
+            "shadow_only": True,
+        })
+        saved = self._save_diagnostic_frames(
+            PEAK_CANDIDATE_DIR, candidate["id"], candidate["start_frames"], metadata, log_fn,
+        )
+        log_metric(
+            log_fn, "weight_peak_rejected" if category != "stable_session" else "weight_peak_promoted",
+            id=candidate["id"], category=category,
+            peak_weight_kg=candidate["peak_weight_kg"], end_reason=end_reason,
+            images=saved, shadow_only=True,
+        )
+        self._peak_candidate = None
+        self._peak_departure_since = None
 
     def _wait_for_empty_cycle(self, frame, log_fn):
         if not self._waiting_for_empty:

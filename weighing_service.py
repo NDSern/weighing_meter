@@ -58,6 +58,7 @@ from config import (
     MQTT_ENABLED,
     NO_PLATE_DIR,
     NO_STABLE_DIR,
+    PEAK_CANDIDATE_DIR,
     RTSP_URL,
     RTSP_URL_2,
     RTSP_URL_3,
@@ -251,7 +252,7 @@ def main():
         storage_maintenance.start()
         if IMAGE_RETENTION_ENABLED:
             retention_cleaner = ImageRetentionCleaner(
-                [CAPTURE_DIR, UNDETECTABLE_DIR, NO_STABLE_DIR, NO_PLATE_DIR],
+                [CAPTURE_DIR, UNDETECTABLE_DIR, NO_STABLE_DIR, NO_PLATE_DIR, PEAK_CANDIDATE_DIR],
                 IMAGE_RETENTION_DAYS,
                 IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
                 IMAGE_RETENTION_EXTENSIONS,
