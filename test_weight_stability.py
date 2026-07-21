@@ -471,14 +471,34 @@ class AttemptArchiveTests(unittest.TestCase):
     def test_stable_attempt_promotes_without_no_stable_archive(self):
         manager = SessionManager(Mock(), lpr_grabbers={})
         manager._archive_no_stable = Mock()
+        log = Mock()
         frame = make_frame(1200)
         frame.status = "STABLE"
         frame.stable_weight = 1200
+        frame.stability_rule = "exact_5"
 
-        manager.on_frame(frame, Mock())
+        manager.on_frame(frame, log)
 
         self.assertTrue(manager.session.session_active)
         manager._archive_no_stable.assert_not_called()
+        log.assert_any_call(
+            "EVENT", "Session start reason=5 exact weight frames rule=exact_5"
+        )
+
+    def test_spread_session_logs_tolerance_reason(self):
+        manager = SessionManager(Mock(), lpr_grabbers={})
+        log = Mock()
+        frame = make_frame(1200)
+        frame.status = "STABLE"
+        frame.stable_weight = 1200
+        frame.stability_rule = "spread_10"
+
+        manager.on_frame(frame, log)
+
+        log.assert_any_call(
+            "EVENT",
+            "Session start reason=10 weight frames within <=20 kg tolerance rule=spread_10",
+        )
 
 if __name__ == "__main__":
     unittest.main()

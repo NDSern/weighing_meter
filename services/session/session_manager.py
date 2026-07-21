@@ -855,6 +855,14 @@ class SessionManager:
                 log_fn("ERROR", f"Session frame spool unavailable: {exc}")
         self._clear_attempt()
         log_fn("EVENT", f"===== SESSION START wt={self.session.stable_weight:.{decimal_pos}f}kg lpr=on =====")
+        stability_reason = {
+            "exact_5": "5 exact weight frames",
+            "spread_10": "10 weight frames within <=20 kg tolerance",
+        }.get(self.session.stability_rule, self.session.stability_rule or "unknown stability rule")
+        log_fn(
+            "EVENT",
+            f"Session start reason={stability_reason} rule={self.session.stability_rule or 'unknown'}",
+        )
         log_metric(
             log_fn, "session_start", id=self.session.session_id,
             attempt_started_at=self.session.started_at_iso,
