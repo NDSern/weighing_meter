@@ -20,6 +20,7 @@ class SessionFrameSpool:
         root_dir,
         cam1_grabber,
         cam3_grabber,
+        cam2_grabber=None,
         interval=0.2,
         jpeg_quality=90,
         notification_queue_size=32,
@@ -38,6 +39,8 @@ class SessionFrameSpool:
         self.failed_dir = os.path.join(self.root_dir, "failed")
         self.orphan_dir = os.path.join(self.root_dir, "orphan")
         self._grabbers = {"cam1": cam1_grabber, "cam3": cam3_grabber}
+        if cam2_grabber is not None:
+            self._grabbers["cam2"] = cam2_grabber
         self._interval = interval
         self._jpeg_quality = jpeg_quality
         self._disk_cap_bytes = disk_cap_bytes
@@ -99,7 +102,7 @@ class SessionFrameSpool:
                 "files": [],
                 "incomplete": False,
                 "errors": [],
-                "counts": {"cam1": 0, "cam3": 0},
+                "counts": {camera: 0 for camera in self._grabbers},
                 "metadata": dict(metadata or {}),
             }
             self._write_active_locked()

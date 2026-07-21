@@ -92,6 +92,23 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertNotEqual(manifest_a["session_dir"], manifest_b["session_dir"])
             self.assertEqual(manifest_a["metadata"], {"weight": 10})
 
+    def test_samples_optional_cam2_with_session_timeline(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = SessionFrameSpool(
+                root, Grabber(40), Grabber(180), cam2_grabber=Grabber(90),
+                interval=0.03, min_free_bytes=0, cv2_module=FakeCv2,
+            )
+            spool.start()
+            spool.begin_session("rear")
+            time.sleep(0.07)
+            job = spool.end_session("rear", {})
+            self.assertTrue(spool.stop(1))
+
+            with open(job, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            self.assertGreaterEqual(manifest["frame_counts"]["cam2"], 1)
+            self.assertTrue(any(name.startswith("cam2-") for name in manifest["files"]))
+
     def test_pending_jobs_recover_fifo_after_queue_overflow_and_restart(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root, notification_queue_size=1)

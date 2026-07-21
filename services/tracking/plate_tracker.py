@@ -38,7 +38,8 @@ class PlateTracker:
         self._image_plate = None  # plate text associated with saved frame
         self._image_camera = None  # camera name associated with saved frame
         self._image_conf = 0.0  # best det_conf for saved frame
-        self._plate_images = {}  # plate_text -> (frame, camera_name, det_conf)
+        self._image_observed_at = None
+        self._plate_images = {}  # plate_text -> (frame, camera_name, det_conf, observed_at)
         self._undetectable_frame = None  # first "unknown" frame for undetectable save
         self._undetectable_saved = False  # only save once per session
 
@@ -52,7 +53,7 @@ class PlateTracker:
         with self._lock:
             self._observations.append((plate_text, weight, source, ts))
 
-    def update_image(self, plate_text: str, det_conf: float, frame, camera_name: str):
+    def update_image(self, plate_text: str, det_conf: float, frame, camera_name: str, observed_at=None):
         """Store the best-confidence frame. Caller transfers ownership (no copy made)."""
         with self._lock:
             old = self._plate_images.get(plate_text)
@@ -60,12 +61,16 @@ class PlateTracker:
                 if old is None and len(self._plate_images) >= 8:
                     weakest = min(self._plate_images, key=lambda key: self._plate_images[key][2])
                     self._plate_images.pop(weakest, None)
-                self._plate_images[plate_text] = (frame.copy(), camera_name, det_conf)
+                self._plate_images[plate_text] = (
+                    frame.copy(), camera_name, det_conf,
+                    time.time() if observed_at is None else observed_at,
+                )
             if det_conf > self._image_conf:
                 self._image_frame = frame.copy()
                 self._image_plate = plate_text
                 self._image_camera = camera_name
                 self._image_conf = det_conf
+                self._image_observed_at = time.time() if observed_at is None else observed_at
 
     def get_confirmed_plate(self):
         """Returns the most frequent session plate if it appears at least PLATE_CONFIRM_THRESHOLD times."""
@@ -138,18 +143,20 @@ class PlateTracker:
 
             matched_plate = next((candidate for candidate in lookup_plates if candidate in self._plate_images), None)
             if matched_plate is not None:
-                frame, camera_name, _conf = self._plate_images.pop(matched_plate)
+                frame, camera_name, _conf, observed_at = self._plate_images.pop(matched_plate)
                 plate = matched_plate
             else:
                 frame = self._image_frame
                 plate = self._image_plate
                 camera_name = self._image_camera
+                observed_at = self._image_observed_at
             self._image_frame = None
             self._image_plate = None
             self._image_camera = None
             self._image_conf = 0.0
+            self._image_observed_at = None
             self._plate_images.clear()
-            return frame, plate, camera_name
+            return frame, plate, camera_name, observed_at
 
     def clear(self):
         with self._lock:
@@ -158,6 +165,7 @@ class PlateTracker:
             self._image_plate = None
             self._image_camera = None
             self._image_conf = 0.0
+            self._image_observed_at = None
             self._plate_images.clear()
             self._undetectable_frame = None
             self._undetectable_saved = False

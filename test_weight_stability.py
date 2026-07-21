@@ -335,6 +335,46 @@ class SessionWeightTests(unittest.TestCase):
 
         self.assertTrue(manager._waiting_for_empty)
 
+    def test_nearest_session_frame_uses_requested_timestamp(self):
+        metadata = {
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam2-000001-sample.jpg",
+                "cam2-000004-sample.jpg",
+                "cam1-000004-sample.jpg",
+            ],
+            "capture_interval_seconds": 0.2,
+        }
+
+        observed_at = datetime.fromisoformat(metadata["started_at"]).timestamp() + 0.75
+        path = self.manager._nearest_session_frame(metadata, "cam2", observed_at)
+
+        self.assertEqual(path, "/spool/session/cam2-000004-sample.jpg")
+
+    def test_no_plate_diagnostic_prefers_frames_one_second_after_start(self):
+        metadata = {
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000000-start.jpg", "cam1-000005-sample.jpg",
+                "cam3-000000-start.jpg", "cam3-000005-sample.jpg",
+            ],
+            "capture_interval_seconds": 0.2,
+            "start_frame_paths": {"cam1": "/fallback-cam1.jpg"},
+        }
+        frames = {
+            "/spool/session/cam1-000005-sample.jpg": "cam1+1s",
+            "/spool/session/cam3-000005-sample.jpg": "cam3+1s",
+        }
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", side_effect=frames.get,
+        ):
+            selected = self.manager._load_diagnostic_frames(metadata, offset_seconds=1.0)
+
+        self.assertEqual(selected, {"cam1": "cam1+1s", "cam3": "cam3+1s"})
+
     def test_stable_frame_promotes_before_chained_wait_gate(self):
         manager = SessionManager(Mock())
         manager.session.rearm_block_until = 11.0

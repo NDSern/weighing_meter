@@ -1019,7 +1019,7 @@ class SessionManager:
             return True
         plate, score, count = tracker.get_confirmed_plate()
         if not plate:
-            frames = self._load_start_frames(metadata)
+            frames = self._load_diagnostic_frames(metadata, offset_seconds=1.0)
             saved = self._save_diagnostic_frames(
                 NO_PLATE_DIR,
                 metadata["session_id"],
@@ -1063,6 +1063,37 @@ class SessionManager:
                 frames[camera] = frame
         return frames
 
+    @staticmethod
+    def _nearest_session_frame(metadata, camera, observed_at):
+        session_dir = metadata.get("session_dir")
+        files = metadata.get("session_files", [])
+        if not session_dir or observed_at is None:
+            return None
+        started_at = datetime.fromisoformat(metadata["started_at"]).timestamp()
+        interval = float(metadata.get("capture_interval_seconds", 0.2))
+        candidates = []
+        for relative_path in files:
+            if not relative_path.startswith(camera + "-"):
+                continue
+            try:
+                index = int(relative_path.split("-", 2)[1])
+            except (ValueError, IndexError):
+                continue
+            candidates.append((abs(started_at + index * interval - observed_at), relative_path))
+        if not candidates:
+            return None
+        return os.path.join(session_dir, min(candidates)[1])
+
+    def _load_diagnostic_frames(self, metadata, offset_seconds):
+        target = datetime.fromisoformat(metadata["started_at"]).timestamp() + offset_seconds
+        frames = {}
+        for camera in ("cam1", "cam3"):
+            path = self._nearest_session_frame(metadata, camera, target)
+            frame = cv2.imread(path) if path else None
+            if frame is not None:
+                frames[camera] = frame
+        return frames or self._load_start_frames(metadata)
+
     def publish_result(self, stable_weight, decimal_pos, log_fn, tracker=None, metadata=None):
         """Query PlateTracker and publish if plate is confirmed."""
         tracker = tracker or self.plate_tracker
@@ -1092,6 +1123,10 @@ class SessionManager:
             result, stable_weight, decimal_pos, plate, image_aliases, log_fn,
             tracker=tracker, rear_start_path=metadata.get("rear_start_path"),
             start_frame_paths=metadata.get("start_frame_paths", {}),
+            session_dir=metadata.get("session_dir"),
+            session_files=metadata.get("session_files", []),
+            capture_interval_seconds=metadata.get("capture_interval_seconds", 0.2),
+            session_started_at=metadata.get("started_at"),
             session_id=metadata.get("session_id"),
         ):
             log_fn("ERROR", f"Publish skipped — image capture failed for plate={plate}")
@@ -1207,13 +1242,17 @@ class SessionManager:
     def _attach_publish_images(
         self, result, stable_weight, decimal_pos, plate, image_aliases, log_fn,
         tracker=None, rear_start_path=None, start_frame_paths=None,
+        session_dir=None, session_files=None, capture_interval_seconds=0.2,
+        session_started_at=None,
         session_id=None,
     ):
         import numpy as np
         attach_started_at = time.time()
 
         tracker = tracker or self.plate_tracker
-        frame, img_plate, camera_name = tracker.get_image_frame(plate, aliases=image_aliases)
+        frame, img_plate, camera_name, observed_at = tracker.get_image_frame(
+            plate, aliases=image_aliases
+        )
         if frame is None or not plate:
             return False
         if img_plate != plate:
@@ -1222,7 +1261,15 @@ class SessionManager:
         now = datetime.now()
         captured_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         paths = self._prepare_capture_paths(now, plate, session_id)
-        rear_frame = cv2.imread(rear_start_path) if rear_start_path else self.session.rear_start_frame
+        rear_path = self._nearest_session_frame({
+            "started_at": session_started_at,
+            "session_dir": session_dir,
+            "session_files": session_files or [],
+            "capture_interval_seconds": capture_interval_seconds,
+        }, "cam2", observed_at) if session_started_at else None
+        rear_frame = cv2.imread(rear_path) if rear_path else None
+        if rear_frame is None:
+            rear_frame = cv2.imread(rear_start_path) if rear_start_path else self.session.rear_start_frame
         if rear_frame is None and not rear_start_path and self.rear_grabber:
             rear_frame = self.rear_grabber.get_latest_frame()
         if rear_frame is not None:

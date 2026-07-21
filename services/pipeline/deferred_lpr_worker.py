@@ -152,6 +152,9 @@ class DeferredLprWorker:
                     separators=(",", ":"), sort_keys=True,
                 ),
             )
+        metadata["session_dir"] = session_dir
+        metadata["session_files"] = files
+        metadata["capture_interval_seconds"] = float(job.get("capture_interval_seconds", 0.2))
 
         tracker = self._tracker_factory()
         successful_frames = 0
@@ -226,13 +229,13 @@ class DeferredLprWorker:
                     candidate, confidence, width, height,
                     source="candidate", observed_at=observed_at,
                 )
-                tracker.update_image(candidate, confidence, frame, camera_name)
+                tracker.update_image(candidate, confidence, frame, camera_name, observed_at)
                 if best_plate is None:
                     best_plate, best_conf = candidate, confidence
         if has_unknown and best_plate is None and tracker.needs_undetectable():
             tracker.save_undetectable(frame.copy())
         if best_plate is not None:
-            tracker.update_image(best_plate, best_conf, frame, camera_name)
+            tracker.update_image(best_plate, best_conf, frame, camera_name, observed_at)
 
     def _log(self, level, message):
         if self._log_fn:

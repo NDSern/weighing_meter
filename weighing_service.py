@@ -273,6 +273,7 @@ def main():
             LPR_SPOOL_DIR,
             cam1,
             cam3,
+            cam2_grabber=grabber2,
             interval=SESSION_FRAME_INTERVAL_SECONDS,
             jpeg_quality=SESSION_FRAME_JPEG_QUALITY,
             notification_queue_size=SESSION_FRAME_QUEUE_SIZE,
