@@ -245,7 +245,7 @@ def main():
             port=SERIAL_PORT,
             baud=BAUD_RATE,
             db_file=os.path.join(SERVICE_DIR, "scale_data.db"),
-            log_interval=1.0,
+            log_interval=0.2,
         )
         storage_maintenance = StorageMaintenance(IMAGE_RETENTION_CHECK_INTERVAL_SECONDS, log_fn=log)
         storage_maintenance.start()

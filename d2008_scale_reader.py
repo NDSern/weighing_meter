@@ -38,7 +38,7 @@ SERIAL_PORT   = "/dev/ttyS6"       # Windows: "COM3", Linux: "/dev/ttyUSB0"
 BAUD_RATE     = 9600
 DB_FILE       = "scale_data.db"
 SERIAL_DUMP_FILE = None
-LOG_INTERVAL  = 1.0          # Ghi DB mỗi N giây (0 = ghi mọi frame)
+LOG_INTERVAL  = 0.2          # Persist at the scale's nominal 5 Hz frame rate
 
 # Stability detection
 STABLE_COUNT     = 10        # Consecutive readings required for software stability
@@ -500,7 +500,7 @@ class D2008Reader:
             self._last_print = now
 
         # Ghi DB theo interval
-        if frame.checksum_ok and (now - self._last_log >= self.log_interval):
+        if frame.checksum_ok and (now - self._last_log + 1e-9 >= self.log_interval):
             self._db.save(frame)
             self._last_log = now
 
