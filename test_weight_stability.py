@@ -458,14 +458,13 @@ class PeakCandidateTests(unittest.TestCase):
         return frame
 
     def finish_peak(self):
-        self.manager.on_frame(self.frame(9500, 1), self.log)
-        self.manager.on_frame(self.frame(9500, 3), self.log)
+        for index, weight in enumerate([10000] * 5 + [9500] * 13):
+            self.manager.on_frame(self.frame(weight, index * 0.2), self.log)
 
     def archived_metadata(self):
         return self.manager._save_diagnostic_frames.call_args.args[3]
 
     def test_unstable_departed_peak_is_archived_for_shadow_audit(self):
-        self.manager.on_frame(self.frame(10000, 0), self.log)
         self.finish_peak()
 
         metadata = self.archived_metadata()
@@ -475,7 +474,6 @@ class PeakCandidateTests(unittest.TestCase):
 
     def test_waiting_for_empty_peak_records_block_reason(self):
         self.manager._waiting_for_empty = True
-        self.manager.on_frame(self.frame(10000, 0), self.log)
         self.finish_peak()
 
         self.assertEqual(self.archived_metadata()["category"], "blocked_waiting_for_empty")
@@ -485,12 +483,35 @@ class PeakCandidateTests(unittest.TestCase):
         self.manager.session.session_id = "session-1"
         self.manager.session.weight_departure_baseline = 20000
         self.manager.session.latest_stable_weight = 20000
-        self.manager.on_frame(self.frame(10000, 0), self.log)
         self.finish_peak()
 
         metadata = self.archived_metadata()
         self.assertEqual(metadata["category"], "absorbed_active_session")
         self.assertEqual(metadata["session_ids"], ["session-1"])
+
+    def test_short_spike_does_not_start_peak_candidate(self):
+        for index, weight in enumerate([0, 0, 10000, 0, 0]):
+            self.manager.on_frame(self.frame(weight, index * 0.2), self.log)
+
+        self.assertIsNone(self.manager._peak_candidate)
+
+    def test_rocking_return_cancels_movement_without_archiving(self):
+        weights = [10000] * 5 + [9400] * 4 + [10000] * 5
+        for index, weight in enumerate(weights):
+            self.manager.on_frame(self.frame(weight, index * 0.2), self.log)
+
+        self.assertIsNotNone(self.manager._peak_candidate)
+        self.manager._save_diagnostic_frames.assert_not_called()
+        metrics = [call.args[1] for call in self.log.call_args_list if call.args[0] == "METRIC"]
+        self.assertTrue(any('"event":"weight_peak_rocking_cancelled"' in metric for metric in metrics))
+
+    def test_five_filtered_departure_frames_archive_candidate(self):
+        weights = [10000] * 5 + list(range(9500, 8200, -100))
+        for index, weight in enumerate(weights):
+            self.manager.on_frame(self.frame(weight, index * 0.2), self.log)
+
+        self.assertIsNone(self.manager._peak_candidate)
+        self.assertEqual(self.archived_metadata()["end_reason"], "weight_departure")
 
 
 class AttemptArchiveTests(unittest.TestCase):

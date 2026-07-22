@@ -22,6 +22,9 @@ from config import (
     NO_PLATE_DIR,
     NO_STABLE_DIR,
     PEAK_CANDIDATE_DIR,
+    PEAK_FILTER_FRAMES,
+    PEAK_MOVEMENT_CANCEL_KG,
+    PEAK_MOVEMENT_CONFIRM_FRAMES,
     SAME_PLATE_DUPLICATE_SECONDS,
     SESSION_DEDUP_STATE_FILE,
     SESSION_FINALIZATION_DB,
@@ -432,7 +435,9 @@ class SessionManager:
         self._waiting_for_empty = False
         self._post_session_empty_since = None
         self._peak_candidate = None
-        self._peak_departure_since = None
+        self._peak_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
+        self._peak_movement_frames = []
+        self._peak_movement_started_at = None
         self._load_dedup_state()
 
     def _load_dedup_state(self):
@@ -461,7 +466,10 @@ class SessionManager:
     def shutdown(self, log_fn):
         """Persist active capture state before sampler and inference workers stop."""
         if self._peak_candidate:
-            frame = type("PeakEndFrame", (), {"weight": self._peak_candidate["peak_weight_kg"]})()
+            frame = type("PeakEndFrame", (), {
+                "weight": self._peak_candidate["peak_weight_kg"],
+                "timestamp": datetime.now(timezone.utc),
+            })()
             self._archive_peak_candidate(frame, log_fn, "shutdown")
         if self.session.session_active:
             self._end_session("shutdown", log_fn)
@@ -546,27 +554,35 @@ class SessionManager:
 
     def _update_peak_candidate(self, frame, log_fn):
         """Record shadow peak evidence without changing session behavior."""
-        now = frame.timestamp.timestamp()
+        self._peak_weight_window.append((frame.timestamp, frame.weight, frame.status, frame.stability_rule))
+        if len(self._peak_weight_window) < PEAK_FILTER_FRAMES:
+            return
+        ordered_weights = sorted(item[1] for item in self._peak_weight_window)
+        filtered_weight = ordered_weights[len(ordered_weights) // 2]
         if self._peak_candidate is None:
-            if frame.weight <= WEIGHT_THRESHOLD:
+            if filtered_weight <= WEIGHT_THRESHOLD:
                 return
+            first = self._peak_weight_window[0]
+            peak = max(self._peak_weight_window, key=lambda item: item[1])
             self._peak_candidate = {
                 "id": uuid.uuid4().hex,
-                "started_at": frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
-                "peak_at": frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
-                "peak_weight_kg": frame.weight,
-                "peak_status": frame.status,
-                "peak_stability_rule": frame.stability_rule,
-                "saw_stable": frame.status == "STABLE",
+                "started_at": first[0].astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+                "peak_at": peak[0].astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+                "peak_weight_kg": peak[1],
+                "filtered_peak_weight_kg": filtered_weight,
+                "peak_status": peak[2],
+                "peak_stability_rule": peak[3],
+                "saw_stable": any(item[2] == "STABLE" for item in self._peak_weight_window),
                 "blocked_waiting_for_empty": self._waiting_for_empty,
                 "absorbed_active_session": self.session.session_active,
                 "session_ids": [self.session.session_id] if self.session.session_id else [],
                 "start_frames": self._capture_lpr_start_frames(log_fn),
             }
-            self._peak_departure_since = None
+            self._peak_movement_frames = []
+            self._peak_movement_started_at = None
             log_metric(
                 log_fn, "weight_peak_candidate", id=self._peak_candidate["id"],
-                started_at=self._peak_candidate["started_at"], start_weight_kg=frame.weight,
+                started_at=self._peak_candidate["started_at"], start_weight_kg=filtered_weight,
                 waiting_for_empty=self._waiting_for_empty,
                 session_active=self.session.session_active,
             )
@@ -587,16 +603,41 @@ class SessionManager:
             candidate["peak_at"] = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
             candidate["peak_status"] = frame.status
             candidate["peak_stability_rule"] = frame.stability_rule
+        candidate["filtered_peak_weight_kg"] = max(
+            candidate["filtered_peak_weight_kg"], filtered_weight,
+        )
 
-        departed = candidate["peak_weight_kg"] - frame.weight >= SESSION_WEIGHT_DEPARTURE_KG
-        empty = frame.weight <= WEIGHT_THRESHOLD
+        baseline = candidate["filtered_peak_weight_kg"]
+        departed = baseline - filtered_weight >= SESSION_WEIGHT_DEPARTURE_KG
+        empty = filtered_weight <= WEIGHT_THRESHOLD
         if not departed and not empty:
-            self._peak_departure_since = None
+            if self._peak_movement_frames and baseline - filtered_weight <= PEAK_MOVEMENT_CANCEL_KG:
+                log_metric(
+                    log_fn, "weight_peak_rocking_cancelled", id=candidate["id"],
+                    peak_weight_kg=candidate["peak_weight_kg"],
+                    filtered_weight_kg=filtered_weight,
+                    excursion_frames=len(self._peak_movement_frames),
+                )
+            self._peak_movement_frames = []
+            self._peak_movement_started_at = None
             return
-        if self._peak_departure_since is None:
-            self._peak_departure_since = now
+        if self._peak_movement_started_at is None:
+            self._peak_movement_started_at = frame.timestamp.timestamp()
+        self._peak_movement_frames.append(filtered_weight)
+        if len(self._peak_movement_frames) > PEAK_MOVEMENT_CONFIRM_FRAMES:
+            self._peak_movement_frames.pop(0)
+        if len(self._peak_movement_frames) < PEAK_MOVEMENT_CONFIRM_FRAMES:
             return
-        if now - self._peak_departure_since < SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS:
+        if (
+            frame.timestamp.timestamp() - self._peak_movement_started_at
+            < SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS
+        ):
+            return
+        downward_steps = sum(
+            later <= earlier
+            for earlier, later in zip(self._peak_movement_frames, self._peak_movement_frames[1:])
+        )
+        if not empty and downward_steps < PEAK_MOVEMENT_CONFIRM_FRAMES - 1:
             return
         self._archive_peak_candidate(frame, log_fn, "scale_empty" if empty else "weight_departure")
 
@@ -632,7 +673,9 @@ class SessionManager:
             images=saved, shadow_only=True,
         )
         self._peak_candidate = None
-        self._peak_departure_since = None
+        self._peak_weight_window.clear()
+        self._peak_movement_frames = []
+        self._peak_movement_started_at = None
 
     def _wait_for_empty_cycle(self, frame, log_fn):
         if not self._waiting_for_empty:
