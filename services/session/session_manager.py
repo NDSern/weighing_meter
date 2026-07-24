@@ -2,12 +2,10 @@
 
 import json
 import os
-import sqlite3
 import threading
 import time
 import uuid
 from collections import Counter, deque
-from contextlib import closing
 from datetime import datetime, timezone
 
 import cv2
@@ -15,6 +13,7 @@ import numpy as np
 
 from services.storage.image_save_worker import ImageSaveWorker
 from services.storage.publish_outbox import PublishOutbox, set_log_fn as set_publish_outbox_log
+from services.session import diagnostic_archive, finalization_store, plate_store
 
 from config import (
     CAPTURE_DIR,
@@ -29,19 +28,18 @@ from config import (
     SESSION_DEDUP_STATE_FILE,
     SESSION_FINALIZATION_DB,
     SESSION_END_EMPTY_DWELL_SECONDS,
-    SESSION_MIN_DURATION_SECONDS,
     SESSION_STABLE_WEIGHT_WINDOW,
     SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS,
     SESSION_WEIGHT_DEPARTURE_KG,
+    SESSION_WEIGHT_TREND_DIRECTIONAL_STEPS,
+    SESSION_WEIGHT_TREND_FRAMES,
     SERVICE_DIR,
     STABLE_COUNT_THRESHOLD,
-    VEHICLE_LEFT_DWELL_SECONDS,
     WEIGHT_CHANGE_THRESHOLD,
     WEIGHT_THRESHOLD,
 )
 
 _log_fn = None
-_plate_db_lock = threading.Lock()
 _registry_lock = threading.Lock()
 _registry_loaded = False
 _registry_mtime = None
@@ -65,28 +63,11 @@ def log(level: str, msg: str):
 
 
 def isSessionFinalized(session_id):
-    try:
-        with closing(sqlite3.connect(SESSION_FINALIZATION_DB)) as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS finalized_sessions "
-                         "(session_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, finalized_at TEXT NOT NULL)")
-            return conn.execute(
-                "SELECT 1 FROM finalized_sessions WHERE session_id = ?", (session_id,)
-            ).fetchone() is not None
-    except sqlite3.Error:
-        return False
+    return finalization_store.contains(SESSION_FINALIZATION_DB, session_id)
 
 
 def markSessionFinalized(session_id, outcome):
-    os.makedirs(os.path.dirname(SESSION_FINALIZATION_DB), exist_ok=True)
-    with closing(sqlite3.connect(SESSION_FINALIZATION_DB)) as conn:
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("CREATE TABLE IF NOT EXISTS finalized_sessions "
-                     "(session_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, finalized_at TEXT NOT NULL)")
-        conn.execute(
-            "INSERT OR IGNORE INTO finalized_sessions (session_id, outcome, finalized_at) VALUES (?, ?, ?)",
-            (session_id, outcome, datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
+    finalization_store.mark(SESSION_FINALIZATION_DB, session_id, outcome)
 
 
 def log_metric(log_fn, event, **fields):
@@ -95,65 +76,9 @@ def log_metric(log_fn, event, **fields):
 
 def saveConfirmedLicensePlate(license_plate, session_id=None):
     """Persist confirmed plate count once per confirmed session."""
-    if not license_plate or license_plate == "none":
-        return None
-
     db_file = os.path.join(SERVICE_DIR, "confirmed_license_plates.db")
-    now = datetime.now().isoformat(timespec="seconds")
     try:
-        with _plate_db_lock:
-            conn = sqlite3.connect(db_file)
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS confirmed_license_plates (
-                        license_plate TEXT PRIMARY KEY,
-                        recognition_count INTEGER NOT NULL DEFAULT 0,
-                        first_seen_at TEXT NOT NULL,
-                        last_seen_at TEXT NOT NULL
-                    )
-                """)
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS confirmed_plate_sessions (
-                        session_id TEXT PRIMARY KEY,
-                        license_plate TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    )
-                """)
-                if session_id:
-                    cursor = conn.execute(
-                        "INSERT OR IGNORE INTO confirmed_plate_sessions "
-                        "(session_id, license_plate, created_at) VALUES (?, ?, ?)",
-                        (session_id, license_plate, now),
-                    )
-                    if cursor.rowcount == 0:
-                        row = conn.execute(
-                            "SELECT recognition_count FROM confirmed_license_plates WHERE license_plate = ?",
-                            (license_plate,),
-                        ).fetchone()
-                        conn.commit()
-                        return row[0] if row else None
-                conn.execute("""
-                    INSERT INTO confirmed_license_plates (
-                        license_plate,
-                        recognition_count,
-                        first_seen_at,
-                        last_seen_at
-                    )
-                    VALUES (?, 1, ?, ?)
-                    ON CONFLICT(license_plate) DO UPDATE SET
-                        recognition_count = recognition_count + 1,
-                        last_seen_at = excluded.last_seen_at
-                """, (license_plate, now, now))
-                conn.commit()
-                row = conn.execute(
-                    "SELECT recognition_count FROM confirmed_license_plates WHERE license_plate = ?",
-                    (license_plate,),
-                ).fetchone()
-                return row[0] if row else None
-            finally:
-                conn.close()
+        return plate_store.increment(db_file, license_plate, session_id)
     except Exception as exc:
         print(f"[PLATE_DB] saveConfirmedLicensePlate failed: {exc}", flush=True)
         return None
@@ -308,14 +233,11 @@ class WeighingSessionState:
         self.stable_weight_history = deque(maxlen=SESSION_STABLE_WEIGHT_WINDOW)
         self.stable_weight_sequence = 0
         self.latest_stable_weight = None
-        self.weight_departure_since = None
-        self.weight_departure_baseline = None
+        self.weight_trend_window = deque(maxlen=SESSION_WEIGHT_TREND_FRAMES)
         self.session_active = False
         self.published_this_stop = False
         self.session_had_weight = False
         self.vehicle_type = None
-        self.vehicle_was_stable = False
-        self.both_unstable_since = None
         self.empty_since = None
         self.skipped_duplicate_publish = False
         self.rearm_block_until = 0.0
@@ -334,7 +256,6 @@ class WeighingSessionState:
     def record_stable_weight(self, weight, decimal_pos):
         self.latest_stable_weight = weight
         if not self.session_active:
-            self.weight_departure_baseline = weight
             self.stable_weight = weight
             self.stable_decimal_pos = decimal_pos
             return
@@ -388,8 +309,7 @@ class WeighingSessionState:
         self.stable_weight_history.clear()
         self.stable_weight_sequence = 0
         self.latest_stable_weight = None
-        self.weight_departure_since = None
-        self.weight_departure_baseline = None
+        self.weight_trend_window.clear()
 
 
 class SessionManager:
@@ -546,11 +466,11 @@ class SessionManager:
             self._update_attempt(frame, log_fn)
             self.session.stable_count = 0
 
-        if self._check_weight_departure(frame, log_fn):
+        if self._check_weight_trend(frame, log_fn):
             return
         if self._check_scale_empty(frame, log_fn):
             return
-        self._update_vehicle_state(log_fn)
+        self._update_vehicle_type(log_fn)
 
     def _update_peak_candidate(self, frame, log_fn):
         """Record shadow peak evidence without changing session behavior."""
@@ -794,65 +714,43 @@ class SessionManager:
 
     @staticmethod
     def _save_diagnostic_frames(root, item_id, frames, metadata, log_fn):
-        started_at = metadata.get("started_at")
-        try:
-            now = datetime.fromisoformat(started_at).astimezone() if started_at else datetime.now()
-        except (TypeError, ValueError):
-            now = datetime.now()
-        target = os.path.join(root, now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
-        try:
-            os.makedirs(target, exist_ok=True)
-        except OSError as exc:
-            log_fn("ERROR", f"Diagnostic directory create failed id={item_id}: {exc}")
-            return False
-        saved = []
-        for camera, frame in frames.items():
-            path = os.path.join(target, f"{item_id}_{camera}.jpg")
-            if ImageSaveWorker.save_local_only(path, frame):
-                saved.append(path)
-            else:
-                log_fn("WARNING", f"Diagnostic image save failed camera={camera} id={item_id}")
-        metadata = dict(metadata, images=saved)
-        path = os.path.join(target, f"{item_id}.json")
-        temp = path + ".tmp"
-        metadata_saved = False
-        try:
-            with open(temp, "w", encoding="utf-8") as handle:
-                json.dump(metadata, handle, ensure_ascii=False, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, path)
-            metadata_saved = True
-        except OSError as exc:
-            log_fn("ERROR", f"Diagnostic metadata save failed id={item_id}: {exc}")
-        return len(saved) if metadata_saved else False
+        return diagnostic_archive.save_frames(
+            root,
+            item_id,
+            frames,
+            metadata,
+            log_fn,
+        )
 
-    def _check_weight_departure(self, frame, log_fn):
+    def _check_weight_trend(self, frame, log_fn):
         if not self.session.session_active:
             return False
-
-        if (
-            self.session.weight_departure_baseline is None
-            or frame.weight <= WEIGHT_THRESHOLD
-        ):
-            self.session.weight_departure_since = None
+        if frame.weight <= WEIGHT_THRESHOLD:
+            self.session.weight_trend_window.clear()
             return False
-
-        departure_weight = self.session.weight_departure_baseline - SESSION_WEIGHT_DEPARTURE_KG
-        if frame.weight > departure_weight:
-            self.session.weight_departure_since = None
-            self.session.weight_departure_baseline = max(
-                self.session.weight_departure_baseline,
-                self.session.latest_stable_weight,
-            )
+        window = self.session.weight_trend_window
+        window.append(frame.weight)
+        if len(window) < SESSION_WEIGHT_TREND_FRAMES:
             return False
-        if self.session.weight_departure_since is None:
-            self.session.weight_departure_since = time.time()
+        net_movement = window[-1] - window[0]
+        if abs(net_movement) < SESSION_WEIGHT_DEPARTURE_KG:
             return False
-        if (time.time() - self.session.weight_departure_since) < SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS:
+        if net_movement > 0:
+            direction = "rising"
+            directional_steps = sum(later > earlier for earlier, later in zip(window, list(window)[1:]))
+        else:
+            direction = "falling"
+            directional_steps = sum(later < earlier for earlier, later in zip(window, list(window)[1:]))
+        if directional_steps < SESSION_WEIGHT_TREND_DIRECTIONAL_STEPS:
             return False
-
-        self._end_session("weight_departure", log_fn)
+        log_metric(
+            log_fn, "weight_trend_confirmed", direction=direction,
+            start_weight_kg=window[0], end_weight_kg=window[-1],
+            net_movement_kg=net_movement, directional_steps=directional_steps,
+            comparison_frames=len(window),
+        )
+        self._end_session(f"weight_trend_{direction}", log_fn)
+        self._update_attempt(frame, log_fn)
         return True
 
     def _check_scale_empty(self, frame, log_fn):
@@ -871,7 +769,7 @@ class SessionManager:
         self.session.stable_weight = frame.weight
         return True
 
-    def _update_vehicle_state(self, log_fn):
+    def _update_vehicle_type(self, log_fn):
         if not self.session.session_active or not self.vehicle_tracker:
             return
 
@@ -879,24 +777,6 @@ class SessionManager:
         if summary["vehicle_type"] and summary["vehicle_type"] != self.session.vehicle_type:
             self.session.vehicle_type = summary["vehicle_type"]
             log_fn("VEHICLE", f"Session vehicle_type={self.session.vehicle_type}")
-
-        if summary["cam1_truck_stable"] or summary["cam3_truck_stable"]:
-            if not self.session.vehicle_was_stable:
-                log_fn("VEHICLE", "Session truck stabilized")
-            self.session.vehicle_was_stable = True
-
-        both_unstable = summary["cam1_truck_unstable"] and summary["cam3_truck_unstable"]
-        if not self.session.vehicle_was_stable or not both_unstable:
-            self.session.both_unstable_since = None
-            return
-
-        session_age = time.time() - (self.session.started_at or time.time())
-        if session_age < SESSION_MIN_DURATION_SECONDS:
-            self.session.both_unstable_since = None
-        elif self.session.both_unstable_since is None:
-            self.session.both_unstable_since = time.time()
-        elif (time.time() - self.session.both_unstable_since) >= VEHICLE_LEFT_DWELL_SECONDS:
-            self._end_session("vehicle_left", log_fn)
 
     def on_status_change(self, frame, old_status: str, new_status: str, log_fn):
         """Transition callback."""
@@ -1068,25 +948,11 @@ class SessionManager:
             deferred_lpr=queued,
         )
 
-        if reason in ("vehicle_left", "weight_departure") and (self.session.stable_weight or 0) > WEIGHT_THRESHOLD:
-            self._waiting_for_empty = True
-            self._post_session_empty_since = None
-            self.session.rearm_block_until = 0.0
-            self.session.rearm_block_reason = reason
-            self.session.rearm_reference_weight = self.session.stable_weight
-            self._attempt_wait_reference = None
-            self._post_session_low = None
-            log_fn("EVENT", f"Scale cycle waiting for empty after {reason}")
-            log_metric(
-                log_fn, "scale_cycle_waiting_for_empty", reason=reason,
-                reference_weight_kg=self.session.stable_weight,
-            )
-        else:
-            self.session.rearm_block_until = 0.0
-            self.session.rearm_block_reason = None
-            self.session.rearm_reference_weight = None
-            self._attempt_wait_reference = None
-            self._post_session_low = None
+        self.session.rearm_block_until = 0.0
+        self.session.rearm_block_reason = None
+        self.session.rearm_reference_weight = None
+        self._attempt_wait_reference = None
+        self._post_session_low = None
 
         self.session.session_active = False
         self.session.published_this_stop = False
@@ -1096,8 +962,6 @@ class SessionManager:
         self.session.last_publish_weight = None
         self.session.last_publish_decimal_pos = 0
         self.session.vehicle_type = None
-        self.session.vehicle_was_stable = False
-        self.session.both_unstable_since = None
         self.session.empty_since = None
         self.session.skipped_duplicate_publish = False
         self.session.lpr_start_frames = {}

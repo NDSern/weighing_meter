@@ -1,5 +1,9 @@
 __pycache__/
 *.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
 *.log
 *.bak
 AGENTS.md
@@ -21,6 +25,9 @@ weighing_service.service
 backup/
 diagnostics/
 patches/
+dist/
+build/
+*.egg-info/
 tmp_*.py
 run_patched.py
 nhap.py

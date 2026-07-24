@@ -39,10 +39,15 @@ config.local.py                             per-device overrides, untracked
 mqtt_service.py                             MQTT publisher
 d2008_scale_reader.py                       D2008 serial scale reader
 registered_license_plates.json              active plate registry
+tests/                                      unit tests and manual MQTT probe
 services/capture/frame_source.py            RTSP latest-frame grabbers
 services/capture/detect_coordinator.py      LPR and vehicle detection coordinators
 services/pipeline/license_plate_recognition.py  production LPR pipeline
-services/session/session_manager.py         session lifecycle, publishing, DB counts
+services/runtime/async_logging.py            nonblocking console/file logger
+services/session/session_manager.py         session lifecycle and publishing
+services/session/finalization_store.py      finalized-session ledger
+services/session/plate_store.py             confirmed-plate persistence
+services/session/diagnostic_archive.py      no-stable/no-plate evidence archive
 services/storage/image_save_worker.py       local image save and MinIO retry queue
 services/storage/publish_outbox.py          durable MQTT outbox
 services/tracking/plate_tracker.py          plate aggregation and image selection
@@ -65,6 +70,21 @@ MQTT_WEIGHBRIDGE_TOPIC_ID = WEIGHBRIDGE_ID[:8]
 ```
 
 Do not commit `config.local.py` or `weighing_service.service`.
+
+## Tests
+
+Run unit tests from repository root:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+The manual MQTT probe is intentionally outside test discovery:
+
+```bash
+python3 tests/mqtt_probe.py
+python3 tests/mqtt_probe.py --publish
+```
 
 ## Runtime Data
 

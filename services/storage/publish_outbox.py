@@ -220,7 +220,12 @@ class PublishOutbox:
         if ok:
             PublishOutbox._mark_completed(event_id)
             PublishOutbox._mark_published(event_id)
-            log("OFFLINE", f"Published queued event id={event_id}")
+            result = event["session_result"]
+            log(
+                ">>> SENT <<<",
+                f"plate={result.get('official_plate')} "
+                f"wt={result.get('stable_weight'):g}kg id={event_id[:8]}",
+            )
             log("METRIC", json.dumps(
                 {"event": "session_publish_acknowledged", "id": event_id},
                 separators=(",", ":"), sort_keys=True,

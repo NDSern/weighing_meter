@@ -89,6 +89,30 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         self.assertEqual(first, 1)
         self.assertEqual(replay, 1)
 
+    def test_publish_success_logs_one_prominent_line_and_metric(self):
+        event_id = "1234567890abcdef"
+        module._pending_events[event_id] = {
+            "id": event_id,
+            "created_at": "2026-07-23T00:00:00",
+            "image_paths": [],
+            "session_result": {
+                "official_plate": "14C-017.80",
+                "stable_weight": 34780.0,
+            },
+        }
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = True
+        logs = []
+
+        with patch.object(module, "_mqtt_svc", mqtt), patch.object(
+            module, "_log_fn", lambda level, message: logs.append((level, message))
+        ):
+            PublishOutbox._publish_event(event_id)
+
+        human = [entry for entry in logs if entry[0] != "METRIC"]
+        self.assertEqual(human, [(">>> SENT <<<", "plate=14C-017.80 wt=34780kg id=12345678")])
+        self.assertEqual(len([entry for entry in logs if entry[0] == "METRIC"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,6 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "4")
 os.environ.setdefault("OPENCV_FFMPEG_THREADS", "2")
@@ -79,65 +78,11 @@ from config import (
     YOLO26_MODEL_PATH,
 )
 
-# ── Logging ───────────────────────────────────────────────────────
-_log_lock = threading.Lock()
-_log_fp = None
-_log_date = None
+from services.runtime.async_logging import AsyncLogger
 
-
-def _log_path_for_date(date_text: str):
-    return os.path.join(LOG_DIR, f"{LOG_FILE_PREFIX}_{date_text}.log")
-
-
-def _ensure_log_file(now: datetime):
-    global _log_fp, _log_date
-    date_text = now.strftime("%Y-%m-%d")
-    if _log_fp is not None and _log_date == date_text:
-        return _log_fp
-    if _log_fp is not None:
-        _log_fp.close()
-        _log_fp = None
-        _log_date = None
-    os.makedirs(LOG_DIR, exist_ok=True)
-    _log_fp = open(_log_path_for_date(date_text), "a", buffering=1)
-    _log_date = date_text
-    return _log_fp
-
-
-def close_log():
-    global _log_fp, _log_date
-    with _log_lock:
-        if _log_fp is not None:
-            _log_fp.close()
-            _log_fp = None
-            _log_date = None
-
-
-def log(level: str, msg: str):
-    now = datetime.now()
-    ts = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
-    prefix = f"{ts} [{level:<7}] "
-    text = str(msg).replace("\r", "")
-    lines = text.splitlines() or [""]
-    rendered = [f"{prefix}{part}" if idx == 0 else f"{'':23} [{'':<7}] {part}" for idx, part in enumerate(lines)]
-    try:
-        with _log_lock:
-            fp = _ensure_log_file(now)
-            for line in rendered:
-                try:
-                    print(line, flush=True)
-                except OSError:
-                    pass
-                fp.write(line + "\n")
-            fp.flush()
-    except OSError as exc:
-        try:
-            sys.stderr.write(f"{prefix}File logging failed: {exc}\n")
-            for line in rendered:
-                sys.stderr.write(line + "\n")
-            sys.stderr.flush()
-        except OSError:
-            pass
+_logger = AsyncLogger(LOG_DIR, LOG_FILE_PREFIX)
+log = _logger.log
+close_log = _logger.close
 
 
 def mask_url_secret(url: str):

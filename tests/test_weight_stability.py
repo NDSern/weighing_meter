@@ -150,7 +150,7 @@ class SessionWeightTests(unittest.TestCase):
         self.manager.session.session_active = True
         self.manager.session.stable_weight = 39120
         self.manager.session.latest_stable_weight = 39120
-        self.manager.session.weight_departure_baseline = 39120
+        self.manager.session.weight_trend_window.extend([39120] * 15)
         self.manager.session.stable_weight_counts[39120] = 1
         self.manager.session.stable_weight_last_seen[39120] = 1
         self.manager.session.stable_weight_sequence = 1
@@ -168,46 +168,58 @@ class SessionWeightTests(unittest.TestCase):
         self.manager.on_frame(self.stable_frame(39120), Mock())
         self.assertEqual(self.manager.session.stable_weight, 39120)
 
-    def test_weight_departure_ends_after_two_seconds(self):
-        frame = make_frame(38500)
-        frame.status = "UNSTABLE"
-        self.manager._end_session = Mock()
+    def test_falling_trend_ends_session_and_starts_chained_attempt(self):
+        end_session = Mock(side_effect=lambda *_args: setattr(self.manager.session, "session_active", False))
+        self.manager._end_session = end_session
+        self.manager.session.weight_trend_window.clear()
 
-        with unittest.mock.patch(
-            "services.session.session_manager.time.time",
-            side_effect=[10.0, 11.9, 12.0],
-        ):
-            self.manager.on_frame(frame, Mock())
-            self.manager.on_frame(frame, Mock())
+        for weight in range(39120, 37620, -100):
+            frame = make_frame(weight)
+            frame.status = "UNSTABLE"
             self.manager.on_frame(frame, Mock())
 
-        self.manager._end_session.assert_called_once_with("weight_departure", unittest.mock.ANY)
+        end_session.assert_called_once_with("weight_trend_falling", unittest.mock.ANY)
+        self.assertIsNotNone(self.manager._attempt)
 
-    def test_stable_drop_does_not_move_departure_baseline(self):
+    def test_rising_trend_ends_session_and_starts_chained_attempt(self):
+        end_session = Mock(side_effect=lambda *_args: setattr(self.manager.session, "session_active", False))
+        self.manager._end_session = end_session
+        self.manager.session.weight_trend_window.clear()
+
+        for weight in range(39120, 40620, 100):
+            frame = make_frame(weight)
+            frame.status = "UNSTABLE"
+            self.manager.on_frame(frame, Mock())
+
+        end_session.assert_called_once_with("weight_trend_rising", unittest.mock.ANY)
+        self.assertIsNotNone(self.manager._attempt)
+
+    def test_rocking_does_not_confirm_weight_trend(self):
         self.manager._end_session = Mock()
-        dropped = self.stable_frame(38500)
+        self.manager.session.weight_trend_window.clear()
 
-        with unittest.mock.patch(
-            "services.session.session_manager.time.time",
-            side_effect=[10.0, 12.0],
-        ):
-            self.manager.on_frame(dropped, Mock())
-            self.manager.on_frame(dropped, Mock())
+        for weight in (39120, 38500, 39200, 38400, 39300) * 3:
+            frame = make_frame(weight)
+            frame.status = "UNSTABLE"
+            self.manager.on_frame(frame, Mock())
 
-        self.manager._end_session.assert_called_once_with("weight_departure", unittest.mock.ANY)
+        self.manager._end_session.assert_not_called()
 
-    def test_gradual_stable_drop_keeps_high_water_baseline(self):
+    def test_vehicle_disappearance_does_not_end_session(self):
+        self.manager.vehicle_tracker = Mock()
+        self.manager.vehicle_tracker.get_summary.return_value = {
+            "vehicle_type": "truck",
+            "cam1_truck_stable": False,
+            "cam3_truck_stable": False,
+            "cam1_truck_unstable": True,
+            "cam3_truck_unstable": True,
+        }
         self.manager._end_session = Mock()
-        with unittest.mock.patch(
-            "services.session.session_manager.time.time",
-            side_effect=[10.0, 12.0],
-        ):
-            self.manager.on_frame(self.stable_frame(38800), Mock())
-            self.manager.on_frame(self.stable_frame(38600), Mock())
-            self.manager.on_frame(self.stable_frame(38600), Mock())
 
-        self.assertEqual(self.manager.session.weight_departure_baseline, 39120)
-        self.manager._end_session.assert_called_once_with("weight_departure", unittest.mock.ANY)
+        self.manager.on_frame(make_frame(39120), Mock())
+
+        self.manager._end_session.assert_not_called()
+        self.assertEqual(self.manager.session.vehicle_type, "truck")
 
     def test_rolling_mode_forgets_old_plateau(self):
         for _ in range(25):
@@ -331,9 +343,9 @@ class SessionWeightTests(unittest.TestCase):
         manager.session.stable_weight = 10000
         manager.session.last_publish_weight = 10000
 
-        manager._end_session("weight_departure", Mock())
+        manager._end_session("weight_trend_falling", Mock())
 
-        self.assertTrue(manager._waiting_for_empty)
+        self.assertFalse(manager._waiting_for_empty)
 
     def test_nearest_session_frame_uses_requested_timestamp(self):
         metadata = {
@@ -369,7 +381,7 @@ class SessionWeightTests(unittest.TestCase):
         }
 
         with unittest.mock.patch(
-            "services.session.session_manager.cv2.imread", side_effect=frames.get,
+            "services.session.session_manager.cv2.imread", side_effect=frames.get, create=True,
         ):
             selected = self.manager._load_diagnostic_frames(metadata, offset_seconds=1.0)
 
@@ -379,7 +391,7 @@ class SessionWeightTests(unittest.TestCase):
         manager = SessionManager(Mock())
         manager.session.rearm_block_until = 11.0
         manager.session.rearm_reference_weight = 10000
-        manager.session.rearm_block_reason = "vehicle_left"
+        manager.session.rearm_block_reason = "weight_departure"
         manager._attempt_wait_reference = 10000
         frame = self.stable_frame(10600)
         frame.stability_rule = "exact_5"

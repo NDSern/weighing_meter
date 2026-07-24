@@ -69,7 +69,7 @@ class MqttService:
             self._log("WARNING", f"MQTT disconnected unexpectedly (rc={rc}), will reconnect...")
 
     def _on_publish(self, client, userdata, mid):
-        self._log("INFO", f"MQTT message published (mid={mid})")
+        pass
 
     def start(self):
         """Connect to broker in background with auto-reconnect."""
@@ -135,9 +135,6 @@ class MqttService:
                 if not info.is_published():
                     self._log("ERROR", f"MQTT publish ack timeout: plate={plate}, weight={weight:.3f} kg, mid={info.mid}")
                     return False
-            self._log("INFO", f"Published to {MQTT_TOPIC}: "
-                               f"plate={plate}, weight={weight:.3f} kg, "
-                               f"type={transaction_type} (mid={info.mid})")
             return True
         except Exception as exc:
             self._log("ERROR", f"MQTT publish failed: {exc}")
