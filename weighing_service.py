@@ -74,8 +74,6 @@ from config import (
     SESSION_FRAME_QUEUE_SIZE,
     UNDETECTABLE_DIR,
     WEIGHT_THRESHOLD,
-    YOLO26_ENABLED,
-    YOLO26_MODEL_PATH,
 )
 
 from services.runtime.async_logging import AsyncLogger
@@ -93,12 +91,10 @@ def mask_url_secret(url: str):
 from d2008_scale_reader import D2008Reader
 from mqtt_service import MqttService
 
-from services.pipeline.inference import detect_vehicles_rknn
 from services.pipeline.license_plate_recognition import detect_plate_regions, load_lpr_charset, recognize_plate_regions
 
-from services.tracking import PlateTracker, VehicleTracker
-from services.tracking.vehicle_tracker import set_log_fn as set_vehicle_tracker_log
-from services.capture import FrameGrabber, CameraGrabber, VehicleDetectCoordinator
+from services.tracking import PlateTracker
+from services.capture import FrameGrabber, CameraGrabber, DetectCoordinator
 from services.capture.detect_coordinator import set_log_fn as set_detect_coordinator_log
 from services.capture.session_frame_spool import SessionFrameSpool
 from services.pipeline.deferred_lpr_worker import DeferredLprWorker
@@ -112,7 +108,6 @@ from services.session import SessionManager
 from services.session.session_manager import set_log_fn as set_session_log
 
 # Configure logging in all modules
-set_vehicle_tracker_log(log)
 set_detect_coordinator_log(log)
 set_image_save_log(log)
 set_session_log(log)
@@ -128,10 +123,10 @@ def main():
         signal.SIGINT: signal.getsignal(signal.SIGINT),
     }
     models = mqtt_svc = cam1 = cam3 = grabber2 = None
-    detect_coord = vehicle_coord = reader = frame_spool = deferred_lpr = None
+    detect_coord = reader = frame_spool = deferred_lpr = None
     retention_cleaner = storage_maintenance = session_manager = plate_tracker = None
     mqtt_started = image_worker_started = outbox_started = False
-    lpr_stopped = vehicle_stopped = True
+    detect_stopped = deferred_stopped = True
 
     def cleanup(name, callback):
         try:
@@ -157,8 +152,8 @@ def main():
         models = RknnModelSet.open(
             LPR_DETECTOR_MODEL,
             LPR_RECOGNIZER_MODEL,
-            YOLO26_MODEL_PATH,
-            YOLO26_ENABLED,
+            None,
+            False,
             RKNN,
             log_fn=log,
         )
@@ -180,12 +175,6 @@ def main():
         grabber2.start()
 
         vehicle_tracker = None
-        if handles.vehicle is not None:
-            vehicle_tracker = VehicleTracker()
-            vehicle_coord = VehicleDetectCoordinator(
-                [cam1, cam3], vehicle_tracker, handles.vehicle, detect_vehicles_rknn
-            )
-            vehicle_coord.start()
 
         reader = D2008Reader(
             port=SERIAL_PORT,
@@ -215,6 +204,14 @@ def main():
             undetectable_dir=UNDETECTABLE_DIR,
             cam2_result_crop=CAM2_RESULT_CROP,
         )
+        detect_coord = DetectCoordinator(
+            [cam1, cam3], plate_tracker,
+            presence_callback=lambda camera, valid, revision: session_manager.on_plate_presence(
+                camera, valid, log, revision=revision
+            ),
+            session_context=session_manager.session_context,
+        )
+        detect_coord.configure_split_pipeline(detect_plate_regions, recognize_plate_regions, lpr_charset)
         frame_spool = SessionFrameSpool(
             LPR_SPOOL_DIR,
             cam1,
@@ -225,6 +222,7 @@ def main():
             notification_queue_size=SESSION_FRAME_QUEUE_SIZE,
             disk_cap_bytes=SESSION_FRAME_DISK_CAP_BYTES,
             min_free_bytes=SESSION_FRAME_MIN_FREE_BYTES,
+            metadata_provider=detect_coord.get_frame_metadata,
         )
         session_manager.frame_spool = frame_spool
         deferred_lpr = DeferredLprWorker(
@@ -243,6 +241,8 @@ def main():
             outbox_started = True
         frame_spool.start()
         deferred_lpr.start()
+        detect_coord.start()
+        detect_coord.set_enabled(True)
 
         reader.on_weight = lambda frame: session_manager.on_weight(frame, log)
         reader.on_frame = lambda frame: session_manager.on_frame(frame, log)
@@ -255,17 +255,18 @@ def main():
         request_stop()
     finally:
         log("INFO", "Stopping service...")
+        if detect_coord:
+            detect_coord.set_enabled(False)
+            detect_stopped = cleanup("detect_coordinator", detect_coord.stop) is not False
         if reader:
             reader.on_weight = reader.on_frame = reader.on_status_change = None
             cleanup("scale_reader", reader.stop)
         if session_manager:
             cleanup("session_manager", lambda: session_manager.shutdown(log))
         if deferred_lpr:
-            lpr_stopped = cleanup("deferred_lpr", deferred_lpr.stop) is not False
+            deferred_stopped = cleanup("deferred_lpr", deferred_lpr.stop) is not False
         if frame_spool:
             cleanup("session_frame_spool", frame_spool.stop)
-        if vehicle_coord:
-            vehicle_stopped = cleanup("vehicle_coordinator", vehicle_coord.stop) is not False
         for name, camera in (("cam2", grabber2), ("cam3", cam3), ("cam1", cam1)):
             if camera and cleanup(name, camera.stop) is False:
                 log("ERROR", f"{name} capture thread did not stop")
@@ -283,7 +284,10 @@ def main():
         if models:
             cleanup(
                 "rknn_models",
-                lambda: models.close(release_lpr=lpr_stopped, release_vehicle=vehicle_stopped),
+                lambda: models.close(
+                    release_lpr=detect_stopped and deferred_stopped,
+                    release_vehicle=True,
+                ),
             )
         for sig, handler in previous_handlers.items():
             cleanup(f"signal_{sig}", lambda sig=sig, handler=handler: signal.signal(sig, handler))

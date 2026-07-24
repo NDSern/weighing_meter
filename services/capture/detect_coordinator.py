@@ -3,7 +3,71 @@
 import threading
 import time
 
-from config import DETECT_FPS, YOLO26_DETECT_FPS
+from config import DETECT_FPS, PLATE_TRACK_STALE_SECONDS, YOLO26_DETECT_FPS
+
+
+def bbox_iou(left, right):
+    x1, y1 = max(left[0], right[0]), max(left[1], right[1])
+    x2, y2 = min(left[2], right[2]), min(left[3], right[3])
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    union = max(0, left[2] - left[0]) * max(0, left[3] - left[1]) + max(0, right[2] - right[0]) * max(0, right[3] - right[1]) - intersection
+    return intersection / union if union else 0.0
+
+
+class CameraPlateTrack:
+    """Camera-local detector track. Missing/error observations leave state untouched."""
+
+    def __init__(self, camera, confirm_hits=2, iou_threshold=0.3):
+        self.camera = camera
+        self.confirm_hits = confirm_hits
+        self.iou_threshold = iou_threshold
+        self.track_id = 0
+        self.bbox = None
+        self.confidence = 0.0
+        self.hits = 0
+        self.valid = False
+        self.frame_id = None
+        self.last_observed_at = None
+
+    def observe(self, regions, frame_id=None, observed_at=None):
+        self.last_observed_at = time.monotonic() if observed_at is None else observed_at
+        best = max(regions, key=lambda item: item.get("det_conf", item.get("confidence", 0.0)), default=None)
+        if best is None:
+            self.bbox = None
+            self.confidence = 0.0
+            self.hits = 0
+            self.valid = False
+            self.frame_id = frame_id
+            return
+        bbox = list(best["bbox"])
+        if self.bbox is None or bbox_iou(self.bbox, bbox) < self.iou_threshold:
+            self.track_id += 1
+            self.hits = 1
+        else:
+            self.hits += 1
+        self.bbox = bbox
+        self.confidence = float(best.get("det_conf", best.get("confidence", 0.0)))
+        self.valid = self.hits >= self.confirm_hits
+        self.frame_id = frame_id
+
+    def expire(self, now=None, stale_seconds=PLATE_TRACK_STALE_SECONDS):
+        if not self.valid or self.last_observed_at is None:
+            return False
+        now = time.monotonic() if now is None else now
+        if now - self.last_observed_at < stale_seconds:
+            return False
+        self.bbox = None
+        self.confidence = 0.0
+        self.hits = 0
+        self.valid = False
+        self.frame_id = None
+        return True
+
+    def metadata(self):
+        if not self.valid:
+            return []
+        return [{"bbox": list(self.bbox), "track_id": self.track_id,
+                 "confidence": self.confidence, "frame_id": self.frame_id}]
 
 
 def crop_lpr_frame(frame, mode):
@@ -49,13 +113,17 @@ def log(level: str, msg: str):
 
 
 class DetectCoordinator:
-    """Runs LPR on frames from multiple cameras in parallel.
-    Uses a persistent worker thread for second camera to avoid per-cycle thread creation."""
+    """Run one persistent detector and OCR worker per camera."""
 
-    def __init__(self, cameras: list, tracker, detect_plates_fn=None):
+    def __init__(self, cameras: list, tracker, detect_plates_fn=None, presence_callback=None, session_context=None):
         self._cameras = cameras
         self._tracker = tracker
         self._detect_plates_fn = detect_plates_fn
+        self._presence_callback = presence_callback
+        self._session_context = session_context or (lambda: (None, None))
+        self._tracks = {cam.name: CameraPlateTrack(cam.name) for cam in cameras}
+        self._track_lock = threading.Lock()
+        self._presence_revision = 0
         self._detect_regions_fn = None
         self._recognize_regions_fn = None
         self._charset = None
@@ -65,12 +133,12 @@ class DetectCoordinator:
         self._ocr_jobs = {}
         self._ocr_locks = {}
         self._ocr_events = {}
-        self._worker_frame = None
-        self._worker_event = threading.Event()
-        self._worker_done = threading.Event()
-        self._worker_done.set()
         self._detect_thread = None
-        self._worker_thread = None
+        self._worker_threads = []
+        self._detect_events = {}
+        self._detect_jobs = {}
+        self._detect_locks = {}
+        self._last_submitted_frame_ids = {}
         self._ocr_threads = []
 
     def configure_split_pipeline(self, detect_regions_fn, recognize_regions_fn, charset):
@@ -79,10 +147,16 @@ class DetectCoordinator:
         self._charset = charset
 
     def start(self):
+        if self._running:
+            return
         self._running = True
-        if len(self._cameras) > 1:
-            self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-            self._worker_thread.start()
+        for cam in self._cameras:
+            self._detect_events[cam.name] = threading.Event()
+            self._detect_locks[cam.name] = threading.Lock()
+            self._detect_jobs[cam.name] = None
+            thread = threading.Thread(target=self._camera_worker_loop, args=(cam,), daemon=True)
+            thread.start()
+            self._worker_threads.append(thread)
         if self._detect_regions_fn and self._recognize_regions_fn:
             for cam in self._cameras:
                 self._ocr_jobs[cam.name] = None
@@ -100,19 +174,18 @@ class DetectCoordinator:
         self._running = False
         for event in self._ocr_events.values():
             event.set()
-        self._worker_event.set()
-        self._worker_done.set()
-        self._worker_frame = None
+        for event in self._detect_events.values():
+            event.set()
         for name, lock in self._ocr_locks.items():
             with lock:
                 self._ocr_jobs[name] = None
-        for thread in (self._detect_thread, self._worker_thread):
+        for thread in [self._detect_thread, *self._worker_threads]:
             if thread and thread.is_alive():
                 thread.join(timeout=max(0.0, deadline - time.time()))
         for thread in self._ocr_threads:
             if thread and thread.is_alive():
                 thread.join(timeout=max(0.0, deadline - time.time()))
-        threads = [self._detect_thread, self._worker_thread, *self._ocr_threads]
+        threads = [self._detect_thread, *self._worker_threads, *self._ocr_threads]
         return all(not thread or not thread.is_alive() for thread in threads)
 
     def set_enabled(self, enabled: bool):
@@ -127,24 +200,29 @@ class DetectCoordinator:
         with self._state_lock:
             return self._enabled
 
-    def _worker_loop(self):
-        """Persistent worker thread for second camera inference."""
-        cam = self._cameras[1]
+    def _camera_worker_loop(self, cam):
+        event = self._detect_events[cam.name]
         while self._running:
-            self._worker_event.wait()
-            self._worker_event.clear()
+            event.wait(0.1)
+            event.clear()
             if not self._running:
                 break
-            frame = self._worker_frame
-            self._worker_frame = None
-            if frame is not None:
+            with self._detect_locks[cam.name]:
+                job = self._detect_jobs[cam.name]
+                self._detect_jobs[cam.name] = None
+            if job is not None:
+                frame, frame_id = job
                 try:
-                    self._run_detection(cam, frame)
+                    self._run_detection(cam, frame, frame_id)
                 except Exception as exc:
                     log("ERROR", f"Worker detection error [{cam.name}]: {exc}")
-                finally:
-                    del frame
-            self._worker_done.set()
+
+    def get_frame_metadata(self, camera, frame_id=None):
+        with self._track_lock:
+            metadata = self._tracks[camera].metadata() if camera in self._tracks else []
+            if frame_id is None or not metadata or metadata[0]["frame_id"] != frame_id:
+                return []
+            return metadata
 
     def _process_plate_detections(self, cam, plates, full_frame):
         """Process plate detections: log, update tracker, capture best plate and unknown frame."""
@@ -203,6 +281,7 @@ class DetectCoordinator:
                 "regions": regions,
                 "created_at": time.time(),
                 "detect_started_at": detect_started_at,
+                "session_context": self._session_context(),
             }
         event.set()
 
@@ -231,8 +310,12 @@ class DetectCoordinator:
                 if not self.is_enabled():
                     continue
                 t0 = time.time()
-                plates = self._recognize_regions_fn(regions, ocr=cam.ocr, charset=self._charset)
+                with cam.inference_lock:
+                    plates = self._recognize_regions_fn(regions, ocr=cam.ocr, charset=self._charset)
                 if not self.is_enabled():
+                    continue
+                if job["session_context"] != self._session_context():
+                    log("INFO", f"[{cam.name}] stale OCR result ignored context={job['session_context']}")
                     continue
                 elapsed_ms = (time.time() - t0) * 1000
                 age_ms = (t0 - job["created_at"]) * 1000
@@ -255,13 +338,21 @@ class DetectCoordinator:
                 del full_frame
                 del regions
 
-    def _run_detection(self, cam, full_frame):
+    def _run_detection(self, cam, full_frame, frame_id=None):
         """Run detection for one camera. Feeds tracker directly."""
         t0 = time.time()
         if self._detect_regions_fn and self._recognize_regions_fn:
             lpr_frame, dx, dy = crop_lpr_frame(full_frame, cam.lpr_crop)
-            regions = self._detect_regions_fn(lpr_frame, detector=cam.detector)
+            with cam.inference_lock:
+                regions = self._detect_regions_fn(lpr_frame, detector=cam.detector)
             regions = remap_lpr_regions(regions, dx, dy)
+            with self._track_lock:
+                self._tracks[cam.name].observe(regions, frame_id)
+                valid = {name: track.valid for name, track in self._tracks.items()}
+                self._presence_revision += 1
+                revision = self._presence_revision
+            if self._presence_callback:
+                self._presence_callback(cam.name, valid, revision)
             elapsed_ms = (time.time() - t0) * 1000
             log("TIMING", f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
                            f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
@@ -274,41 +365,57 @@ class DetectCoordinator:
             log("TIMING", f"[{cam.name}] Frame inference: {elapsed_ms:.0f}ms  plates={len(plates)}")
         self._process_plate_detections(cam, plates, full_frame)
 
+    def _expire_stale_tracks(self):
+        with self._track_lock:
+            changed = False
+            for track in self._tracks.values():
+                changed = track.expire() or changed
+            if not changed:
+                return None
+            valid = {name: track.valid for name, track in self._tracks.items()}
+            self._presence_revision += 1
+            return valid, self._presence_revision
+
     def _detect_loop(self):
         interval = 1.0 / DETECT_FPS
-        _cam0 = self._cameras[0]
-        _has_cam1 = len(self._cameras) > 1
         while self._running:
             if not self.is_enabled():
                 time.sleep(0.05)
                 continue
+            expired = self._expire_stale_tracks()
+            if expired and self._presence_callback:
+                valid, revision = expired
+                self._presence_callback(None, valid, revision)
 
-            frame1 = _cam0.get_latest_frame()
-            frame2 = self._cameras[1].get_latest_frame() if _has_cam1 else None
-
-            if frame1 is None and frame2 is None:
+            frames = []
+            for cam in self._cameras:
+                peek = getattr(cam, "peek_latest_frame_with_id", None)
+                frame, frame_id = peek(copy_frame=True) if peek else (
+                    cam.peek_latest_frame(copy_frame=True), None
+                )
+                frames.append((cam, frame, frame_id))
+            if not any(frame is not None for _cam, frame, _frame_id in frames):
                 time.sleep(0.01)
                 continue
 
             t0 = time.time()
             try:
-                if frame1 is not None and frame2 is not None:
-                    self._worker_done.wait()
-                    self._worker_done.clear()
-                    self._worker_frame = frame2
-                    frame2 = None
-                    self._worker_event.set()
-                    self._run_detection(_cam0, frame1)
-                    self._worker_done.wait()
-                elif frame1 is not None:
-                    self._run_detection(_cam0, frame1)
-                else:
-                    self._run_detection(self._cameras[1], frame2)
+                for cam, frame, frame_id in frames:
+                    if frame is None:
+                        continue
+                    if (
+                        frame_id is not None
+                        and self._last_submitted_frame_ids.get(cam.name) == frame_id
+                    ):
+                        continue
+                    self._last_submitted_frame_ids[cam.name] = frame_id
+                    with self._detect_locks[cam.name]:
+                        self._detect_jobs[cam.name] = (frame, frame_id)
+                    self._detect_events[cam.name].set()
             except Exception as exc:
                 log("ERROR", f"DetectCoordinator pipeline error: {exc}")
             finally:
-                frame1 = None
-                frame2 = None
+                frames = []
 
             elapsed_total = time.time() - t0
             time.sleep(max(0.0, interval - elapsed_total))

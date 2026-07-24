@@ -38,6 +38,7 @@ class _LatestFrameSource:
         self._grab_fail_log = grab_fail_log
         self._running = False
         self._latest_frame = None
+        self._latest_frame_id = 0
         self._frame_lock = threading.Lock()
         self._capture_lock = threading.Lock()
         self._capture = None
@@ -72,6 +73,14 @@ class _LatestFrameSource:
             if frame is None:
                 return None
             return frame.copy() if copy_frame else frame
+
+    def peek_latest_frame_with_id(self, copy_frame=False):
+        """Return latest frame and capture generation from one locked snapshot."""
+        with self._frame_lock:
+            frame = self._latest_frame
+            if frame is None:
+                return None, None
+            return (frame.copy() if copy_frame else frame), self._latest_frame_id
 
     def _grab_loop(self):
         interval = 1.0 / DETECT_FPS
@@ -111,6 +120,7 @@ class _LatestFrameSource:
                     if ret2:
                         with self._frame_lock:
                             self._latest_frame = frame
+                            self._latest_frame_id += 1
                     last_retrieve = now
                 grab_took = time.time() - t_grab
                 time.sleep(max(0.0, cam_frame_time - grab_took))
@@ -143,6 +153,7 @@ class CameraGrabber(_LatestFrameSource):
         self.detector = detector
         self.ocr = ocr
         self.lpr_crop = lpr_crop
+        self.inference_lock = threading.Lock()
         super().__init__(
             url=url,
             start_log=f"CameraGrabber [{name}] started. RTSP: {mask_url_secret(url)}",

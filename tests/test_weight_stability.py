@@ -13,6 +13,7 @@ sys.modules.setdefault("minio.error", Mock())
 
 from d2008_scale_reader import D2008Reader, WeightFrame
 from services.session.session_manager import SessionManager
+from services.storage.image_save_worker import ImageSaveWorker
 
 
 def make_frame(weight):
@@ -181,9 +182,8 @@ class SessionWeightTests(unittest.TestCase):
         end_session.assert_called_once_with("weight_trend_falling", unittest.mock.ANY)
         self.assertIsNotNone(self.manager._attempt)
 
-    def test_rising_trend_ends_session_and_starts_chained_attempt(self):
-        end_session = Mock(side_effect=lambda *_args: setattr(self.manager.session, "session_active", False))
-        self.manager._end_session = end_session
+    def test_rising_trend_does_not_split_active_session(self):
+        self.manager._end_session = Mock()
         self.manager.session.weight_trend_window.clear()
 
         for weight in range(39120, 40620, 100):
@@ -191,8 +191,8 @@ class SessionWeightTests(unittest.TestCase):
             frame.status = "UNSTABLE"
             self.manager.on_frame(frame, Mock())
 
-        end_session.assert_called_once_with("weight_trend_rising", unittest.mock.ANY)
-        self.assertIsNotNone(self.manager._attempt)
+        self.manager._end_session.assert_not_called()
+        self.assertTrue(self.manager.session.session_active)
 
     def test_rocking_does_not_confirm_weight_trend(self):
         self.manager._end_session = Mock()
@@ -387,7 +387,7 @@ class SessionWeightTests(unittest.TestCase):
 
         self.assertEqual(selected, {"cam1": "cam1+1s", "cam3": "cam3+1s"})
 
-    def test_stable_frame_promotes_before_chained_wait_gate(self):
+    def test_stable_frame_does_not_bypass_chained_wait_gate(self):
         manager = SessionManager(Mock())
         manager.session.rearm_block_until = 11.0
         manager.session.rearm_reference_weight = 10000
@@ -399,8 +399,7 @@ class SessionWeightTests(unittest.TestCase):
         with unittest.mock.patch("services.session.session_manager.time.time", return_value=12.0):
             manager.on_frame(frame, Mock())
 
-        self.assertTrue(manager.session.session_active)
-        self.assertEqual(manager.session.stability_rule, "exact_5")
+        self.assertFalse(manager.session.session_active)
 
     def test_stable_same_plateau_remains_blocked_after_rearm_delay(self):
         manager = SessionManager(Mock())
@@ -444,7 +443,7 @@ class SessionWeightTests(unittest.TestCase):
         self.assertFalse(manager.session.session_active)
         self.assertIsNone(manager._attempt)
 
-    def test_stable_frame_promotes_before_attempt_wait_gate_without_rearm(self):
+    def test_stable_frame_alone_does_not_start_session(self):
         self.manager.session.session_active = False
         self.manager._attempt_wait_reference = 10000
         frame = self.stable_frame(10300)
@@ -452,8 +451,118 @@ class SessionWeightTests(unittest.TestCase):
 
         self.manager.on_frame(frame, Mock())
 
-        self.assertTrue(self.manager.session.session_active)
-        self.assertEqual(self.manager.session.stability_rule, "exact_5")
+        self.assertFalse(self.manager.session.session_active)
+
+    def test_cam2_snapshot_is_saved_when_session_becomes_active(self):
+        rear = Mock()
+        rear.peek_latest_frame.return_value = "promotion-frame"
+        spool = Mock()
+        spool.begin_session.return_value = "/spool/session-1"
+        spool.save_session_frame.return_value = "/spool/session-1/cam2-start.jpg"
+        manager = SessionManager(Mock(), rear_grabber=rear, frame_spool=spool)
+        manager.session.stable_weight = 1200
+        manager.session.stability_rule = "exact_5"
+        manager._attempt = {
+            "id": "session-1",
+            "started_at": "2026-07-24T00:00:00+00:00",
+            "max_weight": 1200,
+            "start_frames": {},
+        }
+
+        manager._start_session(0, Mock())
+
+        self.assertTrue(manager.session.session_active)
+        rear.peek_latest_frame.assert_called_once_with(copy_frame=True)
+        spool.save_session_frame.assert_called_once_with(
+            "session-1", "cam2-start.jpg", "promotion-frame"
+        )
+        self.assertEqual(manager.session.rear_capture_source, "promotion")
+        self.assertIsNone(manager.session.rear_fallback_deadline)
+
+    def test_cam2_fallback_runs_once_two_seconds_after_failed_primary(self):
+        rear = Mock()
+        rear.peek_latest_frame.side_effect = [None, "fallback-frame"]
+        spool = Mock()
+        spool.begin_session.return_value = "/spool/session-1"
+        spool.save_session_frame.return_value = "/spool/session-1/cam2-fallback.jpg"
+        manager = SessionManager(Mock(), rear_grabber=rear, frame_spool=spool)
+        manager.session.stable_weight = 1200
+        manager.session.stability_rule = "exact_5"
+        manager._attempt = {
+            "id": "session-1",
+            "started_at": "2026-07-24T00:00:00+00:00",
+            "max_weight": 1200,
+            "start_frames": {},
+        }
+
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time",
+            side_effect=[10.0, 11.9, 12.0, 12.1],
+        ):
+            manager._start_session(0, Mock())
+            self.assertFalse(manager._capture_rear_fallback_if_due(Mock()))
+            self.assertTrue(manager._capture_rear_fallback_if_due(Mock()))
+            self.assertFalse(manager._capture_rear_fallback_if_due(Mock()))
+
+        self.assertEqual(rear.peek_latest_frame.call_count, 2)
+        spool.save_session_frame.assert_called_once_with(
+            "session-1", "cam2-fallback.jpg", "fallback-frame"
+        )
+        self.assertEqual(manager.session.rear_capture_source, "fallback_2s")
+
+    def test_publish_uses_saved_cam2_snapshot_not_later_sample(self):
+        manager = SessionManager(Mock(), rear_grabber=Mock())
+        tracker = Mock()
+        tracker.get_image_frame.return_value = (
+            Mock(shape=(448, 800, 3)),
+            "14C-017.80",
+            "cam1",
+            10.0,
+        )
+        manager._nearest_session_frame = Mock(
+            return_value="/spool/session/cam2-later.jpg"
+        )
+        manager._prepare_capture_paths = Mock(return_value={
+            key: (f"/{key}.jpg", f"key/{key}.jpg", f"/url/{key}.jpg")
+            for key in ("front", "rear", "merged", "unchosen_cam1", "unchosen_cam3")
+        })
+        manager._build_publish_images = Mock(
+            return_value=("front", "merged", "rear")
+        )
+        manager._crop_cam2_result_image = Mock(side_effect=lambda frame: frame)
+        result = {}
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: "saved-rear" if path == "/spool/session/cam2-start.jpg" else None,
+            create=True,
+        ), unittest.mock.patch.object(
+            ImageSaveWorker, "save_local_only", return_value=True
+        ):
+            attached = manager._attach_publish_images(
+                result,
+                1200,
+                0,
+                "14C-017.80",
+                [],
+                Mock(),
+                tracker=tracker,
+                rear_start_path="/spool/session/cam2-start.jpg",
+                session_dir="/spool/session",
+                session_files=["cam2-000010-sample.jpg"],
+                session_started_at="2026-07-24T00:00:00+00:00",
+                session_id="session-1",
+            )
+
+        self.assertTrue(attached)
+        manager._nearest_session_frame.assert_not_called()
+        manager._build_publish_images.assert_called_once_with(
+            tracker.get_image_frame.return_value[0],
+            "14C-017.80",
+            1200,
+            0,
+            "saved-rear",
+        )
 
 
 class PeakCandidateTests(unittest.TestCase):
@@ -550,7 +659,7 @@ class AttemptArchiveTests(unittest.TestCase):
         self.assertEqual(metadata["maximum_weight_kg"], 1600)
         self.assertIsNone(manager._attempt)
 
-    def test_stable_attempt_promotes_without_no_stable_archive(self):
+    def test_stable_attempt_waits_for_rising_trend(self):
         manager = SessionManager(Mock(), lpr_grabbers={})
         manager._archive_no_stable = Mock()
         log = Mock()
@@ -561,13 +670,10 @@ class AttemptArchiveTests(unittest.TestCase):
 
         manager.on_frame(frame, log)
 
-        self.assertTrue(manager.session.session_active)
+        self.assertFalse(manager.session.session_active)
         manager._archive_no_stable.assert_not_called()
-        log.assert_any_call(
-            "EVENT", "Session start reason=5 exact weight frames rule=exact_5"
-        )
 
-    def test_spread_session_logs_tolerance_reason(self):
+    def test_spread_stability_alone_does_not_log_session_start(self):
         manager = SessionManager(Mock(), lpr_grabbers={})
         log = Mock()
         frame = make_frame(1200)
@@ -577,10 +683,11 @@ class AttemptArchiveTests(unittest.TestCase):
 
         manager.on_frame(frame, log)
 
-        log.assert_any_call(
-            "EVENT",
-            "Session start reason=weights value within tolerance rule=spread_10",
-        )
+        self.assertFalse(manager.session.session_active)
+        self.assertFalse(any(
+            call.args[0] == "EVENT" and "Session start reason=" in call.args[1]
+            for call in log.call_args_list
+        ))
 
 if __name__ == "__main__":
     unittest.main()

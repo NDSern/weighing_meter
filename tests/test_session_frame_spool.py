@@ -109,6 +109,24 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertGreaterEqual(manifest["frame_counts"]["cam2"], 1)
             self.assertTrue(any(name.startswith("cam2-") for name in manifest["files"]))
 
+    def test_records_timestamp_and_plate_track_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = lambda camera, frame_id: [{"bbox": [1, 2, 10, 8], "track_id": 7,
+                                                   "confidence": 0.9,
+                                                   "frame_id": frame_id}] if camera == "cam1" else []
+            spool = self.make_spool(root, metadata_provider=provider)
+            spool.start()
+            spool.begin_session("tracked")
+            time.sleep(0.05)
+            job = spool.end_session("tracked", {})
+            self.assertTrue(spool.stop(1))
+
+            with open(job, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            cam1 = next(name for name in manifest["files"] if name.startswith("cam1-"))
+            self.assertIn("captured_at", manifest["frame_metadata"][cam1])
+            self.assertEqual(manifest["frame_metadata"][cam1]["tracks"][0]["track_id"], 7)
+
     def test_pending_jobs_recover_fifo_after_queue_overflow_and_restart(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root, notification_queue_size=1)

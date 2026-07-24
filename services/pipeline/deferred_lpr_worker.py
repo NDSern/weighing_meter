@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime
 
 import cv2 as _cv2
@@ -141,6 +142,7 @@ class DeferredLprWorker:
             job = json.load(handle)
         session_dir = job["session_dir"]
         files = job["files"]
+        frame_metadata = job.get("frame_metadata", {})
         metadata = job["metadata"]
         if not isinstance(files, list) or not isinstance(metadata, dict):
             raise ValueError("manifest files and metadata have invalid types")
@@ -168,7 +170,11 @@ class DeferredLprWorker:
                 camera_name = relative_path.split("-", 1)[0]
                 observed_at = started_at + camera_indexes.get(camera_name, 0) * interval
                 camera_indexes[camera_name] = camera_indexes.get(camera_name, 0) + 1
-                if self._process_frame(session_dir, relative_path, tracker, observed_at):
+                item_metadata = frame_metadata.get(relative_path)
+                if isinstance(item_metadata, dict) and item_metadata.get("captured_at"):
+                    observed_at = datetime.fromisoformat(item_metadata["captured_at"]).timestamp()
+                if self._process_frame(session_dir, relative_path, tracker, observed_at,
+                                       item_metadata):
                     successful_frames += 1
             except Exception as exc:
                 self._log(
@@ -181,7 +187,7 @@ class DeferredLprWorker:
         if self._callback(metadata, tracker) is False:
             raise RuntimeError("deferred session finalization failed")
 
-    def _process_frame(self, session_dir, relative_path, tracker, observed_at):
+    def _process_frame(self, session_dir, relative_path, tracker, observed_at, metadata=None):
         if not isinstance(relative_path, str):
             raise ValueError("frame path is not a string")
         camera_name = relative_path.split("-", 1)[0]
@@ -195,10 +201,23 @@ class DeferredLprWorker:
         if frame is None:
             raise ValueError("JPEG decode failed")
 
-        cropped, dx, dy = crop_lpr_frame(frame, camera.lpr_crop)
-        regions = self._detect_regions(cropped, detector=camera.detector)
-        regions = remap_lpr_regions(regions, dx, dy)
-        plates = self._recognize_regions(regions, ocr=camera.ocr, charset=self._charset)
+        tracks = metadata.get("tracks") if isinstance(metadata, dict) else None
+        if not tracks:
+            cropped, dx, dy = crop_lpr_frame(frame, camera.lpr_crop)
+            with getattr(camera, "inference_lock", nullcontext()):
+                regions = self._detect_regions(cropped, detector=camera.detector)
+            regions = remap_lpr_regions(regions, dx, dy)
+        else:
+            regions = []
+            height, width = frame.shape[:2]
+            for track in tracks:
+                x1, y1, x2, y2 = (int(value) for value in track["bbox"])
+                x1, y1, x2, y2 = max(0, x1), max(0, y1), min(width, x2), min(height, y2)
+                if x2 > x1 and y2 > y1:
+                    regions.append({"bbox": [x1, y1, x2, y2], "crop": frame[y1:y2, x1:x2],
+                                    "det_conf": track.get("confidence", 0.0)})
+        with getattr(camera, "inference_lock", nullcontext()):
+            plates = self._recognize_regions(regions, ocr=camera.ocr, charset=self._charset)
         self._update_tracker(tracker, plates, frame, camera_name, observed_at)
         return True
 

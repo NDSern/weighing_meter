@@ -27,6 +27,7 @@ class SessionFrameSpool:
         disk_cap_bytes=None,
         min_free_bytes=64 * 1024 * 1024,
         cv2_module=cv2,
+        metadata_provider=None,
     ):
         if interval <= 0:
             raise ValueError("interval must be positive")
@@ -46,6 +47,7 @@ class SessionFrameSpool:
         self._disk_cap_bytes = disk_cap_bytes
         self._min_free_bytes = min_free_bytes
         self._cv2 = cv2_module
+        self._metadata_provider = metadata_provider
         self._notifications = queue.Queue(maxsize=notification_queue_size)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -100,6 +102,7 @@ class SessionFrameSpool:
                 "session_dir": session_dir,
                 "started_at": self._now(),
                 "files": [],
+                "frame_metadata": {},
                 "incomplete": False,
                 "errors": [],
                 "counts": {camera: 0 for camera in self._grabbers},
@@ -136,6 +139,7 @@ class SessionFrameSpool:
                 "started_at": active["started_at"],
                 "ended_at": self._now(),
                 "files": list(active["files"]),
+                "frame_metadata": dict(active["frame_metadata"]),
                 "frame_counts": dict(active["counts"]),
                 "capture_interval_seconds": self._interval,
                 "metadata": metadata,
@@ -253,9 +257,9 @@ class SessionFrameSpool:
             with self._lock:
                 if self._active is not None:
                     for camera, grabber in self._grabbers.items():
-                        frame = self._read_frame(grabber)
+                        frame, frame_id = self._read_frame(grabber)
                         if frame is not None:
-                            self._save_frame_locked(camera, frame, "sample")
+                            self._save_frame_locked(camera, frame, "sample", frame_id)
             if time.monotonic() >= next_cleanup:
                 self._resume_cleanup()
                 next_cleanup = time.monotonic() + 10.0
@@ -284,15 +288,18 @@ class SessionFrameSpool:
     @staticmethod
     def _read_frame(grabber):
         if grabber is None:
-            return None
+            return None, None
+        peek_with_id = getattr(grabber, "peek_latest_frame_with_id", None)
+        if peek_with_id:
+            return peek_with_id(copy_frame=True)
         peek = getattr(grabber, "peek_latest_frame", None)
         if peek:
-            return peek(copy_frame=True)
+            return peek(copy_frame=True), None
         if callable(grabber):
-            return grabber()
+            return grabber(), None
         raise TypeError("grabber must be callable or expose peek_latest_frame")
 
-    def _save_frame_locked(self, camera, frame, kind):
+    def _save_frame_locked(self, camera, frame, kind, frame_id=None):
         active = self._active
         index = active["counts"][camera]
         name = "%s-%06d-%s.jpg" % (camera, index, kind)
@@ -314,11 +321,20 @@ class SessionFrameSpool:
             self._bytes_written += len(data)
             active["counts"][camera] += 1
             active["files"].append(os.path.relpath(path, active["session_dir"]))
+            relative_path = os.path.relpath(path, active["session_dir"])
+            active["frame_metadata"][relative_path] = self._frame_metadata(camera, frame_id)
             return True
         except Exception as exc:
             active["incomplete"] = True
             active["errors"].append("%s: %s" % (camera, exc))
             return False
+
+    def _frame_metadata(self, camera, frame_id=None):
+        captured_at = self._now()
+        tracks = []
+        if self._metadata_provider:
+            tracks = self._metadata_provider(camera, frame_id)
+        return {"captured_at": captured_at, "frame_id": frame_id, "tracks": tracks}
 
     def _space_failure(self, size):
         if self._disk_cap_bytes is not None and self._bytes_written + size > self._disk_cap_bytes:
@@ -412,6 +428,7 @@ class SessionFrameSpool:
                     "started_at": active.get("started_at"),
                     "ended_at": ended_at,
                     "files": files,
+                    "frame_metadata": dict(active.get("frame_metadata", {})),
                     "frame_counts": active.get("counts", {"cam1": 0, "cam3": 0}),
                     "capture_interval_seconds": active.get("capture_interval_seconds", self._interval),
                     "metadata": metadata,
@@ -449,6 +466,7 @@ class SessionFrameSpool:
             "session_dir": active["session_dir"],
             "started_at": active["started_at"],
             "files": list(active["files"]),
+            "frame_metadata": dict(active["frame_metadata"]),
             "counts": dict(active["counts"]),
             "capture_interval_seconds": self._interval,
             "metadata": active["metadata"],

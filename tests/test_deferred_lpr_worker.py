@@ -86,6 +86,34 @@ class DeferredLprWorkerTests(unittest.TestCase):
                        "capture_interval_seconds": 0.2}, handle)
         return path
 
+    def test_tracked_bbox_skips_deferred_detector(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "bbox", ["cam1-000001.jpg"])
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest["frame_metadata"] = {
+                "cam1-000001.jpg": {
+                    "captured_at": "2026-07-15T00:00:01+00:00",
+                    "tracks": [{"bbox": [1, 2, 10, 8], "track_id": 1, "confidence": 0.9}],
+                }
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            detect = unittest.mock.Mock(side_effect=AssertionError("detector must not run"))
+            recognize = unittest.mock.Mock(return_value=[])
+            spool = FakeSpool([path])
+            camera = SimpleNamespace(name="cam1", detector="d1", ocr="o1", lpr_crop="full")
+            worker = DeferredLprWorker(
+                spool, [camera], "chars", lambda _metadata, _tracker: True,
+                detect_regions_fn=detect, recognize_regions_fn=recognize,
+                tracker_factory=Tracker, cv2_module=FakeCv2({"cam1-000001.jpg": Frame()}),
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: spool.acknowledged))
+            self.assertTrue(worker.stop())
+            detect.assert_not_called()
+            self.assertEqual(recognize.call_args.args[0][0]["bbox"], [1, 2, 10, 8])
+
     @staticmethod
     def wait_for(predicate, timeout=1):
         deadline = time.time() + timeout
