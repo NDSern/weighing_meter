@@ -61,6 +61,7 @@ class Tracker:
         self.observations = []
         self.images = []
         self.unknown = None
+        self.clear_count = 0
 
     def add_observation(self, *args, **kwargs):
         self.observations.append((args, kwargs))
@@ -75,6 +76,7 @@ class Tracker:
         self.unknown = frame
 
     def clear(self):
+        self.clear_count += 1
         self.observations.clear()
         self.images.clear()
         self.unknown = None
@@ -236,6 +238,100 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertEqual(spool.acknowledged, [])
             self.assertEqual(worker.status()["failed_jobs"], 1)
             self.assertIn("publish failed", worker.status()["last_error"])
+
+    def test_callback_failure_clears_tracker(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "first", [])
+            trackers = []
+
+            def make_tracker():
+                tracker = Tracker()
+                trackers.append(tracker)
+                return tracker
+
+            def fail_callback(_metadata, _tracker):
+                raise RuntimeError("publish failed")
+
+            worker = DeferredLprWorker(
+                FakeSpool([path]), [], [],
+                fail_callback,
+                tracker_factory=make_tracker, cv2_module=FakeCv2({}), failed_retry_delay=10,
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: worker.status()["failed_jobs"] == 1))
+            self.assertTrue(worker.stop())
+
+            self.assertEqual(trackers[0].clear_count, 1)
+
+    def test_frame_failure_clears_tracker(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "first", ["cam1-bad.jpg"])
+            trackers = []
+
+            def make_tracker():
+                tracker = Tracker()
+                trackers.append(tracker)
+                return tracker
+
+            worker = DeferredLprWorker(
+                FakeSpool([path]),
+                [SimpleNamespace(name="cam1", detector=1, ocr=2, lpr_crop="full")],
+                [], lambda _metadata, _tracker: True,
+                tracker_factory=make_tracker, cv2_module=FakeCv2({}), failed_retry_delay=10,
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: worker.status()["failed_jobs"] == 1))
+            self.assertTrue(worker.stop())
+
+            self.assertEqual(trackers[0].clear_count, 1)
+
+    def test_cleanup_failure_does_not_stop_worker(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = self.make_manifest(root, "first", [])
+            second = self.make_manifest(root, "second", [])
+            spool = FakeSpool([first, second])
+            completed = []
+            logs = []
+
+            worker = DeferredLprWorker(
+                spool, [], [], lambda metadata, _tracker: completed.append(metadata),
+                tracker_factory=Tracker, cv2_module=FakeCv2({}),
+                memory_cleanup_fn=mock.Mock(side_effect=RuntimeError("trim failed")),
+                log_fn=lambda level, message: logs.append((level, message)),
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: len(completed) == 2))
+            self.assertTrue(worker.stop())
+
+            events = [json.loads(message)["event"] for level, message in logs if level == "METRIC"]
+            self.assertEqual(spool.acknowledged, [first, second])
+            self.assertEqual(events.count("deferred_memory_cleanup_failed"), 2)
+
+    def test_job_interval_paces_jobs_and_stop_interrupts_wait(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = self.make_manifest(root, "first", [])
+            second = self.make_manifest(root, "second", [])
+            spool = FakeSpool([first, second])
+            completed_at = []
+            worker = DeferredLprWorker(
+                spool, [], [], lambda _metadata, _tracker: completed_at.append(time.monotonic()),
+                tracker_factory=Tracker, cv2_module=FakeCv2({}), job_interval=0.15,
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: len(completed_at) == 2))
+            self.assertGreaterEqual(completed_at[1] - completed_at[0], 0.14)
+            self.assertTrue(worker.stop())
+
+            third = self.make_manifest(root, "third", [])
+            waiting_worker = DeferredLprWorker(
+                FakeSpool([third]), [], [], lambda _metadata, _tracker: True,
+                tracker_factory=Tracker, cv2_module=FakeCv2({}), job_interval=5,
+            )
+            waiting_worker.start()
+            self.assertTrue(self.wait_for(lambda: waiting_worker.status()["current_job"] is None))
+            started = time.monotonic()
+            self.assertTrue(waiting_worker.stop())
+            self.assertLess(time.monotonic() - started, 0.5)
 
     def test_malformed_job_does_not_kill_thread(self):
         with tempfile.TemporaryDirectory() as root:

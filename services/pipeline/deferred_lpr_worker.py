@@ -143,9 +143,7 @@ class DeferredLprWorker:
                 else:
                     current_path = path
             finally:
-                gc.collect()
-                if self._memory_cleanup_fn:
-                    self._memory_cleanup_fn()
+                self._cleanup_memory(path)
                 rss_after = self._rss_bytes()
                 self._log(
                     "METRIC",
@@ -161,6 +159,31 @@ class DeferredLprWorker:
                     self._current_job = None
             if finished:
                 self._stop_event.wait(self._job_interval)
+
+    def _cleanup_memory(self, path):
+        for operation, callback in (
+            ("gc_collect", gc.collect),
+            ("native_trim", self._memory_cleanup_fn),
+        ):
+            if callback is None:
+                continue
+            try:
+                callback()
+            except Exception as exc:
+                self._log(
+                    "ERROR",
+                    "Deferred memory cleanup failed [%s] operation=%s: %s"
+                    % (path, operation, exc),
+                )
+                self._log(
+                    "METRIC",
+                    json.dumps(
+                        {"event": "deferred_memory_cleanup_failed", "manifest": path,
+                         "operation": operation,
+                         "error": "%s: %s" % (type(exc).__name__, exc)},
+                        separators=(",", ":"), sort_keys=True,
+                    ),
+                )
 
     @staticmethod
     def _rss_bytes():
@@ -195,6 +218,18 @@ class DeferredLprWorker:
         metadata["capture_interval_seconds"] = float(job.get("capture_interval_seconds", 0.2))
 
         tracker = self._tracker_factory()
+        try:
+            self._process_job_with_tracker(
+                job, session_dir, files, frame_metadata, metadata, tracker
+            )
+        finally:
+            clear = getattr(tracker, "clear", None)
+            if clear:
+                clear()
+
+    def _process_job_with_tracker(
+        self, job, session_dir, files, frame_metadata, metadata, tracker
+    ):
         successful_frames = 0
         started_at = datetime.fromisoformat(job["started_at"]).timestamp()
         interval = float(job.get("capture_interval_seconds", 0.2))
@@ -220,13 +255,8 @@ class DeferredLprWorker:
                 )
         if files and successful_frames == 0:
             raise RuntimeError("no session frames processed successfully")
-        try:
-            if self._callback(metadata, tracker) is False:
-                raise RuntimeError("deferred session finalization failed")
-        finally:
-            clear = getattr(tracker, "clear", None)
-            if clear:
-                clear()
+        if self._callback(metadata, tracker) is False:
+            raise RuntimeError("deferred session finalization failed")
 
     def _process_frame(self, session_dir, relative_path, tracker, observed_at, metadata=None):
         if not isinstance(relative_path, str):
