@@ -28,6 +28,7 @@ class SessionFrameSpool:
         min_free_bytes=64 * 1024 * 1024,
         cv2_module=cv2,
         metadata_provider=None,
+        quarantine_retention_days=30,
     ):
         if interval <= 0:
             raise ValueError("interval must be positive")
@@ -48,7 +49,9 @@ class SessionFrameSpool:
         self._min_free_bytes = min_free_bytes
         self._cv2 = cv2_module
         self._metadata_provider = metadata_provider
+        self._quarantine_retention_seconds = quarantine_retention_days * 86400
         self._notifications = queue.Queue(maxsize=notification_queue_size)
+        self._notification_lock = threading.Lock()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
@@ -63,7 +66,7 @@ class SessionFrameSpool:
         ):
             os.makedirs(path, exist_ok=True)
         self._recover_disk_state()
-        self._bytes_written = self._directory_size(self.sessions_dir)
+        self._bytes_written = self._spool_size()
         self._recover_notifications()
 
     def start(self):
@@ -154,12 +157,14 @@ class SessionFrameSpool:
 
     def get_pending_job(self, timeout=None):
         """Atomically claim and return the oldest pending manifest path."""
-        self._recover_notifications()
+        if self._notifications.empty():
+            self._recover_notifications()
         try:
             path = self._notifications.get(timeout=timeout)
         except queue.Empty:
             return None
-        self._known_notifications.discard(path)
+        with self._notification_lock:
+            self._known_notifications.discard(path)
         if os.path.exists(path):
             claimed = os.path.join(self.processing_dir, os.path.basename(path))
             try:
@@ -195,7 +200,8 @@ class SessionFrameSpool:
                 except OSError:
                     return
         self._unlink_durable(cleanup_path)
-        self._known_notifications.discard(path)
+        with self._notification_lock:
+            self._known_notifications.discard(path)
 
     def abort_session(self, session_id):
         """Discard one partially initialized active session."""
@@ -218,7 +224,8 @@ class SessionFrameSpool:
         os.replace(path, target)
         self._fsync_dir(os.path.dirname(path))
         self._fsync_dir(self.failed_dir)
-        self._known_notifications.discard(path)
+        with self._notification_lock:
+            self._known_notifications.discard(path)
         return target
 
     def save_session_frame(self, session_id, name, frame):
@@ -241,9 +248,12 @@ class SessionFrameSpool:
                 if reason not in self._active["errors"]:
                     self._active["errors"].append(reason)
                 return None
+            previous_size = os.path.getsize(path) if os.path.exists(path) else 0
             self._atomic_bytes(path, data)
-            self._bytes_written += len(data)
-            self._active["files"].append(os.path.relpath(path, self._active["session_dir"]))
+            self._bytes_written += len(data) - previous_size
+            relative_path = os.path.relpath(path, self._active["session_dir"])
+            if relative_path not in self._active["files"]:
+                self._active["files"].append(relative_path)
             self._write_active_locked()
             return path
 
@@ -284,6 +294,59 @@ class SessionFrameSpool:
                 continue
             self._bytes_written = max(0, self._bytes_written - size)
             self._unlink_durable(path)
+        self._expire_quarantine()
+
+    def _expire_quarantine(self):
+        cutoff = time.time() - self._quarantine_retention_seconds
+        live_references = self._manifest_session_references(
+            (self.jobs_dir, self.processing_dir, self.cleanup_dir)
+        )
+        failed_references = self._manifest_session_reference_counts((self.failed_dir,))
+        for directory in (self.failed_dir, self.orphan_dir):
+            try:
+                names = os.listdir(directory)
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(directory, name)
+                try:
+                    if os.path.getmtime(path) >= cutoff:
+                        continue
+                    session_dir = None
+                    if directory == self.failed_dir and os.path.isfile(path):
+                        manifest = self._read_manifest(path)
+                        if manifest:
+                            candidate = os.path.abspath(str(manifest.get("session_dir", "")))
+                            if self._is_session_dir(candidate):
+                                session_dir = candidate
+                    size = self._directory_size(path) if os.path.isdir(path) else os.path.getsize(path)
+                    if (session_dir and session_dir not in live_references
+                            and failed_references.get(session_dir, 0) <= 1
+                            and os.path.isdir(session_dir)):
+                        size += self._directory_size(session_dir)
+                        shutil.rmtree(session_dir)
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.unlink(path)
+                    self._bytes_written = max(0, self._bytes_written - size)
+                except OSError:
+                    continue
+
+    def _manifest_session_references(self, directories):
+        return set(self._manifest_session_reference_counts(directories))
+
+    def _manifest_session_reference_counts(self, directories):
+        counts = {}
+        for directory in directories:
+            for path in self._manifest_paths(directory):
+                manifest = self._read_manifest(path)
+                if not manifest:
+                    continue
+                session_dir = os.path.abspath(str(manifest.get("session_dir", "")))
+                if self._is_session_dir(session_dir):
+                    counts[session_dir] = counts.get(session_dir, 0) + 1
+        return counts
 
     @staticmethod
     def _read_frame(grabber):
@@ -524,13 +587,20 @@ class SessionFrameSpool:
             return []
 
     def _notify(self, path):
-        if path in self._known_notifications:
-            return
-        try:
-            self._notifications.put_nowait(path)
-            self._known_notifications.add(path)
-        except queue.Full:
-            pass
+        with self._notification_lock:
+            if path in self._known_notifications:
+                return
+            try:
+                self._notifications.put_nowait(path)
+                self._known_notifications.add(path)
+            except queue.Full:
+                pass
+
+    def _spool_size(self):
+        return sum(
+            self._directory_size(path)
+            for path in (self.sessions_dir, self.failed_dir, self.orphan_dir)
+        )
 
     @staticmethod
     def _atomic_bytes(path, data):

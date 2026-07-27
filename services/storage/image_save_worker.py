@@ -48,9 +48,10 @@ _minio = Minio(
 )
 
 _pending_file = os.path.join(SERVICE_DIR, "storage", "upload_pending.jsonl")
-_upload_queue = queue.Queue()
+_upload_queue = queue.Queue(maxsize=100)
 _pending_lock = threading.Lock()
 _pending_tasks = {}
+_queued_keys = set()
 _worker_lock = threading.Lock()
 _worker_thread = None
 _worker_started = False
@@ -160,7 +161,7 @@ class ImageSaveWorker:
             _worker_thread = None
         with _sync_executor_lock:
             if _sync_executor is not None:
-                _sync_executor.shutdown(wait=True)
+                _sync_executor.shutdown(wait=False, cancel_futures=True)
                 _sync_executor = None
         return True
 
@@ -306,14 +307,21 @@ class ImageSaveWorker:
                     if not os.path.exists(fpath):
                         append_dead_letter("minio", task, "local file missing", "missing_file")
                         continue
+                    try:
+                        attempts = max(0, int(task.get("attempts", 0)))
+                        next_attempt_at = max(0.0, float(task.get("next_attempt_at", 0.0)))
+                    except (TypeError, ValueError):
+                        attempts = 0
+                        next_attempt_at = 0.0
                     _pending_tasks[object_key] = {
                         "fpath": fpath,
                         "object_key": object_key,
                         "created_at": task.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+                        "attempts": attempts,
+                        "next_attempt_at": next_attempt_at,
                     }
             ImageSaveWorker._persist_pending_locked()
-            for task in _pending_tasks.values():
-                _upload_queue.put(task)
+            ImageSaveWorker._fill_upload_queue_locked()
         if _pending_tasks:
             log("MINIO", f"Loaded {len(_pending_tasks)} pending upload(s)")
 
@@ -334,17 +342,34 @@ class ImageSaveWorker:
             "fpath": fpath,
             "object_key": object_key,
             "created_at": datetime.now().isoformat(timespec="seconds"),
+            "attempts": 0,
+            "next_attempt_at": 0.0,
         }
         with _pending_lock:
             _pending_tasks[object_key] = task
             ImageSaveWorker._persist_pending_locked()
-        _upload_queue.put(task)
+            ImageSaveWorker._fill_upload_queue_locked()
 
     @staticmethod
     def _mark_uploaded(object_key):
         with _pending_lock:
             _pending_tasks.pop(object_key, None)
+            _queued_keys.discard(object_key)
             ImageSaveWorker._persist_pending_locked()
+            ImageSaveWorker._fill_upload_queue_locked()
+
+    @staticmethod
+    def _fill_upload_queue_locked():
+        now = time.time()
+        for task in _pending_tasks.values():
+            object_key = task["object_key"]
+            if object_key in _queued_keys or float(task.get("next_attempt_at", 0.0)) > now:
+                continue
+            try:
+                _upload_queue.put_nowait(task)
+            except queue.Full:
+                return
+            _queued_keys.add(object_key)
 
     @staticmethod
     def _upload_loop():
@@ -352,14 +377,18 @@ class ImageSaveWorker:
             try:
                 task = _upload_queue.get(timeout=0.5)
             except queue.Empty:
+                with _pending_lock:
+                    ImageSaveWorker._fill_upload_queue_locked()
                 continue
             try:
                 ImageSaveWorker._upload_task(task)
             except Exception as exc:
                 log("ERROR", f"MinIO upload worker error: {exc}")
-                time.sleep(2.0)
-                _upload_queue.put(task)
+                ImageSaveWorker._schedule_retry(task)
             finally:
+                with _pending_lock:
+                    _queued_keys.discard(task.get("object_key"))
+                    ImageSaveWorker._fill_upload_queue_locked()
                 _upload_queue.task_done()
 
     @staticmethod
@@ -388,9 +417,19 @@ class ImageSaveWorker:
             ImageSaveWorker._mark_uploaded(object_key)
         except S3Error as exc:
             log("ERROR", f"MinIO upload failed for {object_key}: {exc}")
-            time.sleep(2.0)
-            _upload_queue.put(task)
+            ImageSaveWorker._schedule_retry(task)
         except Exception as exc:
             log("ERROR", f"MinIO upload error for {object_key}: {exc}")
-            time.sleep(2.0)
-            _upload_queue.put(task)
+            ImageSaveWorker._schedule_retry(task)
+
+    @staticmethod
+    def _schedule_retry(task, increment=True):
+        object_key = task["object_key"]
+        with _pending_lock:
+            pending = _pending_tasks.get(object_key)
+            if pending is not task:
+                return
+            attempts = int(task.get("attempts", 0)) + (1 if increment else 0)
+            task["attempts"] = attempts
+            task["next_attempt_at"] = time.time() + min(300.0, 2.0 ** min(attempts, 8))
+            ImageSaveWorker._persist_pending_locked()

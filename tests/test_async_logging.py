@@ -37,6 +37,41 @@ class AsyncLoggingTests(unittest.TestCase):
 
             self.assertIn("[>>> SENT <<<] plate=14C-017.80", record[1][0])
 
+    def test_full_queue_drops_oldest_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logger = AsyncLogger(directory, "test", stdout=io.StringIO(), queue_size=2)
+            logger._ensure_thread = lambda: None
+
+            logger.log("INFO", "one")
+            logger.log("INFO", "two")
+            logger.log("INFO", "three")
+
+            records = [logger._queue.get_nowait(), logger._queue.get_nowait()]
+            self.assertNotIn("one", records[0][1][0])
+            self.assertIn("two", records[0][1][0])
+            self.assertIn("three", records[1][1][0])
+            self.assertEqual(logger._dropped, 1)
+
+    def test_close_can_enqueue_sentinel_when_queue_is_full(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logger = AsyncLogger(directory, "test", stdout=io.StringIO(), queue_size=1)
+            logger._queue.put_nowait((None, ["old"]))
+            thread = unittest.mock.Mock()
+            thread.is_alive.side_effect = [True, False]
+            logger._thread = thread
+
+            self.assertTrue(logger.close())
+            self.assertIs(logger._queue.get_nowait(), logger._sentinel)
+
+    def test_log_after_close_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logger = AsyncLogger(directory, "test", stdout=io.StringIO())
+            logger.close()
+
+            logger.log("INFO", "late")
+
+            self.assertTrue(logger._queue.empty())
+
 
 if __name__ == "__main__":
     unittest.main()

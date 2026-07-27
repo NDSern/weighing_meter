@@ -1,6 +1,8 @@
 import unittest
+from unittest import mock
 
 from services.runtime.rknn_models import RknnModelSet
+from services.tracking.plate_tracker import PlateTracker
 
 
 class FakeRknn:
@@ -76,6 +78,20 @@ class RknnModelSetTests(unittest.TestCase):
 
         releases = [call for call in FakeRknn.calls if call == ("release", 3)]
         self.assertEqual(len(releases), 2)
+
+
+class PlateTrackerResourceTests(unittest.TestCase):
+    def test_candidate_and_global_best_share_one_frame_copy(self):
+        frame = mock.Mock()
+        copied = object()
+        frame.copy.return_value = copied
+        tracker = PlateTracker(max_plate_images=2)
+
+        tracker.update_image("30A-12345", 0.9, frame, "cam1")
+
+        self.assertIs(tracker._plate_images["30A-12345"][0], copied)
+        self.assertIs(tracker._image_frame, copied)
+        frame.copy.assert_called_once()
 
 
 if __name__ == "__main__":

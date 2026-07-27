@@ -35,6 +35,7 @@ class DeferredLprWorker:
         failed_retry_delay=1.0,
         max_retries=3,
         job_interval=0.0,
+        gc_interval=10,
         memory_cleanup_fn=None,
         log_fn=None,
     ):
@@ -50,6 +51,8 @@ class DeferredLprWorker:
         self._failed_retry_delay = failed_retry_delay
         self._max_retries = max_retries
         self._job_interval = job_interval
+        self._gc_interval = max(1, gc_interval)
+        self._cleanup_count = 0
         self._memory_cleanup_fn = memory_cleanup_fn
         self._log_fn = log_fn
         self._stop_event = threading.Event()
@@ -161,10 +164,11 @@ class DeferredLprWorker:
                 self._stop_event.wait(self._job_interval)
 
     def _cleanup_memory(self, path):
-        for operation, callback in (
-            ("gc_collect", gc.collect),
-            ("native_trim", self._memory_cleanup_fn),
-        ):
+        self._cleanup_count += 1
+        operations = [("native_trim", self._memory_cleanup_fn)]
+        if self._cleanup_count % self._gc_interval == 0:
+            operations.insert(0, ("gc_collect", gc.collect))
+        for operation, callback in operations:
             if callback is None:
                 continue
             try:
@@ -285,8 +289,17 @@ class DeferredLprWorker:
                 x1, y1, x2, y2 = (int(value) for value in track["bbox"])
                 x1, y1, x2, y2 = max(0, x1), max(0, y1), min(width, x2), min(height, y2)
                 if x2 > x1 and y2 > y1:
-                    regions.append({"bbox": [x1, y1, x2, y2], "crop": frame[y1:y2, x1:x2],
-                                    "det_conf": track.get("confidence", 0.0)})
+                    crop = frame[y1:y2, x1:x2]
+                    regions.append({
+                        "bbox": [x1, y1, x2, y2],
+                        "obb": None,
+                        "det_conf": track.get("confidence", 0.0),
+                        "class": "tracked",
+                        "crop_size": "%dx%d" % (x2 - x1, y2 - y1),
+                        "crop_img": crop,
+                        "two_row": (x2 - x1) / max(y2 - y1, 1) < 2.2,
+                        "ocr_status": None,
+                    })
         with getattr(camera, "inference_lock", nullcontext()):
             plates = self._recognize_regions(regions, ocr=camera.ocr, charset=self._charset)
         self._update_tracker(tracker, plates, frame, camera_name, observed_at)

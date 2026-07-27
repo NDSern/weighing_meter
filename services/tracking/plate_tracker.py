@@ -58,16 +58,18 @@ class PlateTracker:
         """Store the best-confidence frame. Caller transfers ownership (no copy made)."""
         with self._lock:
             old = self._plate_images.get(plate_text)
+            stored_frame = None
             if old is None or det_conf > old[2]:
                 if old is None and len(self._plate_images) >= self._max_plate_images:
                     weakest = min(self._plate_images, key=lambda key: self._plate_images[key][2])
                     self._plate_images.pop(weakest, None)
+                stored_frame = frame.copy()
                 self._plate_images[plate_text] = (
-                    frame.copy(), camera_name, det_conf,
+                    stored_frame, camera_name, det_conf,
                     time.time() if observed_at is None else observed_at,
                 )
             if det_conf > self._image_conf:
-                self._image_frame = frame.copy()
+                self._image_frame = stored_frame if stored_frame is not None else frame.copy()
                 self._image_plate = plate_text
                 self._image_camera = camera_name
                 self._image_conf = det_conf

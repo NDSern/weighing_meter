@@ -296,6 +296,73 @@ class SessionFrameSpoolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 spool.acknowledge_job(os.path.join(root, "outside.json"))
 
+    def test_quarantine_counts_toward_cap_and_expires(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, quarantine_retention_days=1)
+            failed_session = os.path.join(spool.sessions_dir, "failed-session")
+            os.makedirs(failed_session)
+            frame = os.path.join(failed_session, "frame.jpg")
+            with open(frame, "wb") as handle:
+                handle.write(b"12345")
+            orphan = os.path.join(spool.orphan_dir, "old")
+            os.makedirs(orphan)
+            orphan_frame = os.path.join(orphan, "frame.jpg")
+            with open(orphan_frame, "wb") as handle:
+                handle.write(b"123")
+            old = time.time() - 2 * 86400
+            os.utime(orphan, (old, old))
+
+            restarted = self.make_spool(root, quarantine_retention_days=1)
+
+            self.assertGreaterEqual(restarted._bytes_written, 5)
+            self.assertFalse(os.path.exists(orphan))
+
+    def test_expired_failed_manifest_removes_session_frames(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, quarantine_retention_days=1)
+            session_dir = spool.begin_session("failed", {"cam1": Frame(1)})
+            spool.end_session("failed", {})
+            failed = spool.fail_job(spool.get_pending_job(timeout=0))
+            old = time.time() - 2 * 86400
+            os.utime(failed, (old, old))
+
+            restarted = self.make_spool(root, quarantine_retention_days=1)
+
+            self.assertFalse(os.path.exists(failed))
+            self.assertFalse(os.path.exists(session_dir))
+            self.assertEqual(restarted._bytes_written, 0)
+
+    def test_replacing_auxiliary_frame_keeps_accounting_and_manifest_bounded(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("replace")
+
+            spool.save_session_frame("replace", "rear.jpg", Frame(1))
+            first_bytes = spool._bytes_written
+            spool.save_session_frame("replace", "rear.jpg", Frame(2))
+
+            self.assertEqual(spool._bytes_written, first_bytes)
+            self.assertEqual(spool._active["files"].count("rear.jpg"), 1)
+
+    def test_failed_expiry_keeps_session_referenced_by_pending_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, quarantine_retention_days=1)
+            session_dir = spool.begin_session("shared", {"cam1": Frame(1)})
+            pending = spool.end_session("shared", {})
+            with open(pending, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            failed = os.path.join(spool.failed_dir, "old.json")
+            with open(failed, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            old = time.time() - 2 * 86400
+            os.utime(failed, (old, old))
+
+            restarted = self.make_spool(root, quarantine_retention_days=1)
+
+            self.assertFalse(os.path.exists(failed))
+            self.assertTrue(os.path.isdir(session_dir))
+            self.assertIsNotNone(restarted.get_pending_job(timeout=0))
+
 
 if __name__ == "__main__":
     unittest.main()

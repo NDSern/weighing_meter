@@ -120,7 +120,11 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertTrue(self.wait_for(lambda: spool.acknowledged))
             self.assertTrue(worker.stop())
             detect.assert_not_called()
-            self.assertEqual(recognize.call_args.args[0][0]["bbox"], [1, 2, 10, 8])
+            region = recognize.call_args.args[0][0]
+            self.assertEqual(region["bbox"], [1, 2, 10, 8])
+            self.assertEqual(region["crop_size"], "9x6")
+            self.assertIn("crop_img", region)
+            self.assertNotIn("crop", region)
 
     @staticmethod
     def wait_for(predicate, timeout=1):
@@ -175,7 +179,7 @@ class DeferredLprWorkerTests(unittest.TestCase):
             worker = DeferredLprWorker(
                 spool, [], [], lambda _metadata, _tracker: True,
                 tracker_factory=Tracker, cv2_module=FakeCv2({}),
-                memory_cleanup_fn=cleanup, job_interval=0,
+                memory_cleanup_fn=cleanup, job_interval=0, gc_interval=1,
                 log_fn=lambda level, message: logs.append((level, message)),
             )
 

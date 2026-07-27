@@ -6,17 +6,19 @@ from datetime import datetime
 
 
 class AsyncLogger:
-    def __init__(self, log_dir, file_prefix, stdout=None, stderr=None):
+    def __init__(self, log_dir, file_prefix, stdout=None, stderr=None, queue_size=10000):
         self.log_dir = log_dir
         self.file_prefix = file_prefix
         self.stdout = stdout or sys.stdout
         self.stderr = stderr or sys.stderr
         self._lock = threading.Lock()
-        self._queue = queue.Queue()
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._dropped = 0
         self._sentinel = object()
         self._thread = None
         self._file = None
         self._date = None
+        self._closing = False
 
     def _path_for_date(self, date_text):
         return os.path.join(self.log_dir, f"{self.file_prefix}_{date_text}.log")
@@ -72,6 +74,9 @@ class AsyncLogger:
                 self._thread.start()
 
     def log(self, level, message):
+        with self._lock:
+            if self._closing:
+                return
         now = datetime.now()
         timestamp = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
         tag = level if len(level) > 7 else f"{level:<7}"
@@ -84,13 +89,29 @@ class AsyncLogger:
             for index, part in enumerate(lines)
         ]
         self._ensure_thread()
-        self._queue.put_nowait((now, rendered))
+        self._enqueue((now, rendered))
+
+    def _enqueue(self, record):
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                self._dropped += 1
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(record)
+            except queue.Full:
+                self._dropped += 1
 
     def close(self, timeout=10.0):
         with self._lock:
+            self._closing = True
             thread = self._thread
         if thread and thread.is_alive():
-            self._queue.put_nowait(self._sentinel)
+            self._enqueue(self._sentinel)
             thread.join(timeout=timeout)
             if thread.is_alive():
                 return False
