@@ -303,35 +303,54 @@ class SessionFrameSpool:
         )
         failed_references = self._manifest_session_reference_counts((self.failed_dir,))
         for directory in (self.failed_dir, self.orphan_dir):
-            try:
-                names = os.listdir(directory)
-            except OSError:
-                continue
-            for name in names:
-                path = os.path.join(directory, name)
+            for path in self._expired_paths(directory, cutoff):
                 try:
-                    if os.path.getmtime(path) >= cutoff:
-                        continue
-                    session_dir = None
-                    if directory == self.failed_dir and os.path.isfile(path):
-                        manifest = self._read_manifest(path)
-                        if manifest:
-                            candidate = os.path.abspath(str(manifest.get("session_dir", "")))
-                            if self._is_session_dir(candidate):
-                                session_dir = candidate
-                    size = self._directory_size(path) if os.path.isdir(path) else os.path.getsize(path)
+                    session_dir = self._failed_session_dir(path) if directory == self.failed_dir else None
+                    removed_bytes = self._path_size(path)
                     if (session_dir and session_dir not in live_references
                             and failed_references.get(session_dir, 0) <= 1
                             and os.path.isdir(session_dir)):
-                        size += self._directory_size(session_dir)
+                        removed_bytes += self._directory_size(session_dir)
                         shutil.rmtree(session_dir)
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.unlink(path)
-                    self._bytes_written = max(0, self._bytes_written - size)
+                    self._remove_path(path)
+                    self._bytes_written = max(0, self._bytes_written - removed_bytes)
                 except OSError:
                     continue
+
+    @staticmethod
+    def _expired_paths(directory, cutoff):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+        expired = []
+        for name in names:
+            path = os.path.join(directory, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    expired.append(path)
+            except OSError:
+                continue
+        return expired
+
+    def _failed_session_dir(self, manifest_path):
+        if not os.path.isfile(manifest_path):
+            return None
+        manifest = self._read_manifest(manifest_path)
+        if not manifest:
+            return None
+        session_dir = os.path.abspath(str(manifest.get("session_dir", "")))
+        return session_dir if self._is_session_dir(session_dir) else None
+
+    def _path_size(self, path):
+        return self._directory_size(path) if os.path.isdir(path) else os.path.getsize(path)
+
+    @staticmethod
+    def _remove_path(path):
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
 
     def _manifest_session_references(self, directories):
         return set(self._manifest_session_reference_counts(directories))

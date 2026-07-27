@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import sys
 from types import ModuleType
@@ -316,6 +317,30 @@ class SessionFrameSpoolTests(unittest.TestCase):
 
             self.assertGreaterEqual(restarted._bytes_written, 5)
             self.assertFalse(os.path.exists(orphan))
+
+    def test_quarantine_scan_skips_unreadable_entry(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            expired = os.path.join(spool.orphan_dir, "expired")
+            unreadable = os.path.join(spool.orphan_dir, "unreadable")
+            os.makedirs(expired)
+            os.makedirs(unreadable)
+            old = time.time() - 2 * 86400
+            os.utime(expired, (old, old))
+
+            original_getmtime = os.path.getmtime
+            def getmtime(path):
+                if path == unreadable:
+                    raise OSError("unreadable")
+                return original_getmtime(path)
+
+            with mock.patch(
+                "services.capture.session_frame_spool.os.path.getmtime",
+                side_effect=getmtime,
+            ):
+                paths = spool._expired_paths(spool.orphan_dir, time.time() - 86400)
+
+            self.assertEqual(paths, [expired])
 
     def test_expired_failed_manifest_removes_session_frames(self):
         with tempfile.TemporaryDirectory() as root:

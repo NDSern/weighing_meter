@@ -283,27 +283,34 @@ class DeferredLprWorker:
                 regions = self._detect_regions(cropped, detector=camera.detector)
             regions = remap_lpr_regions(regions, dx, dy)
         else:
-            regions = []
-            height, width = frame.shape[:2]
-            for track in tracks:
-                x1, y1, x2, y2 = (int(value) for value in track["bbox"])
-                x1, y1, x2, y2 = max(0, x1), max(0, y1), min(width, x2), min(height, y2)
-                if x2 > x1 and y2 > y1:
-                    crop = frame[y1:y2, x1:x2]
-                    regions.append({
-                        "bbox": [x1, y1, x2, y2],
-                        "obb": None,
-                        "det_conf": track.get("confidence", 0.0),
-                        "class": "tracked",
-                        "crop_size": "%dx%d" % (x2 - x1, y2 - y1),
-                        "crop_img": crop,
-                        "two_row": (x2 - x1) / max(y2 - y1, 1) < 2.2,
-                        "ocr_status": None,
-                    })
+            regions = self._tracked_regions(frame, tracks)
         with getattr(camera, "inference_lock", nullcontext()):
             plates = self._recognize_regions(regions, ocr=camera.ocr, charset=self._charset)
         self._update_tracker(tracker, plates, frame, camera_name, observed_at)
         return True
+
+    @staticmethod
+    def _tracked_regions(frame, tracks):
+        height, width = frame.shape[:2]
+        regions = []
+        for track in tracks:
+            x1, y1, x2, y2 = (int(value) for value in track["bbox"])
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            crop_width, crop_height = x2 - x1, y2 - y1
+            if crop_width <= 0 or crop_height <= 0:
+                continue
+            regions.append({
+                "bbox": [x1, y1, x2, y2],
+                "obb": None,
+                "det_conf": track.get("confidence", 0.0),
+                "class": "tracked",
+                "crop_size": "%dx%d" % (crop_width, crop_height),
+                "crop_img": frame[y1:y2, x1:x2],
+                "two_row": crop_width / crop_height < 2.2,
+                "ocr_status": None,
+            })
+        return regions
 
     @staticmethod
     def _update_tracker(tracker, plates, frame, camera_name, observed_at):

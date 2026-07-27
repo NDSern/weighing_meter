@@ -25,6 +25,10 @@ from config import (
 )
 from services.storage.dead_letter import append_dead_letter, is_expired
 
+UPLOAD_QUEUE_SIZE = 100
+MAX_RETRY_DELAY_SECONDS = 300.0
+MAX_RETRY_EXPONENT = 8
+
 _log_fn = None
 
 
@@ -48,7 +52,7 @@ _minio = Minio(
 )
 
 _pending_file = os.path.join(SERVICE_DIR, "storage", "upload_pending.jsonl")
-_upload_queue = queue.Queue(maxsize=100)
+_upload_queue = queue.Queue(maxsize=UPLOAD_QUEUE_SIZE)
 _pending_lock = threading.Lock()
 _pending_tasks = {}
 _queued_keys = set()
@@ -307,19 +311,7 @@ class ImageSaveWorker:
                     if not os.path.exists(fpath):
                         append_dead_letter("minio", task, "local file missing", "missing_file")
                         continue
-                    try:
-                        attempts = max(0, int(task.get("attempts", 0)))
-                        next_attempt_at = max(0.0, float(task.get("next_attempt_at", 0.0)))
-                    except (TypeError, ValueError):
-                        attempts = 0
-                        next_attempt_at = 0.0
-                    _pending_tasks[object_key] = {
-                        "fpath": fpath,
-                        "object_key": object_key,
-                        "created_at": task.get("created_at") or datetime.now().isoformat(timespec="seconds"),
-                        "attempts": attempts,
-                        "next_attempt_at": next_attempt_at,
-                    }
+                    _pending_tasks[object_key] = ImageSaveWorker._normalize_upload_task(task)
             ImageSaveWorker._persist_pending_locked()
             ImageSaveWorker._fill_upload_queue_locked()
         if _pending_tasks:
@@ -337,14 +329,28 @@ class ImageSaveWorker:
         os.replace(tmp_path, _pending_file)
 
     @staticmethod
+    def _normalize_upload_task(task):
+        try:
+            attempts = max(0, int(task.get("attempts", 0)))
+            next_attempt_at = max(0.0, float(task.get("next_attempt_at", 0.0)))
+        except (TypeError, ValueError):
+            attempts = 0
+            next_attempt_at = 0.0
+        return {
+            "fpath": task["fpath"],
+            "object_key": task["object_key"],
+            "created_at": task.get("created_at") or datetime.now().isoformat(timespec="seconds"),
+            "attempts": attempts,
+            "next_attempt_at": next_attempt_at,
+        }
+
+    @staticmethod
     def _enqueue_upload(fpath, object_key):
-        task = {
+        task = ImageSaveWorker._normalize_upload_task({
             "fpath": fpath,
             "object_key": object_key,
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "attempts": 0,
-            "next_attempt_at": 0.0,
-        }
+        })
         with _pending_lock:
             _pending_tasks[object_key] = task
             ImageSaveWorker._persist_pending_locked()
@@ -431,5 +437,9 @@ class ImageSaveWorker:
                 return
             attempts = int(task.get("attempts", 0)) + (1 if increment else 0)
             task["attempts"] = attempts
-            task["next_attempt_at"] = time.time() + min(300.0, 2.0 ** min(attempts, 8))
+            task["next_attempt_at"] = time.time() + ImageSaveWorker._retry_delay(attempts)
             ImageSaveWorker._persist_pending_locked()
+
+    @staticmethod
+    def _retry_delay(attempts):
+        return min(MAX_RETRY_DELAY_SECONDS, 2.0 ** min(attempts, MAX_RETRY_EXPONENT))
