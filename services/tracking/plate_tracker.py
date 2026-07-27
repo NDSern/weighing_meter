@@ -31,7 +31,7 @@ def _prefer_detailed_variant(best, counts, scores):
 class PlateTracker:
     """Accumulates plate observations across a session and returns the most frequent plate."""
 
-    def __init__(self):
+    def __init__(self, max_plate_images=8):
         self._observations = deque(maxlen=5000)  # (plate_text, weight, source, timestamp)
         self._lock = threading.Lock()
         self._image_frame = None  # full frame for saving on publish
@@ -40,6 +40,7 @@ class PlateTracker:
         self._image_conf = 0.0  # best det_conf for saved frame
         self._image_observed_at = None
         self._plate_images = {}  # plate_text -> (frame, camera_name, det_conf, observed_at)
+        self._max_plate_images = max_plate_images
         self._undetectable_frame = None  # first "unknown" frame for undetectable save
         self._undetectable_saved = False  # only save once per session
 
@@ -58,7 +59,7 @@ class PlateTracker:
         with self._lock:
             old = self._plate_images.get(plate_text)
             if old is None or det_conf > old[2]:
-                if old is None and len(self._plate_images) >= 8:
+                if old is None and len(self._plate_images) >= self._max_plate_images:
                     weakest = min(self._plate_images, key=lambda key: self._plate_images[key][2])
                     self._plate_images.pop(weakest, None)
                 self._plate_images[plate_text] = (

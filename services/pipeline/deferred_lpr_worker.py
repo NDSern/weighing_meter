@@ -1,5 +1,6 @@
 """Deferred license plate recognition for finalized session frame spools."""
 
+import gc
 import json
 import os
 import threading
@@ -33,6 +34,8 @@ class DeferredLprWorker:
         poll_interval=0.1,
         failed_retry_delay=1.0,
         max_retries=3,
+        job_interval=0.0,
+        memory_cleanup_fn=None,
         log_fn=None,
     ):
         self._spool = spool
@@ -46,6 +49,8 @@ class DeferredLprWorker:
         self._poll_interval = poll_interval
         self._failed_retry_delay = failed_retry_delay
         self._max_retries = max_retries
+        self._job_interval = job_interval
+        self._memory_cleanup_fn = memory_cleanup_fn
         self._log_fn = log_fn
         self._stop_event = threading.Event()
         self._thread = None
@@ -98,12 +103,15 @@ class DeferredLprWorker:
                 continue
             with self._state_lock:
                 self._current_job = path
+            rss_before = self._rss_bytes()
+            finished = False
             try:
                 self._process_job(path)
                 self._spool.acknowledge_job(path)
                 self._failed_until.pop(path, None)
                 self._retry_counts.pop(path, None)
                 current_path = None
+                finished = True
             except Exception as exc:
                 self._retry_counts[path] = self._retry_counts.get(path, 0) + 1
                 self._failed_until[path] = time.monotonic() + self._failed_retry_delay
@@ -131,11 +139,39 @@ class DeferredLprWorker:
                     self._failed_until.pop(path, None)
                     self._retry_counts.pop(path, None)
                     current_path = None
+                    finished = True
                 else:
                     current_path = path
             finally:
+                gc.collect()
+                if self._memory_cleanup_fn:
+                    self._memory_cleanup_fn()
+                rss_after = self._rss_bytes()
+                self._log(
+                    "METRIC",
+                    json.dumps(
+                        {"event": "deferred_job_memory", "manifest": path,
+                         "rss_before_bytes": rss_before, "rss_after_bytes": rss_after,
+                         "rss_delta_bytes": rss_after - rss_before,
+                         "finished": finished},
+                        separators=(",", ":"), sort_keys=True,
+                    ),
+                )
                 with self._state_lock:
                     self._current_job = None
+            if finished:
+                self._stop_event.wait(self._job_interval)
+
+    @staticmethod
+    def _rss_bytes():
+        try:
+            with open("/proc/self/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
 
     def _process_job(self, manifest_path):
         with open(manifest_path, encoding="utf-8") as handle:
@@ -184,8 +220,13 @@ class DeferredLprWorker:
                 )
         if files and successful_frames == 0:
             raise RuntimeError("no session frames processed successfully")
-        if self._callback(metadata, tracker) is False:
-            raise RuntimeError("deferred session finalization failed")
+        try:
+            if self._callback(metadata, tracker) is False:
+                raise RuntimeError("deferred session finalization failed")
+        finally:
+            clear = getattr(tracker, "clear", None)
+            if clear:
+                clear()
 
     def _process_frame(self, session_dir, relative_path, tracker, observed_at, metadata=None):
         if not isinstance(relative_path, str):

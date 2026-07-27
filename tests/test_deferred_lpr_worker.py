@@ -8,6 +8,7 @@ import sys
 from datetime import datetime
 from types import SimpleNamespace
 from types import ModuleType
+from unittest import mock
 
 try:
     import cv2  # noqa: F401
@@ -73,6 +74,11 @@ class Tracker:
     def save_undetectable(self, frame):
         self.unknown = frame
 
+    def clear(self):
+        self.observations.clear()
+        self.images.clear()
+        self.unknown = None
+
 
 class DeferredLprWorkerTests(unittest.TestCase):
     def make_manifest(self, root, name, files, metadata=None):
@@ -99,8 +105,8 @@ class DeferredLprWorkerTests(unittest.TestCase):
             }
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(manifest, handle)
-            detect = unittest.mock.Mock(side_effect=AssertionError("detector must not run"))
-            recognize = unittest.mock.Mock(return_value=[])
+            detect = mock.Mock(side_effect=AssertionError("detector must not run"))
+            recognize = mock.Mock(return_value=[])
             spool = FakeSpool([path])
             camera = SimpleNamespace(name="cam1", detector="d1", ocr="o1", lpr_crop="full")
             worker = DeferredLprWorker(
@@ -154,9 +160,31 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertTrue(worker.stop())
             self.assertEqual(calls, [("detect", "d1"), ("ocr", "d1", "o1", "chars"),
                                      ("detect", "d3"), ("ocr", "d3", "o3", "chars")])
-            self.assertEqual(len(trackers[0].observations), 2)
+            self.assertEqual(trackers[0].observations, [])
             self.assertEqual(spool.acknowledged, [path])
             self.assertFalse(worker.status()["running"])
+
+    def test_cleans_memory_and_logs_rss_after_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "one", [])
+            spool = FakeSpool([path])
+            cleanup = mock.Mock()
+            logs = []
+            worker = DeferredLprWorker(
+                spool, [], [], lambda _metadata, _tracker: True,
+                tracker_factory=Tracker, cv2_module=FakeCv2({}),
+                memory_cleanup_fn=cleanup, job_interval=0,
+                log_fn=lambda level, message: logs.append((level, message)),
+            )
+
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: cleanup.called))
+            self.assertTrue(worker.stop())
+
+            cleanup.assert_called_once()
+            metrics = [json.loads(message) for level, message in logs if level == "METRIC"]
+            self.assertEqual(metrics[-1]["event"], "deferred_job_memory")
+            self.assertTrue(metrics[-1]["finished"])
 
     def test_bad_frame_and_inference_do_not_abort_job(self):
         with tempfile.TemporaryDirectory() as root:

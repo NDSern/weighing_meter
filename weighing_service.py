@@ -232,6 +232,9 @@ def main():
             lambda metadata, tracker: session_manager.finalize_deferred_session(metadata, tracker, log),
             detect_regions_fn=detect_plate_regions,
             recognize_regions_fn=recognize_plate_regions,
+            tracker_factory=lambda: PlateTracker(max_plate_images=2),
+            job_interval=1.0,
+            memory_cleanup_fn=_malloc_trim,
             log_fn=log,
         )
         ImageSaveWorker.start_upload_worker()
