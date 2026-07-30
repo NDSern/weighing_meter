@@ -497,13 +497,11 @@ class SessionFrameSpool:
                     )
                 except (TypeError, ValueError):
                     duration_s = 0.0
-                metadata.update({
-                    "end_reason": "machine_offline",
-                    "ended_at": ended_at,
-                    "duration_s": duration_s,
-                    "recovered_after_restart": True,
-                    "incomplete": True,
-                })
+                metadata.setdefault("end_reason", "machine_offline")
+                metadata.setdefault("ended_at", ended_at)
+                metadata.setdefault("duration_s", duration_s)
+                metadata["recovered_after_restart"] = True
+                metadata["incomplete"] = True
                 manifest = {
                     "session_id": session_id,
                     "session_dir": session_dir,

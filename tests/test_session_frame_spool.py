@@ -186,6 +186,41 @@ class SessionFrameSpoolTests(unittest.TestCase):
             path = spool.end_session("retry", {})
             self.assertTrue(os.path.exists(path))
 
+    def test_terminal_snapshot_survives_failed_finalize_and_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("retry", {"cam1": Frame(1)}, {
+                "session_id": "retry", "started_at": "2026-07-24T00:00:00+00:00",
+                "stable_weight": None,
+            })
+            terminal = {
+                "session_id": "retry", "started_at": "2026-07-24T00:00:00+00:00",
+                "ended_at": "2026-07-24T00:01:00+00:00", "stable_weight": 1200,
+                "duration_s": 60.0, "end_reason": "scale_empty",
+                "weight_observed_at": "2026-07-24T00:00:30+00:00",
+                "raw_peak_weight": 1210, "filtered_peak_weight": 1200,
+            }
+            spool.update_active_metadata("retry", terminal)
+            original = spool._atomic_json
+            spool._atomic_json = lambda path, value: (
+                (_ for _ in ()).throw(OSError("disk"))
+                if os.path.dirname(path) == spool.jobs_dir else original(path, value)
+            )
+            with self.assertRaises(OSError):
+                spool.end_session("retry", terminal)
+
+            restarted = self.make_spool(root)
+            recovered = restarted.get_pending_job(timeout=0)
+            with open(recovered, encoding="utf-8") as handle:
+                metadata = json.load(handle)["metadata"]
+
+            self.assertEqual(metadata["stable_weight"], 1200)
+            self.assertEqual(metadata["weight_observed_at"], "2026-07-24T00:00:30+00:00")
+            self.assertEqual(metadata["raw_peak_weight"], 1210)
+            self.assertEqual(metadata["end_reason"], "scale_empty")
+            self.assertEqual(metadata["ended_at"], "2026-07-24T00:01:00+00:00")
+            self.assertEqual(metadata["duration_s"], 60.0)
+
     def test_acknowledge_removes_manifest_and_session_directory(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root)

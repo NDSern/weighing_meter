@@ -2,7 +2,7 @@ import tempfile
 import unittest
 import sys
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 sys.modules.setdefault("serial", Mock())
@@ -229,6 +229,23 @@ class SessionWeightTests(unittest.TestCase):
 
         self.assertEqual(self.manager.session.stable_weight, 38500)
         self.assertEqual(len(self.manager.session.stable_weight_history), 25)
+
+    def test_eviction_mode_change_keeps_selected_weight_observation_time(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        started = datetime(2026, 7, 24, tzinfo=timezone.utc)
+        frames = []
+        for index, weight in enumerate([1000] * 13 + [2000] * 12 + [3000]):
+            frame = self.stable_frame(weight)
+            frame.timestamp = started + timedelta(seconds=index)
+            frames.append(frame)
+            manager._handle_stable_frame(frame, Mock())
+
+        self.assertEqual(manager.session.stable_weight, 2000)
+        self.assertEqual(
+            manager.session.stable_weight_observed_at,
+            frames[-2].timestamp.isoformat(timespec="milliseconds"),
+        )
 
     def test_rearm_rejects_same_nonzero_plateau(self):
         self.manager.session.session_active = False
@@ -478,6 +495,56 @@ class SessionWeightTests(unittest.TestCase):
         )
         self.assertEqual(manager.session.rear_capture_source, "promotion")
         self.assertIsNone(manager.session.rear_fallback_deadline)
+
+    def test_spool_finalize_failure_preserves_session_and_sets_fatal_error(self):
+        spool = Mock()
+        spool.end_session.side_effect = OSError("disk failed")
+        manager = SessionManager(Mock(), frame_spool=spool)
+        manager.session.session_active = True
+        manager.session.spool_active = True
+        manager.session.session_id = "session-1"
+        manager.session.started_at_iso = "2026-07-24T00:00:00+00:00"
+        manager.session.started_at = 1.0
+        manager.session.stable_weight = 1200
+        manager._save_diagnostic_frames = Mock()
+        log = Mock()
+
+        result = manager._end_session("scale_empty", log)
+
+        self.assertFalse(result)
+        self.assertTrue(manager.session.session_active)
+        self.assertEqual(manager.session.session_id, "session-1")
+        self.assertIn("disk failed", manager.fatal_error)
+        manager._save_diagnostic_frames.assert_not_called()
+
+        manager._end_session("shutdown", log)
+        failure_metrics = [
+            call for call in manager.frame_spool.method_calls
+            if call[0] == "end_session"
+        ]
+        self.assertEqual(len(failure_metrics), 2)
+        metric_messages = [
+            call.args[1] for call in log.call_args_list
+            if call.args and call.args[0] == "METRIC"
+        ]
+        self.assertEqual(
+            sum('"event":"session_spool_finalization_failed"' in message for message in metric_messages),
+            1,
+        )
+
+    def test_stable_observation_timestamp_is_in_terminal_snapshot(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.session_id = "session-1"
+        manager.session.started_at_iso = "2026-07-24T00:00:00+00:00"
+        manager.session.started_at = 1.0
+        frame = self.stable_frame(1200)
+        frame.timestamp = datetime.fromisoformat("2026-07-24T00:01:02.345+00:00")
+
+        manager._handle_stable_frame(frame, Mock())
+        metadata = manager._snapshot_session("scale_empty")
+
+        self.assertEqual(metadata["weight_observed_at"], "2026-07-24T00:01:02.345+00:00")
 
     def test_cam2_fallback_runs_once_two_seconds_after_failed_primary(self):
         rear = Mock()

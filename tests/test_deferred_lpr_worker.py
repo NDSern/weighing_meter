@@ -170,6 +170,29 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertEqual(spool.acknowledged, [path])
             self.assertFalse(worker.status()["running"])
 
+    def test_manifest_degradation_is_passed_to_finalizer(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "degraded", [], {"errors": ["metadata-error"]})
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest["incomplete"] = True
+            manifest["errors"] = ["disk cap reached", "metadata-error"]
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            received = []
+            spool = FakeSpool([path])
+            worker = DeferredLprWorker(
+                spool, [], [], lambda metadata, _tracker: received.append(dict(metadata)) or True,
+                tracker_factory=Tracker, cv2_module=FakeCv2({}),
+            )
+
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: spool.acknowledged))
+            self.assertTrue(worker.stop())
+
+            self.assertTrue(received[0]["incomplete"])
+            self.assertEqual(received[0]["errors"], ["metadata-error", "disk cap reached"])
+
     def test_cleans_memory_and_logs_rss_after_job(self):
         with tempfile.TemporaryDirectory() as root:
             path = self.make_manifest(root, "one", [])

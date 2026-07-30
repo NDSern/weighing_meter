@@ -66,8 +66,12 @@ def isSessionFinalized(session_id):
     return finalization_store.contains(SESSION_FINALIZATION_DB, session_id)
 
 
-def markSessionFinalized(session_id, outcome):
-    finalization_store.mark(SESSION_FINALIZATION_DB, session_id, outcome)
+def getSessionFinalization(session_id):
+    return finalization_store.get(SESSION_FINALIZATION_DB, session_id)
+
+
+def markSessionFinalized(session_id, outcome, record=None):
+    finalization_store.mark(SESSION_FINALIZATION_DB, session_id, outcome, record)
 
 
 def log_metric(log_fn, event, **fields):
@@ -230,9 +234,11 @@ class WeighingSessionState:
         self.stable_weight_counts = Counter()
         self.stable_weight_last_seen = {}
         self.stable_weight_decimal_pos = {}
+        self.stable_weight_observation_times = {}
         self.stable_weight_history = deque(maxlen=SESSION_STABLE_WEIGHT_WINDOW)
         self.stable_weight_sequence = 0
         self.latest_stable_weight = None
+        self.stable_weight_observed_at = None
         self.weight_trend_window = deque(maxlen=SESSION_WEIGHT_TREND_FRAMES)
         self.session_active = False
         self.vehicle_type = None
@@ -254,7 +260,7 @@ class WeighingSessionState:
         self.spool_active = False
         self.stability_rule = None
 
-    def record_stable_weight(self, weight, decimal_pos):
+    def record_stable_weight(self, weight, decimal_pos, observed_at=None):
         self.latest_stable_weight = weight
         if not self.session_active:
             self.stable_weight = weight
@@ -263,16 +269,18 @@ class WeighingSessionState:
 
         self.stable_weight_sequence += 1
         if len(self.stable_weight_history) == self.stable_weight_history.maxlen:
-            expired_weight, _expired_decimal_pos = self.stable_weight_history.popleft()
+            expired_weight, _expired_decimal_pos, _expired_observed_at = self.stable_weight_history.popleft()
             self.stable_weight_counts[expired_weight] -= 1
             if self.stable_weight_counts[expired_weight] <= 0:
                 self.stable_weight_counts.pop(expired_weight, None)
                 self.stable_weight_last_seen.pop(expired_weight, None)
                 self.stable_weight_decimal_pos.pop(expired_weight, None)
-        self.stable_weight_history.append((weight, decimal_pos))
+                self.stable_weight_observation_times.pop(expired_weight, None)
+        self.stable_weight_history.append((weight, decimal_pos, observed_at))
         self.stable_weight_counts[weight] += 1
         self.stable_weight_last_seen[weight] = self.stable_weight_sequence
         self.stable_weight_decimal_pos[weight] = decimal_pos
+        self.stable_weight_observation_times[weight] = observed_at
         if len(self.stable_weight_counts) > MAX_STABLE_WEIGHT_CANDIDATES:
             oldest_weakest = min(
                 self.stable_weight_counts,
@@ -283,6 +291,8 @@ class WeighingSessionState:
             )
             self.stable_weight_counts.pop(oldest_weakest)
             self.stable_weight_last_seen.pop(oldest_weakest, None)
+            self.stable_weight_decimal_pos.pop(oldest_weakest, None)
+            self.stable_weight_observation_times.pop(oldest_weakest, None)
         self.stable_weight = max(
             self.stable_weight_counts,
             key=lambda value: (
@@ -291,22 +301,28 @@ class WeighingSessionState:
             ),
         )
         self.stable_decimal_pos = self.stable_weight_decimal_pos[self.stable_weight]
+        self.stable_weight_observed_at = self.stable_weight_observation_times[self.stable_weight]
 
     def start_stable_weight_history(self):
         self.stable_weight_counts.clear()
         self.stable_weight_last_seen.clear()
         self.stable_weight_decimal_pos.clear()
+        self.stable_weight_observation_times.clear()
         self.stable_weight_history.clear()
         self.stable_weight_sequence = 1
-        self.stable_weight_history.append((self.stable_weight, self.stable_decimal_pos))
+        self.stable_weight_history.append(
+            (self.stable_weight, self.stable_decimal_pos, self.stable_weight_observed_at)
+        )
         self.stable_weight_counts[self.stable_weight] = 1
         self.stable_weight_last_seen[self.stable_weight] = 1
         self.stable_weight_decimal_pos[self.stable_weight] = self.stable_decimal_pos
+        self.stable_weight_observation_times[self.stable_weight] = self.stable_weight_observed_at
 
     def clear_stable_weight_history(self):
         self.stable_weight_counts.clear()
         self.stable_weight_last_seen.clear()
         self.stable_weight_decimal_pos.clear()
+        self.stable_weight_observation_times.clear()
         self.stable_weight_history.clear()
         self.stable_weight_sequence = 0
         self.latest_stable_weight = None
@@ -367,6 +383,10 @@ class SessionManager:
         self._session_raw_peak = None
         self._session_filtered_peak = None
         self._session_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
+        self.fatal_error = None
+        self._spool_failure_logged_for = None
+        self._pending_terminal_snapshot = None
+        self._last_spool_weight_checkpoint = 0.0
         self._load_dedup_state()
 
     def session_context(self):
@@ -376,6 +396,8 @@ class SessionManager:
     def on_plate_presence(self, _camera, valid_by_camera, log_fn=None, revision=None):
         log_fn = log_fn or log
         with self._lifecycle_lock:
+            if self.fatal_error:
+                return
             if revision is not None:
                 if revision <= self._plate_presence_revision:
                     return
@@ -477,6 +499,8 @@ class SessionManager:
             return self._on_frame_locked(frame, log_fn)
 
     def _on_frame_locked(self, frame, log_fn):
+        if self.fatal_error:
+            return
         if (
             self.session.session_active
             and self._plate_owned
@@ -492,6 +516,9 @@ class SessionManager:
             if len(self._session_weight_window) == self._session_weight_window.maxlen:
                 filtered = sorted(self._session_weight_window)[len(self._session_weight_window) // 2]
                 self._session_filtered_peak = max(self._session_filtered_peak or filtered, filtered)
+            if time.monotonic() - self._last_spool_weight_checkpoint >= 1.0:
+                self._update_spool_metadata(log_fn)
+                self._last_spool_weight_checkpoint = time.monotonic()
         if self._wait_for_empty_cycle(frame, log_fn):
             self.session.stable_count = 0
             return
@@ -682,14 +709,21 @@ class SessionManager:
 
     def _handle_stable_frame(self, frame, log_fn):
         stable_weight = frame.stable_weight if frame.stable_weight is not None else frame.weight
-        self.session.record_stable_weight(stable_weight, frame.decimal_pos)
-        self.session.stable_count += 1
-        if self.session.stable_weight <= WEIGHT_THRESHOLD:
-            return
-
+        previous = self.session.stable_weight
+        observed_at = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        self.session.record_stable_weight(stable_weight, frame.decimal_pos, observed_at)
         self.session.last_publish_weight = self.session.stable_weight
         self.session.last_publish_decimal_pos = self.session.stable_decimal_pos
         self.session.stability_rule = frame.stability_rule
+        if (
+            self.session.session_active
+            and self.session.stable_weight > WEIGHT_THRESHOLD
+            and self.session.stable_weight != previous
+        ):
+            self._update_spool_metadata(log_fn)
+        self.session.stable_count += 1
+        if self.session.stable_weight <= WEIGHT_THRESHOLD:
+            return
         # Stable weight alone never starts a cycle; rising trend does.
 
     def _update_attempt(self, frame, log_fn, allow_chained_stable=False):
@@ -831,7 +865,8 @@ class SessionManager:
         if (time.time() - self.session.empty_since) < SESSION_END_EMPTY_DWELL_SECONDS:
             return False
 
-        self._end_session("scale_empty", log_fn)
+        if self._end_session("scale_empty", log_fn) is False:
+            return True
         self.session.stable_weight = frame.weight
         return True
 
@@ -871,6 +906,7 @@ class SessionManager:
 
     def _start_session(self, decimal_pos: int, log_fn, trigger="scale_rising"):
         self.plate_tracker.clear()
+        self.session.stable_weight_observed_at = None
         self.session.rearm_block_until = 0.0
         self.session.rearm_block_reason = None
         self.session.rearm_reference_weight = None
@@ -927,6 +963,9 @@ class SessionManager:
                         "stable_weight": self.session.last_publish_weight,
                         "decimal_pos": self.session.last_publish_decimal_pos,
                         "stability_rule": self.session.stability_rule,
+                        "weight_observed_at": self.session.stable_weight_observed_at,
+                        "raw_peak_weight": self._session_raw_peak,
+                        "filtered_peak_weight": self._session_filtered_peak,
                         "vehicle_type": self.session.vehicle_type,
                         "rear_start_path": None,
                         "start_frame_paths": {},
@@ -1048,6 +1087,9 @@ class SessionManager:
                     "stable_weight": self.session.last_publish_weight,
                     "decimal_pos": self.session.last_publish_decimal_pos,
                     "stability_rule": self.session.stability_rule,
+                    "weight_observed_at": self.session.stable_weight_observed_at,
+                    "raw_peak_weight": self._session_raw_peak,
+                    "filtered_peak_weight": self._session_filtered_peak,
                     "vehicle_type": self.session.vehicle_type,
                     "rear_start_path": self.session.rear_start_path,
                     "rear_captured_at": self.session.rear_captured_at,
@@ -1062,16 +1104,35 @@ class SessionManager:
         if not self.session.session_active:
             return
 
-        end_reason = reason
-        metadata = self._snapshot_session(reason)
+        if self._pending_terminal_snapshot is None:
+            self._pending_terminal_snapshot = self._snapshot_session(reason)
+        metadata = dict(self._pending_terminal_snapshot)
+        end_reason = metadata["end_reason"]
         log_fn("EVENT", f"Session end id={self.session.session_id} reason={reason} weight_source={metadata['weight_source']}")
         queued = False
         if self.frame_spool and self.session.spool_active:
             try:
+                self.frame_spool.update_active_metadata(self.session.session_id, metadata)
                 self.frame_spool.end_session(self.session.session_id, metadata)
                 queued = True
+                self.fatal_error = None
+                if self._spool_failure_logged_for == metadata["session_id"]:
+                    log_metric(
+                        log_fn, "session_spool_finalization_recovered",
+                        id=metadata["session_id"], started_at=metadata["started_at"],
+                        ended_at=metadata["ended_at"],
+                    )
             except Exception as exc:
-                log_fn("ERROR", f"Session frame spool finalization failed: {exc}")
+                self.fatal_error = "Session frame spool finalization failed: %s" % exc
+                log_fn("FATAL", self.fatal_error)
+                if self._spool_failure_logged_for != metadata["session_id"]:
+                    log_metric(
+                        log_fn, "session_spool_finalization_failed",
+                        id=metadata["session_id"], started_at=metadata["started_at"],
+                        ended_at=metadata["ended_at"], error=str(exc),
+                    )
+                    self._spool_failure_logged_for = metadata["session_id"]
+                return False
         if not queued:
             self._save_diagnostic_frames(
                 NO_PLATE_DIR, self.session.session_id, self.session.lpr_start_frames,
@@ -1086,8 +1147,11 @@ class SessionManager:
         log_metric(
             log_fn, "session_end", id=metadata["session_id"],
             started_at=metadata["started_at"], ended_at=metadata["ended_at"],
-            end_reason=reason, stable_weight_kg=metadata["stable_weight"],
-            deferred_lpr=queued,
+            end_reason=end_reason, stable_weight_kg=metadata["stable_weight"],
+            weight_source=metadata["weight_source"],
+            raw_peak_weight=metadata["raw_peak_weight"],
+            filtered_peak_weight=metadata["filtered_peak_weight"],
+            weight_observed_at=metadata["weight_observed_at"], deferred_lpr=queued,
         )
 
         self.session.rearm_block_until = 0.0
@@ -1122,6 +1186,9 @@ class SessionManager:
         self.session.rear_start_path = None
         self.session.spool_active = False
         self.session.stability_rule = None
+        self.session.stable_weight_observed_at = None
+        self._pending_terminal_snapshot = None
+        return True
 
     def _snapshot_session(self, reason):
         ended_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -1142,6 +1209,9 @@ class SessionManager:
             "weight_source": source,
             "raw_peak_weight": self._session_raw_peak,
             "filtered_peak_weight": self._session_filtered_peak,
+            "weight_observed_at": (
+                self.session.stable_weight_observed_at if source == "stable" else None
+            ),
             "decimal_pos": self.session.last_publish_decimal_pos,
             "vehicle_type": self.session.vehicle_type,
             "rear_start_path": self.session.rear_start_path,
@@ -1167,7 +1237,18 @@ class SessionManager:
         """Finalize one immutable ended session after deferred LPR completes."""
         log_fn = log_fn or log
         session_id = metadata["session_id"]
-        if isSessionFinalized(session_id) or PublishOutbox.has_event(session_id):
+        finalization = getSessionFinalization(session_id)
+        if finalization:
+            outcome, record = finalization
+            outbox_event_id = record.get("outbox_event_id") if record else None
+            expected_outbox_id = outbox_event_id or (session_id if outcome == "published" else None)
+            if MQTT_ENABLED and expected_outbox_id and not PublishOutbox.activate(expected_outbox_id):
+                log_fn(
+                    "ERROR",
+                    f"Finalized session missing publication evidence id={session_id} "
+                    f"outbox_id={expected_outbox_id}",
+                )
+                return False
             log_fn("EVENT", f"Deferred session already finalized id={session_id}")
             return True
         if not metadata.get("stable_weight") or metadata["stable_weight"] <= WEIGHT_THRESHOLD:
@@ -1182,7 +1263,9 @@ class SessionManager:
             if saved is False:
                 return False
             log_fn("EVENT", f"DEFERRED END id={session_id} weight=none published=False")
-            markSessionFinalized(session_id, "no_weight")
+            markSessionFinalized(session_id, "no_weight", {
+                "event": "no_stable_attempt", "id": session_id, **metadata,
+            })
             return True
         plate, score, count = tracker.get_confirmed_plate()
         if not plate:
@@ -1197,29 +1280,65 @@ class SessionManager:
             if saved is False:
                 return False
             log_fn("EVENT", f"DEFERRED END id={metadata['session_id']} plate=none published=False")
+            markSessionFinalized(session_id, "no_plate", {
+                "event": "session_no_plate", "id": session_id,
+                "stable_weight_kg": metadata["stable_weight"], **metadata,
+            })
             log_metric(
                 log_fn, "session_no_plate", id=metadata["session_id"],
                 started_at=metadata["started_at"], ended_at=metadata["ended_at"],
                 end_reason=metadata["end_reason"],
                 stable_weight_kg=metadata["stable_weight"], images=saved,
+                weight_source=metadata.get("weight_source"),
+                raw_peak_weight=metadata.get("raw_peak_weight"),
+                filtered_peak_weight=metadata.get("filtered_peak_weight"),
+                weight_observed_at=metadata.get("weight_observed_at"),
+                recovered_after_restart=bool(metadata.get("recovered_after_restart")),
+                incomplete=bool(metadata.get("incomplete")), errors=metadata.get("errors", []),
             )
-            markSessionFinalized(session_id, "no_plate")
             return True
         result = self.publish_result(
             metadata["stable_weight"], metadata["decimal_pos"], log_fn,
             tracker=tracker, metadata=metadata,
         )
-        state = "duplicate" if result == "duplicate" else bool(result)
+        if result is False:
+            log_fn("EVENT", f"DEFERRED END id={metadata['session_id']} plate={plate} published=False")
+            return False
+        plate = result["plate"]
+        duplicate = result["status"] == "duplicate"
+        state = "duplicate" if duplicate else True
         log_fn("EVENT", f"DEFERRED END id={metadata['session_id']} plate={plate} published={state}")
-        event = "session_duplicate" if result == "duplicate" else "session_publish_queued"
+        event = "session_duplicate" if duplicate else "session_publish_queued"
+        terminal_record = {
+            "event": event, "id": session_id, "plate": plate,
+            "stable_weight_kg": metadata["stable_weight"], **metadata,
+        }
+        outbox_event_id = result.get("outbox_event_id")
+        if outbox_event_id:
+            terminal_record["outbox_event_id"] = outbox_event_id
+        markSessionFinalized(
+            session_id, "duplicate" if duplicate else "published",
+            terminal_record,
+        )
+        if outbox_event_id:
+            if not PublishOutbox.activate(outbox_event_id):
+                log_fn(
+                    "ERROR",
+                    f"Session publication evidence missing id={session_id} outbox_id={outbox_event_id}",
+                )
+                return False
         log_metric(
             log_fn, event, id=metadata["session_id"], plate=plate,
             started_at=metadata["started_at"], ended_at=metadata["ended_at"],
             stable_weight_kg=metadata["stable_weight"],
+            weight_source=metadata.get("weight_source"),
+            raw_peak_weight=metadata.get("raw_peak_weight"),
+            filtered_peak_weight=metadata.get("filtered_peak_weight"),
+            weight_observed_at=metadata.get("weight_observed_at"),
+            recovered_after_restart=bool(metadata.get("recovered_after_restart")),
+            incomplete=bool(metadata.get("incomplete")), errors=metadata.get("errors", []),
         )
-        if result is not False:
-            markSessionFinalized(session_id, "duplicate" if result == "duplicate" else "published")
-        return result is not False
+        return True
 
     @staticmethod
     def _load_start_frames(metadata):
@@ -1279,7 +1398,7 @@ class SessionManager:
             log_fn("REGISTRY", f"Corrected plate {plate} -> {registered_plate} reason={registry_reason}")
             plate = registered_plate
         if self._should_skip_duplicate_publish(plate, stable_weight, metadata.get("started_at")):
-            return "duplicate"
+            return {"status": "duplicate", "plate": plate}
 
         result = self._build_publish_result(stable_weight, plate, count, all_plates, metadata)
         if metadata.get("session_id"):
@@ -1310,8 +1429,12 @@ class SessionManager:
         if saved_count is not None:
             log_fn("PLATE_DB", f"Saved confirmed plate={plate} recognition_count={saved_count}")
 
+        outbox_event_id = None
         if MQTT_ENABLED and self.mqtt_svc:
-            PublishOutbox.enqueue(result, image_object_keys=image_object_keys, image_paths=image_paths)
+            outbox_event_id = PublishOutbox.enqueue(
+                result, image_object_keys=image_object_keys, image_paths=image_paths,
+                activate=False,
+            )
             log_fn("OFFLINE", f"Publish queued offline id={result.get('offline_event_id')} plate={plate}")
 
         with self._publish_lock:
@@ -1322,7 +1445,7 @@ class SessionManager:
                 self._save_dedup_state()
             except OSError as exc:
                 log_fn("ERROR", f"Session dedup state save failed: {exc}")
-        return True
+        return {"status": "published", "plate": plate, "outbox_event_id": outbox_event_id}
 
     def _build_publish_result(self, stable_weight, plate, count, all_plates, metadata=None):
         metadata = metadata or {}

@@ -71,7 +71,7 @@ class PublishOutbox:
         return True
 
     @staticmethod
-    def enqueue(session_result, image_object_keys=None, image_paths=None):
+    def enqueue(session_result, image_object_keys=None, image_paths=None, activate=True):
         event_id = session_result.get("offline_event_id") or uuid.uuid4().hex
         session_result["offline_event_id"] = event_id
         event = {
@@ -80,6 +80,7 @@ class PublishOutbox:
             "image_object_keys": list(image_object_keys or []),
             "image_paths": list(image_paths or []),
             "session_result": session_result,
+            "activated": bool(activate),
         }
         with _pending_lock:
             if PublishOutbox._is_published(event_id):
@@ -90,9 +91,21 @@ class PublishOutbox:
                 return event_id
             _pending_events[event_id] = event
             PublishOutbox._persist_locked()
-        _publish_queue.put(event_id)
+        if activate:
+            _publish_queue.put(event_id)
         log("OFFLINE", f"Queued publish event id={event_id} plate={session_result.get('official_plate')}")
         return event_id
+
+    @staticmethod
+    def activate(event_id):
+        with _pending_lock:
+            event = _pending_events.get(event_id)
+            if event is None:
+                return PublishOutbox._is_published(event_id)
+            event["activated"] = True
+            PublishOutbox._persist_locked()
+        _publish_queue.put(event_id)
+        return True
 
     @staticmethod
     def pending_count():
@@ -155,8 +168,9 @@ class PublishOutbox:
                         continue
                     _pending_events[event_id] = event
             PublishOutbox._persist_locked()
-            for event_id in _pending_events:
-                _publish_queue.put(event_id)
+            for event_id, event in _pending_events.items():
+                if event.get("activated", True):
+                    _publish_queue.put(event_id)
         if _pending_events:
             log("OFFLINE", f"Loaded {len(_pending_events)} pending publish event(s)")
 
@@ -170,6 +184,11 @@ class PublishOutbox:
             fp.flush()
             os.fsync(fp.fileno())
         os.replace(tmp_path, _outbox_file)
+        directory_fd = os.open(os.path.dirname(_outbox_file), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     @staticmethod
     def _mark_published(event_id):

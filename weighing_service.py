@@ -254,6 +254,8 @@ def main():
         while not stop_event.wait(0.1):
             if reader.state == "failed":
                 raise RuntimeError(f"Scale reader failed: {reader.last_error}")
+            if session_manager.fatal_error:
+                raise RuntimeError(session_manager.fatal_error)
     except KeyboardInterrupt:
         request_stop()
     finally:
