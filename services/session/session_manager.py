@@ -78,6 +78,29 @@ def log_metric(log_fn, event, **fields):
     log_fn("METRIC", json.dumps({"event": event, **fields}, separators=(",", ":"), sort_keys=True))
 
 
+def classify_lpr_failure(diagnostics):
+    diagnostics = diagnostics or {}
+    if diagnostics.get("available_lpr_frames") == 0:
+        return "lpr_frames_unavailable"
+    if diagnostics.get("ocr_valid_candidates", 0):
+        return "no_confirmed_plate_after_voting"
+    if diagnostics.get("ocr_low_confidence", 0):
+        return "plate_detected_ocr_low_confidence"
+    if diagnostics.get("ocr_invalid_format", 0):
+        return "plate_detected_ocr_invalid_format"
+    if diagnostics.get("ocr_blank", 0):
+        return "plate_detected_ocr_blank"
+    if diagnostics.get("crop_failures", 0) or diagnostics.get("crop_too_small", 0):
+        return "crop_failed"
+    if diagnostics.get("detector_successes", 0) and not diagnostics.get("detected_regions", 0):
+        return "no_plate_detection"
+    if diagnostics.get("ocr_errors", 0):
+        return "ocr_inference_error"
+    if diagnostics.get("detector_errors", 0):
+        return "detector_inference_error"
+    return "no_plate_detection"
+
+
 def saveConfirmedLicensePlate(license_plate, session_id=None):
     """Persist confirmed plate count once per confirmed session."""
     db_file = os.path.join(SERVICE_DIR, "confirmed_license_plates.db")
@@ -1269,19 +1292,32 @@ class SessionManager:
             return True
         plate, score, count = tracker.get_confirmed_plate()
         if not plate:
-            frames = self._load_diagnostic_frames(metadata, offset_seconds=1.0)
+            lpr_diagnostics = metadata.get("lpr_diagnostics") or {}
+            classification = classify_lpr_failure(lpr_diagnostics)
+            lpr_diagnostics["classification"] = classification
+            frames = self._load_lpr_diagnostic_frames(metadata, classification)
+            if not frames:
+                frames = self._load_diagnostic_frames(metadata, offset_seconds=1.0)
             saved = self._save_diagnostic_frames(
                 NO_PLATE_DIR,
                 metadata["session_id"],
                 frames,
-                {"reason": "no_plate", **metadata},
+                {**metadata, "reason": classification},
                 log_fn,
             )
             if saved is False:
                 return False
-            log_fn("EVENT", f"DEFERRED END id={metadata['session_id']} plate=none published=False")
+            log_fn(
+                "EVENT",
+                f"WEIGHT-BACKED LPR NO RESULT id={metadata['session_id']} "
+                f"class={classification} weight={metadata['stable_weight']:g}kg "
+                f"selected={lpr_diagnostics.get('selected_frames', 0)} "
+                f"processed={lpr_diagnostics.get('processed_frames', 0)} "
+                f"regions={lpr_diagnostics.get('detected_regions', 0)}",
+            )
             markSessionFinalized(session_id, "no_plate", {
                 "event": "session_no_plate", "id": session_id,
+                "classification": classification,
                 "stable_weight_kg": metadata["stable_weight"], **metadata,
             })
             log_metric(
@@ -1295,6 +1331,13 @@ class SessionManager:
                 weight_observed_at=metadata.get("weight_observed_at"),
                 recovered_after_restart=bool(metadata.get("recovered_after_restart")),
                 incomplete=bool(metadata.get("incomplete")), errors=metadata.get("errors", []),
+                classification=classification, lpr_diagnostics=lpr_diagnostics,
+            )
+            log_metric(
+                log_fn, "weight_backed_lpr_no_result",
+                id=metadata["session_id"], classification=classification,
+                stable_weight_kg=metadata["stable_weight"],
+                lpr_diagnostics=lpr_diagnostics,
             )
             return True
         result = self.publish_result(
@@ -1347,6 +1390,10 @@ class SessionManager:
             frame = cv2.imread(path)
             if frame is not None:
                 frames[camera] = frame
+        rear_path = metadata.get("rear_start_path")
+        rear_frame = cv2.imread(rear_path) if rear_path else None
+        if rear_frame is not None:
+            frames["cam2"] = rear_frame
         return frames
 
     @staticmethod
@@ -1379,6 +1426,37 @@ class SessionManager:
             if frame is not None:
                 frames[camera] = frame
         return frames or self._load_start_frames(metadata)
+
+    @staticmethod
+    def _load_lpr_diagnostic_frames(metadata, classification):
+        session_dir = metadata.get("session_dir")
+        evidence = (metadata.get("lpr_diagnostics") or {}).get("evidence") or {}
+        if not session_dir:
+            return {}
+        order = (
+            classification,
+            "valid",
+            "plate_detected_ocr_low_confidence",
+            "plate_detected_ocr_invalid_format",
+            "plate_detected_ocr_blank",
+            "crop_failed",
+            "no_plate_detection",
+            "ocr_inference_error",
+            "detector_inference_error",
+            "lpr_frames_unavailable",
+        )
+        frames = {}
+        for camera, paths in evidence.items():
+            relative_path = next((paths.get(key) for key in order if paths.get(key)), None)
+            if not relative_path:
+                continue
+            path = os.path.abspath(os.path.join(session_dir, relative_path))
+            if os.path.commonpath((os.path.abspath(session_dir), path)) != os.path.abspath(session_dir):
+                continue
+            frame = cv2.imread(path)
+            if frame is not None:
+                frames[camera] = frame
+        return frames
 
     def publish_result(self, stable_weight, decimal_pos, log_fn, tracker=None, metadata=None):
         """Query PlateTracker and publish if plate is confirmed."""

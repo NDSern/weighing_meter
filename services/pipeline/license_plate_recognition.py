@@ -5,12 +5,21 @@ Returns same plate dict contract consumed by DetectCoordinator.
 """
 
 import re
+import threading
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from config import DET_CONF_THRES, DET_IOU_THRES, LPR_OCR_BEAM_WIDTH, LPR_OCR_TOPK
+from config import (
+    DET_CONF_THRES,
+    DET_IOU_THRES,
+    LPR_OCR_BEAM_WIDTH,
+    LPR_OCR_MIN_CONFIDENCE,
+    LPR_OCR_TOPK,
+)
+from services.pipeline.detector_obb_decode import decode_detector_outputs
+from services.runtime.lpr_bundle import verify_lpr_bundle
 
 
 CLASS_NAMES = ["BSD", "BSV"]
@@ -29,6 +38,7 @@ _MIN_TRACK_CROP_W = 30
 _MIN_TRACK_CROP_H = 15
 _DIGIT_FIX = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8", "G": "6", "T": "7"})
 _LETTER_FIX = str.maketrans({"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G"})
+_INPUT_BUFFERS = threading.local()
 
 
 def load_lpr_charset(dict_path):
@@ -36,6 +46,12 @@ def load_lpr_charset(dict_path):
     if not chars:
         raise ValueError(f"Empty OCR charset: {dict_path}")
     return ["[blank]"] + chars + [" "]
+
+
+def validate_lpr_charset(charset):
+    expected = ["[blank]", *list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"), " "]
+    if charset != expected:
+        raise ValueError("Fine-tuned OCR charset must be blank, 0-9, A-Z, then space")
 
 
 def clean_plate(s):
@@ -126,11 +142,24 @@ def _preprocess_ocr(img_bgr):
     new_w = max(1, min(REC_WIDTH, int(round(w * REC_HEIGHT / max(h, 1)))))
     bucket_w = next((bw for bw in REC_WIDTH_BUCKETS if bw >= new_w), REC_WIDTH)
     resized = cv2.resize(img_bgr, (new_w, REC_HEIGHT), interpolation=cv2.INTER_CUBIC)
-    canvas = np.zeros((REC_HEIGHT, bucket_w, 3), dtype=np.uint8)
-    canvas[:, :new_w] = resized
-    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    rgb = (rgb - _NORM_MEAN) / _NORM_STD
-    return np.ascontiguousarray(rgb[None, ...], dtype=np.float32), (new_w / bucket_w)
+    blob = _input_buffer((1, REC_HEIGHT, bucket_w, 3))
+    blob.fill((0.0 - _NORM_MEAN) / _NORM_STD)
+    target = blob[0, :, :new_w]
+    np.multiply(resized[..., ::-1], 1.0 / (255.0 * _NORM_STD), out=target)
+    target -= _NORM_MEAN / _NORM_STD
+    return blob, (new_w / bucket_w)
+
+
+def _input_buffer(shape):
+    buffers = getattr(_INPUT_BUFFERS, "values", None)
+    if buffers is None:
+        buffers = {}
+        _INPUT_BUFFERS.values = buffers
+    buffer = buffers.get(shape)
+    if buffer is None:
+        buffer = np.empty(shape, dtype=np.float32)
+        buffers[shape] = buffer
+    return buffer
 
 
 def _logsumexp(a, b):
@@ -142,15 +171,18 @@ def _logsumexp(a, b):
     return m + np.log(np.exp(a - m) + np.exp(b - m))
 
 
-def _to_probs(logits):
-    if np.min(logits) >= 0:
-        sums = np.sum(logits, axis=-1)
-        if np.all(sums > 0) and np.mean(np.abs(sums - 1.0)) < 1e-2:
-            return logits.astype(np.float64)
-    x = logits.astype(np.float64)
-    x = x - np.max(x, axis=-1, keepdims=True)
-    exp = np.exp(x)
-    return exp / np.sum(exp, axis=-1, keepdims=True)
+def _to_probs(values):
+    x = np.asarray(values, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] != 38:
+        raise ValueError(f"Expected OCR output [T,38], got {x.shape}")
+    if not np.isfinite(x).all():
+        raise ValueError("OCR output contains non-finite values")
+    if np.min(x) < 0 or np.max(x) > 1.0001:
+        raise ValueError("OCR restricted probabilities must be within [0,1]")
+    totals = np.sum(x, axis=-1, keepdims=True)
+    if np.any(totals <= 0) or np.any(totals > 1.01):
+        raise ValueError("OCR restricted probability rows have invalid mass")
+    return x / totals
 
 
 def _ctc_greedy_decode(logits, charset, blank_idx=0):
@@ -209,19 +241,31 @@ def _ctc_decode_topk(logits, charset, topk=None, beam_width=None, blank_idx=0):
     return ranked[:topk]
 
 
-def _run_ocr(ocr, img_bgr, charset, topk=None):
+def _run_ocr_logits(ocr, img_bgr, charset):
     if ocr is None:
         raise ValueError("ocr model is required")
     if not charset:
         raise ValueError("charset is required")
     blob, valid_ratio = _preprocess_ocr(img_bgr)
-    logits = ocr.inference(inputs=[blob], data_format=["nhwc"])[0][0]
+    outputs = ocr.inference(inputs=[blob], data_format=["nhwc"])
+    if len(outputs) != 1:
+        raise RuntimeError(f"Expected one OCR output, got {len(outputs)}")
+    logits = np.asarray(outputs[0])
+    if logits.ndim != 3 or logits.shape[0] != 1:
+        raise RuntimeError(f"Unexpected OCR output shape: {logits.shape}")
+    logits = logits[0]
     if logits.ndim != 2:
         raise RuntimeError(f"Unexpected OCR output shape: {logits.shape}")
-    if logits.shape[-1] != len(charset) and logits.shape[0] == len(charset):
-        logits = logits.transpose(1, 0)
+    if logits.shape[-1] != len(charset):
+        raise RuntimeError(f"Expected OCR class dimension {len(charset)}, got {logits.shape}")
+    if not np.isfinite(logits).all():
+        raise RuntimeError("OCR output contains non-finite values")
     valid_t = max(1, min(logits.shape[0], int(round(logits.shape[0] * valid_ratio))))
-    logits = logits[:valid_t]
+    return logits[:valid_t]
+
+
+def _run_ocr(ocr, img_bgr, charset, topk=None):
+    logits = _run_ocr_logits(ocr, img_bgr, charset)
     if topk is None:
         return _ctc_greedy_decode(logits, charset)
     return _ctc_decode_topk(logits, charset, topk=topk)
@@ -277,28 +321,51 @@ def select_plate_candidate_combined(candidates):
 
 
 def recognize_combined(ocr, charset, img_bgr, two_row=False):
-    old_raw, old_conf = recognize_old(ocr, charset, img_bgr, two_row=two_row)
-    top5 = recognize_topk(ocr, charset, img_bgr, two_row=two_row)
+    topk = LPR_OCR_TOPK
+    img_bgr = _prepare_crop_for_ocr(img_bgr)
+    crops = _split_two_row_crop(img_bgr) if two_row else (img_bgr,)
+    decoded = []
+    for crop in crops:
+        logits = _run_ocr_logits(ocr, crop, charset)
+        decoded.append((
+            _ctc_greedy_decode(logits, charset),
+            _ctc_decode_topk(logits, charset, topk=topk),
+        ))
+
+    if two_row:
+        (top_old, top_rows), (bottom_old, bottom_rows) = decoded
+        top_text, top_conf = top_old
+        bottom_text, bottom_conf = bottom_old
+        old_raw = f"{top_text}-{bottom_text}" if top_text and bottom_text else (top_text or bottom_text)
+        old_conf = (top_conf + bottom_conf) / 2 if (top_conf and bottom_conf) else max(top_conf, bottom_conf)
+        merged = []
+        for top_text, top_conf in top_rows:
+            for bottom_text, bottom_conf in bottom_rows:
+                text = f"{top_text}-{bottom_text}" if top_text and bottom_text else (top_text or bottom_text)
+                conf = (top_conf + bottom_conf) / 2 if (top_conf and bottom_conf) else max(top_conf, bottom_conf)
+                merged.append((text, conf))
+        dedup = {}
+        for text, candidate_conf in sorted(merged, key=lambda item: item[1], reverse=True):
+            dedup.setdefault(text, candidate_conf)
+        top5 = list(dedup.items())[:topk]
+    else:
+        (old_raw, old_conf), top5 = decoded[0]
     raw, conf = select_plate_candidate_combined([(old_raw, old_conf), *top5])
     plate = format_plate_display(raw)
     return plate, conf, raw, top5
 
 
-def _letterbox(img, size):
+def _preprocess_detector(img, size):
     h, w = img.shape[:2]
     scale = min(size / h, size / w)
     new_w, new_h = int(round(w * scale)), int(round(h * scale))
     resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    blob = _input_buffer((1, size, size, 3))
+    blob.fill(114.0 / 255.0)
     dx, dy = (size - new_w) // 2, (size - new_h) // 2
-    canvas[dy:dy + new_h, dx:dx + new_w] = resized
-    return canvas, scale, dx, dy
-
-
-def _preprocess_detector(img_bgr, size):
-    padded, scale, dx, dy = _letterbox(img_bgr, size)
-    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    return np.ascontiguousarray(rgb[None, ...]), scale, dx, dy
+    target = blob[0, dy:dy + new_h, dx:dx + new_w]
+    np.multiply(resized[..., ::-1], 1.0 / 255.0, out=target)
+    return blob, scale, dx, dy
 
 
 def _decode_obb(output, num_classes, conf_thres):
@@ -383,7 +450,9 @@ def detect_obb_plates(frame, detector, imgsz=960, conf_thres=None, iou_thres=Non
     iou = DET_IOU_THRES if iou_thres is None else iou_thres
     blob, scale, dx, dy = _preprocess_detector(frame, imgsz)
     outputs = detector.inference(inputs=[blob], data_format=["nhwc"])
-    raw = outputs[0]
+    raw = decode_detector_outputs(outputs)
+    if not np.isfinite(raw).all():
+        raise ValueError("Detector output contains non-finite values")
     num_classes = int(raw.shape[1]) - 5
     xywhr, scores, classes = _decode_obb(raw, num_classes, conf)
     keep = _rotated_nms(xywhr, scores, iou)
@@ -422,7 +491,9 @@ def detect_plate_regions(frame, detector=None, imgsz=960, conf_thres=None, iou_t
             h, w = crop_img.shape[:2]
             if w < _MIN_TRACK_CROP_W or h < _MIN_TRACK_CROP_H:
                 del crop_img
-                continue
+                crop_img = None
+                ocr_status = "crop_too_small"
+                two_row = False
             else:
                 plate_class = CLASS_NAMES[int(classes[idx])] if int(classes[idx]) < len(CLASS_NAMES) else ""
                 two_row = plate_class == "BSV" and w / max(h, 1) < 2.2
@@ -452,9 +523,13 @@ def recognize_plate_regions(regions, ocr=None, charset=None):
         crop_img = region.get("crop_img")
         two_row = bool(region.get("two_row"))
         valid_candidates = []
+        low_confidence_candidates = []
+        ocr_conf = 0.0
+        raw_text = ""
         if crop_img is None:
             plate_text, candidates = "unknown", []
             ocr_status = region.get("ocr_status") or "crop_failed"
+            ocr_outcome = ocr_status
         else:
             plate_text, ocr_conf, raw_text, top5 = recognize_combined(ocr, charset, crop_img, two_row=two_row)
             candidates = [raw_text] + [text for text, _ in top5]
@@ -463,7 +538,28 @@ def recognize_plate_regions(regions, ocr=None, charset=None):
                     display = format_plate_display(normalized)
                     if is_valid_plate_text(display) and display not in [p for p, _ in valid_candidates]:
                         valid_candidates.append((display, conf))
-            if not is_valid_plate_text(plate_text):
+            if LPR_OCR_MIN_CONFIDENCE is not None:
+                low_confidence_candidates = [
+                    candidate for candidate in valid_candidates
+                    if candidate[1] < LPR_OCR_MIN_CONFIDENCE
+                ]
+                valid_candidates = [
+                    candidate for candidate in valid_candidates
+                    if candidate[1] >= LPR_OCR_MIN_CONFIDENCE
+                ]
+            if valid_candidates:
+                ocr_outcome = "valid"
+                plate_text, ocr_conf = max(valid_candidates, key=lambda candidate: candidate[1])
+            elif low_confidence_candidates:
+                ocr_outcome = "low_confidence"
+                plate_text = "unknown"
+            elif not clean_plate(raw_text):
+                ocr_outcome = "blank"
+            else:
+                ocr_outcome = "invalid_format"
+            if ocr_outcome == "low_confidence":
+                ocr_status = f"low_confidence:{ocr_conf:.3f}{':two_row' if two_row else ''}"
+            elif not is_valid_plate_text(plate_text):
                 plate_text = "unknown"
                 ocr_status = f"invalid_plate:{ocr_conf:.3f}{':two_row' if two_row else ''}"
             else:
@@ -481,11 +577,41 @@ def recognize_plate_regions(regions, ocr=None, charset=None):
             "class": region["class"],
             "crop_size": region["crop_size"],
             "ocr_status": ocr_status,
+            "ocr_outcome": ocr_outcome,
+            "ocr_confidence": float(ocr_conf),
+            "raw_text": raw_text,
             "votes": len(candidates),
             "candidates": candidates,
             "valid_candidates": valid_candidates,
+            "low_confidence_candidates": low_confidence_candidates,
         })
     return plates
+
+
+def validate_lpr_runtime(detectors, recognizers, charset, model_paths=None, log_fn=None):
+    validate_lpr_charset(charset)
+    detector_input = np.zeros((1, 960, 960, 3), dtype=np.float32)
+    for name, detector in detectors:
+        outputs = detector.inference(inputs=[detector_input], data_format=["nhwc"])
+        if not all(np.isfinite(np.asarray(output)).all() for output in outputs):
+            raise ValueError(f"{name} detector output contains non-finite values")
+        decoded = decode_detector_outputs(outputs)
+        if decoded.shape != (1, 7, 18900) or not np.isfinite(decoded).all():
+            raise ValueError(f"{name} decoded detector shape is {decoded.shape}")
+    for name, recognizer in recognizers:
+        for width in REC_WIDTH_BUCKETS:
+            blob = np.full((1, REC_HEIGHT, width, 3), -1.0, dtype=np.float32)
+            outputs = recognizer.inference(inputs=[blob], data_format=["nhwc"])
+            if len(outputs) != 1:
+                raise ValueError(f"{name} expected one OCR output, got {len(outputs)}")
+            output = np.asarray(outputs[0])
+            if output.ndim != 3 or output.shape[0] != 1 or output.shape[2] != len(charset):
+                raise ValueError(f"{name} unexpected OCR output shape at width {width}: {output.shape}")
+            _to_probs(output[0])
+    hashes = verify_lpr_bundle(model_paths) if model_paths else {}
+    if log_fn:
+        log_fn("INFO", f"Fine-tuned LPR runtime contract passed hashes={hashes}")
+    return hashes
 
 
 def detect_license_plates(frame, detector=None, ocr=None, imgsz=960, conf_thres=None, iou_thres=None, pad_ratio=0.0, charset=None):

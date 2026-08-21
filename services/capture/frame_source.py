@@ -7,6 +7,7 @@ import re
 import cv2
 
 from config import DETECT_FPS, FRAME_GRAB_DRAIN_MAX, FRAME_GRAB_DRAIN_SECONDS, RECONNECT_DELAY
+from services.runtime.inference_lock import PriorityInferenceLock
 
 _log_fn = None
 
@@ -30,12 +31,22 @@ def mask_url_secret(url: str):
 class _LatestFrameSource:
     """Continuously grabs frames from an RTSP stream and keeps only the latest."""
 
-    def __init__(self, url: str, start_log: str, open_fail_log: str, connect_log: str, grab_fail_log: str):
+    def __init__(
+        self, url: str, start_log: str, open_fail_log: str, connect_log: str,
+        grab_fail_log: str, source_name: str, expected_resolution=None,
+    ):
         self._url = url
         self._start_log = start_log
         self._open_fail_log = open_fail_log
         self._connect_log = connect_log
         self._grab_fail_log = grab_fail_log
+        self._source_name = source_name
+        self._expected_resolution = (
+            tuple(int(value) for value in expected_resolution)
+            if expected_resolution is not None else None
+        )
+        if self._expected_resolution is not None and len(self._expected_resolution) != 2:
+            raise ValueError("expected_resolution must contain width and height")
         self._running = False
         self._latest_frame = None
         self._latest_frame_id = 0
@@ -45,6 +56,8 @@ class _LatestFrameSource:
         self._thread = None
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            return
         self._running = True
         self._thread = threading.Thread(target=self._grab_loop, daemon=True)
         self._thread.start()
@@ -82,10 +95,15 @@ class _LatestFrameSource:
                 return None, None
             return (frame.copy() if copy_frame else frame), self._latest_frame_id
 
+    def _clear_latest_frame(self):
+        with self._frame_lock:
+            self._latest_frame = None
+
     def _grab_loop(self):
         interval = 1.0 / DETECT_FPS
         cam_frame_time = 1.0 / 25
         while self._running:
+            self._clear_latest_frame()
             cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
             with self._capture_lock:
                 self._capture = cap
@@ -102,6 +120,7 @@ class _LatestFrameSource:
 
             log("INFO", self._connect_log)
             last_retrieve = 0.0
+            decoded_resolution = None
             while self._running:
                 t_grab = time.time()
                 ret = cap.grab()
@@ -117,10 +136,17 @@ class _LatestFrameSource:
                             break
                         drain_count += 1
                     ret2, frame = cap.retrieve()
-                    if ret2:
-                        with self._frame_lock:
-                            self._latest_frame = frame
-                            self._latest_frame_id += 1
+                    if not ret2:
+                        log("WARNING", self._grab_fail_log)
+                        break
+                    decoded_resolution, accepted = self._check_resolution(
+                        frame, decoded_resolution
+                    )
+                    if not accepted:
+                        break
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                        self._latest_frame_id += 1
                     last_retrieve = now
                 grab_took = time.time() - t_grab
                 time.sleep(max(0.0, cam_frame_time - grab_took))
@@ -128,8 +154,33 @@ class _LatestFrameSource:
             with self._capture_lock:
                 if self._capture is cap:
                     self._capture = None
+            self._clear_latest_frame()
             if self._running:
                 time.sleep(RECONNECT_DELAY)
+
+    def _check_resolution(self, frame, previous):
+        resolution = (int(frame.shape[1]), int(frame.shape[0]))
+        if previous is None:
+            log(
+                "INFO",
+                f"[{self._source_name}] RTSP decoded source="
+                f"{resolution[0]}x{resolution[1]}",
+            )
+        elif resolution != previous:
+            log(
+                "WARNING",
+                f"[{self._source_name}] RTSP resolution changed "
+                f"{previous[0]}x{previous[1]} -> {resolution[0]}x{resolution[1]}",
+            )
+        if self._expected_resolution is not None and resolution != self._expected_resolution:
+            log(
+                "WARNING",
+                f"[{self._source_name}] RTSP resolution rejected "
+                f"actual={resolution[0]}x{resolution[1]} "
+                f"expected={self._expected_resolution[0]}x{self._expected_resolution[1]}",
+            )
+            return resolution, False
+        return resolution, True
 
 
 class FrameGrabber(_LatestFrameSource):
@@ -142,22 +193,28 @@ class FrameGrabber(_LatestFrameSource):
             open_fail_log=f"FrameGrabber: cannot open {mask_url_secret(url)}.",
             connect_log=f"FrameGrabber: stream connected ({mask_url_secret(url)})",
             grab_fail_log="FrameGrabber: frame grab failed — reconnecting...",
+            source_name="rear",
         )
 
 
 class CameraGrabber(_LatestFrameSource):
     """Latest-frame RTSP source for LPR cameras. Detection is handled externally."""
 
-    def __init__(self, url: str, name: str = "cam1", detector=None, ocr=None, lpr_crop: str = "full"):
+    def __init__(
+        self, url: str, name: str = "cam1", detector=None, ocr=None,
+        lpr_crop: str = "full", expected_resolution=None,
+    ):
         self.name = name
         self.detector = detector
         self.ocr = ocr
         self.lpr_crop = lpr_crop
-        self.inference_lock = threading.Lock()
+        self.inference_lock = PriorityInferenceLock()
         super().__init__(
             url=url,
             start_log=f"CameraGrabber [{name}] started. RTSP: {mask_url_secret(url)}",
             open_fail_log=f"[{name}] Cannot open RTSP stream.",
             connect_log=f"[{name}] RTSP stream connected.",
             grab_fail_log=f"[{name}] Frame grab failed — reconnecting...",
+            source_name=name,
+            expected_resolution=expected_resolution,
         )

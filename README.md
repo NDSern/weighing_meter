@@ -86,6 +86,31 @@ python3 tests/mqtt_probe.py
 python3 tests/mqtt_probe.py --publish
 ```
 
+## LPR Benchmark
+
+Compare explicit RKNN variants on device without changing production model paths:
+
+```bash
+python3 benchmark_lpr.py storage/lpr-samples \
+  --variant fine-tuned models/lpr/license_plate_detector.rknn models/lpr/license_plate_recognizer.rknn models/lpr/charset.txt 960 \
+  --manifest storage/lpr-samples/manifest.json
+```
+
+Each repeated `--variant` takes its own detector, recognizer, charset, and image size. Output includes artifact hashes, source dimensions, detector/OCR timing, optional exact-match labels, and per-image plate results. Variants load sequentially on the selected NPU core; use `--core 1` or `--core 2` when needed.
+
+## Fine-Tuned LPR Deployment
+
+The tracked LPR bundle targets RK3588 with RKNNLite 2.3.2. Startup verifies model and decoder hashes, the three-output detector contract, the 38-class OCR contract, finite tensors, and all dynamic OCR widths before MQTT or camera workers start.
+
+Camera 1 can enforce the decoded main-stream resolution through host-local configuration:
+
+```python
+RTSP_URL = "rtsp://user:pass@192.168.1.181:554/<verified-main-route>"
+CAM1_EXPECTED_RESOLUTION = (2880, 1624)
+```
+
+Leave `CAM1_EXPECTED_RESOLUTION = None` until the camera route, exact decoded dimensions, and isolated 2K acceptance checks are complete. See `LPR_2K_DEPLOYMENT.md` for deployment, health checks, and rollback.
+
 ## Runtime Data
 
 Runtime data is intentionally untracked:

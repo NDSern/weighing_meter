@@ -36,6 +36,78 @@ class PlateTrackTests(unittest.TestCase):
         self.assertTrue(track.expire(now=13.1, stale_seconds=3.0))
         self.assertFalse(track.valid)
 
+    def test_live_ocr_runs_on_confirmation_then_periodically(self):
+        track = CameraPlateTrack("cam1")
+        region = [{"bbox": [0, 0, 10, 10], "det_conf": 0.9}]
+
+        track.observe(region, observed_at=10.0)
+        self.assertFalse(track.claim_live_ocr(now=10.0, interval=0.5))
+        track.observe(region, observed_at=10.1)
+        self.assertTrue(track.claim_live_ocr(now=10.1, interval=0.5))
+        track.observe(region, observed_at=10.4)
+        self.assertFalse(track.claim_live_ocr(now=10.4, interval=0.5))
+        track.observe(region, observed_at=10.6)
+        self.assertTrue(track.claim_live_ocr(now=10.6, interval=0.5))
+
+    def test_new_track_gets_ocr_after_confirmation(self):
+        track = CameraPlateTrack("cam1")
+        first = [{"bbox": [0, 0, 10, 10], "det_conf": 0.9}]
+        second = [{"bbox": [30, 0, 40, 10], "det_conf": 0.9}]
+        track.observe(first, observed_at=10.0)
+        track.observe(first, observed_at=10.1)
+        self.assertTrue(track.claim_live_ocr(now=10.1, interval=10.0))
+
+        track.observe(second, observed_at=10.2)
+        self.assertFalse(track.claim_live_ocr(now=10.2, interval=10.0))
+        track.observe(second, observed_at=10.3)
+        self.assertTrue(track.claim_live_ocr(now=10.3, interval=10.0))
+
+    def test_track_follows_iou_match_when_other_region_has_higher_confidence(self):
+        track = CameraPlateTrack("cam1")
+        tracked = {"bbox": [0, 0, 10, 10], "det_conf": 0.8}
+        other = {"bbox": [30, 0, 40, 10], "det_conf": 0.99}
+
+        track.observe([tracked])
+        selected = track.observe([tracked, other])
+
+        self.assertIs(selected, tracked)
+        self.assertTrue(track.valid)
+        self.assertEqual(track.bbox, tracked["bbox"])
+
+    def test_track_metadata_keeps_obb_for_deferred_crop(self):
+        track = CameraPlateTrack("cam1", confirm_hits=1)
+        obb = [[1, 2], [10, 2], [10, 8], [1, 8]]
+
+        track.observe([{
+            "bbox": [1, 2, 10, 8], "obb": obb, "det_conf": 0.9,
+            "class": "BSV", "two_row": True,
+        }], frame_id=7)
+
+        self.assertEqual(track.metadata()[0]["obb"], obb)
+        self.assertEqual(track.metadata()[0]["class"], "BSV")
+        self.assertTrue(track.metadata()[0]["two_row"])
+
+    def test_detection_submits_only_confirmed_best_region_to_ocr(self):
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        camera.lpr_crop = "full"
+        camera.inference_lock = unittest.mock.MagicMock()
+        best = {"bbox": [0, 0, 10, 10], "det_conf": 0.9}
+        extra = {"bbox": [30, 0, 40, 10], "det_conf": 0.5}
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator._enabled = True
+        coordinator._detect_regions_fn = Mock(return_value=[best, extra])
+        coordinator._recognize_regions_fn = Mock()
+        coordinator._submit_ocr_job = Mock()
+        frame = Mock()
+        frame.shape = (100, 100, 3)
+
+        coordinator._run_detection(camera, frame, frame_id=1)
+        coordinator._run_detection(camera, frame, frame_id=2)
+
+        coordinator._submit_ocr_job.assert_called_once()
+        self.assertEqual(coordinator._submit_ocr_job.call_args.args[2], [best])
+
     def test_detect_loop_does_not_resubmit_same_frame_generation(self):
         camera = Mock(name="camera")
         camera.name = "cam1"
@@ -59,6 +131,7 @@ class PlateTrackTests(unittest.TestCase):
             coordinator._detect_loop()
 
         self.assertEqual(coordinator._detect_events["cam1"].set.call_count, 1)
+        camera.peek_latest_frame_with_id.assert_called_with(copy_frame=False)
 
 
 class SessionStrategyTests(unittest.TestCase):

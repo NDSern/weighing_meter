@@ -3,7 +3,7 @@
 import threading
 import time
 
-from config import DETECT_FPS, PLATE_TRACK_STALE_SECONDS, YOLO26_DETECT_FPS
+from config import DETECT_FPS, LPR_LIVE_OCR_INTERVAL_SECONDS, PLATE_TRACK_STALE_SECONDS, YOLO26_DETECT_FPS
 
 
 def bbox_iou(left, right):
@@ -24,21 +24,35 @@ class CameraPlateTrack:
         self.track_id = 0
         self.bbox = None
         self.confidence = 0.0
+        self.obb = None
+        self.plate_class = None
+        self.two_row = False
         self.hits = 0
         self.valid = False
         self.frame_id = None
         self.last_observed_at = None
+        self._last_ocr_track_id = None
+        self._last_ocr_at = None
 
     def observe(self, regions, frame_id=None, observed_at=None):
         self.last_observed_at = time.monotonic() if observed_at is None else observed_at
-        best = max(regions, key=lambda item: item.get("det_conf", item.get("confidence", 0.0)), default=None)
+        best = None
+        if self.bbox is not None:
+            best = max(regions, key=lambda item: bbox_iou(self.bbox, item["bbox"]), default=None)
+            if best is not None and bbox_iou(self.bbox, best["bbox"]) < self.iou_threshold:
+                best = None
+        if best is None:
+            best = max(regions, key=lambda item: item.get("det_conf", item.get("confidence", 0.0)), default=None)
         if best is None:
             self.bbox = None
             self.confidence = 0.0
+            self.obb = None
+            self.plate_class = None
+            self.two_row = False
             self.hits = 0
             self.valid = False
             self.frame_id = frame_id
-            return
+            return None
         bbox = list(best["bbox"])
         if self.bbox is None or bbox_iou(self.bbox, bbox) < self.iou_threshold:
             self.track_id += 1
@@ -47,8 +61,12 @@ class CameraPlateTrack:
             self.hits += 1
         self.bbox = bbox
         self.confidence = float(best.get("det_conf", best.get("confidence", 0.0)))
+        self.obb = best.get("obb")
+        self.plate_class = best.get("class")
+        self.two_row = bool(best.get("two_row"))
         self.valid = self.hits >= self.confirm_hits
         self.frame_id = frame_id
+        return best
 
     def expire(self, now=None, stale_seconds=PLATE_TRACK_STALE_SECONDS):
         if not self.valid or self.last_observed_at is None:
@@ -58,16 +76,35 @@ class CameraPlateTrack:
             return False
         self.bbox = None
         self.confidence = 0.0
+        self.obb = None
+        self.plate_class = None
+        self.two_row = False
         self.hits = 0
         self.valid = False
         self.frame_id = None
         return True
 
+    def claim_live_ocr(self, now=None, interval=LPR_LIVE_OCR_INTERVAL_SECONDS):
+        if not self.valid:
+            return False
+        now = time.monotonic() if now is None else now
+        if (
+            self._last_ocr_track_id == self.track_id
+            and self._last_ocr_at is not None
+            and now - self._last_ocr_at < interval
+        ):
+            return False
+        self._last_ocr_track_id = self.track_id
+        self._last_ocr_at = now
+        return True
+
     def metadata(self):
         if not self.valid:
             return []
-        return [{"bbox": list(self.bbox), "track_id": self.track_id,
-                 "confidence": self.confidence, "frame_id": self.frame_id}]
+        return [{"bbox": list(self.bbox), "obb": self.obb,
+                 "class": self.plate_class, "two_row": self.two_row,
+                 "track_id": self.track_id, "confidence": self.confidence,
+                 "frame_id": self.frame_id}]
 
 
 def crop_lpr_frame(frame, mode):
@@ -347,7 +384,9 @@ class DetectCoordinator:
                 regions = self._detect_regions_fn(lpr_frame, detector=cam.detector)
             regions = remap_lpr_regions(regions, dx, dy)
             with self._track_lock:
-                self._tracks[cam.name].observe(regions, frame_id)
+                track = self._tracks[cam.name]
+                ocr_region = track.observe(regions, frame_id)
+                submit_ocr = track.claim_live_ocr()
                 valid = {name: track.valid for name, track in self._tracks.items()}
                 self._presence_revision += 1
                 revision = self._presence_revision
@@ -357,7 +396,8 @@ class DetectCoordinator:
             log("TIMING", f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
                            f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
                            f"input={lpr_frame.shape[1]}x{lpr_frame.shape[0]}")
-            self._submit_ocr_job(cam, full_frame, regions, t0)
+            if submit_ocr and ocr_region is not None:
+                self._submit_ocr_job(cam, full_frame, [ocr_region], t0)
             return
         plates = self._detect_plates_fn(full_frame, detector=cam.detector, ocr=cam.ocr)
         elapsed_ms = (time.time() - t0) * 1000
@@ -390,8 +430,8 @@ class DetectCoordinator:
             frames = []
             for cam in self._cameras:
                 peek = getattr(cam, "peek_latest_frame_with_id", None)
-                frame, frame_id = peek(copy_frame=True) if peek else (
-                    cam.peek_latest_frame(copy_frame=True), None
+                frame, frame_id = peek(copy_frame=False) if peek else (
+                    cam.peek_latest_frame(copy_frame=False), None
                 )
                 frames.append((cam, frame, frame_id))
             if not any(frame is not None for _cam, frame, _frame_id in frames):

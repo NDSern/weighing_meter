@@ -44,6 +44,7 @@ sys.path.insert(0, LPR_DIR)
 from config import (
     BAUD_RATE,
     CAM1_LPR_CROP,
+    CAM1_EXPECTED_RESOLUTION,
     CAM2_RESULT_CROP,
     CAM3_LPR_CROP,
     CAPTURE_DIR,
@@ -75,6 +76,15 @@ from config import (
     UNDETECTABLE_DIR,
     WEIGHT_THRESHOLD,
 )
+from services.runtime.lpr_bundle import verify_lpr_bundle
+
+_LPR_BUNDLE_PATHS = {
+    "detector": LPR_DETECTOR_MODEL,
+    "recognizer": LPR_RECOGNIZER_MODEL,
+    "charset": LPR_CHARSET,
+    "decoder": os.path.join(SERVICE_DIR, "services", "pipeline", "detector_obb_decode.py"),
+}
+verify_lpr_bundle(_LPR_BUNDLE_PATHS)
 
 from services.runtime.async_logging import AsyncLogger
 
@@ -91,7 +101,13 @@ def mask_url_secret(url: str):
 from d2008_scale_reader import D2008Reader
 from mqtt_service import MqttService
 
-from services.pipeline.license_plate_recognition import detect_plate_regions, load_lpr_charset, recognize_plate_regions
+from services.pipeline.license_plate_recognition import (
+    detect_plate_regions,
+    load_lpr_charset,
+    recognize_plate_regions,
+    validate_lpr_runtime,
+)
+from services.pipeline import detector_obb_decode
 
 from services.tracking import PlateTracker
 from services.capture import FrameGrabber, CameraGrabber, DetectCoordinator
@@ -149,12 +165,22 @@ def main():
         lpr_charset = load_lpr_charset(LPR_CHARSET)
         from rknnlite.api import RKNNLite as RKNN
 
+        bundle_hashes = verify_lpr_bundle(_LPR_BUNDLE_PATHS)
+        log("INFO", f"Fine-tuned LPR bundle hashes passed hashes={bundle_hashes}")
         models = RknnModelSet.open(
             LPR_DETECTOR_MODEL,
             LPR_RECOGNIZER_MODEL,
             None,
             False,
             RKNN,
+            log_fn=log,
+        )
+        handles = models.handles
+        validate_lpr_runtime(
+            [("cam1", handles.cam1_detector), ("cam3", handles.cam3_detector)],
+            [("cam1", handles.cam1_ocr), ("cam3", handles.cam3_ocr)],
+            lpr_charset,
+            model_paths=_LPR_BUNDLE_PATHS,
             log_fn=log,
         )
 
@@ -166,8 +192,10 @@ def main():
         else:
             log("INFO", "MQTT disabled (MQTT_ENABLED=False)")
 
-        handles = models.handles
-        cam1 = CameraGrabber(RTSP_URL, "cam1", handles.cam1_detector, handles.cam1_ocr, CAM1_LPR_CROP)
+        cam1 = CameraGrabber(
+            RTSP_URL, "cam1", handles.cam1_detector, handles.cam1_ocr,
+            CAM1_LPR_CROP, expected_resolution=CAM1_EXPECTED_RESOLUTION,
+        )
         cam1.start()
         cam3 = CameraGrabber(RTSP_URL_3, "cam3", handles.cam3_detector, handles.cam3_ocr, CAM3_LPR_CROP)
         cam3.start()

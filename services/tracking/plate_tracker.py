@@ -116,6 +116,48 @@ class PlateTracker:
                 counts[plate] = counts.get(plate, 0) + 1
         return counts
 
+    def get_confirmation_diagnostics(self):
+        from config import MIN_PLATE_OBSERVATION_SPAN_SECONDS, MIN_SELECTED_PLATE_HITS, PLATE_CONFIRM_THRESHOLD
+
+        with self._lock:
+            observations = list(self._observations)
+        counts = {}
+        scores = {}
+        selected = {}
+        first_seen = {}
+        last_seen = {}
+        for plate, weight, source, timestamp in observations:
+            counts[plate] = counts.get(plate, 0) + 1
+            scores[plate] = scores.get(plate, 0.0) + weight
+            if source == "selected":
+                selected[plate] = selected.get(plate, 0) + 1
+            first_seen[plate] = min(first_seen.get(plate, timestamp), timestamp)
+            last_seen[plate] = max(last_seen.get(plate, timestamp), timestamp)
+        best = max(counts, key=lambda plate: (counts[plate], scores[plate])) if counts else None
+        count = counts.get(best, 0)
+        selected_count = selected.get(best, 0)
+        span = last_seen.get(best, 0.0) - first_seen.get(best, 0.0) if best else 0.0
+        if not best:
+            failure_reason = "no_valid_candidates"
+        elif count < PLATE_CONFIRM_THRESHOLD:
+            failure_reason = "insufficient_observations"
+        elif selected_count < MIN_SELECTED_PLATE_HITS:
+            failure_reason = "insufficient_selected_hits"
+        elif span < MIN_PLATE_OBSERVATION_SPAN_SECONDS:
+            failure_reason = "insufficient_observation_span"
+        else:
+            failure_reason = None
+        return {
+            "best_candidate": best,
+            "observation_count": count,
+            "selected_hit_count": selected_count,
+            "observation_span_seconds": span,
+            "required_observations": PLATE_CONFIRM_THRESHOLD,
+            "required_selected_hits": MIN_SELECTED_PLATE_HITS,
+            "required_span_seconds": MIN_PLATE_OBSERVATION_SPAN_SECONDS,
+            "failure_reason": failure_reason,
+        }
+
     def save_undetectable(self, frame):
         """Store the first 'unknown' frame per session. Only saves once until clear().
         Caller must check needs_undetectable() first to avoid unnecessary frame copy."""
