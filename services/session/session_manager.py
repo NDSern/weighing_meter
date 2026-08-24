@@ -1530,6 +1530,7 @@ class SessionManager:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         start = metadata.get("started_at")
         end = metadata.get("ended_at")
+        event_timestamp = end or datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         if start:
             start = datetime.fromisoformat(start).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         if end:
@@ -1537,6 +1538,7 @@ class SessionManager:
         return {
             "start": start or timestamp,
             "end": end or timestamp,
+            "timestamp": event_timestamp,
             "duration_s": metadata.get("duration_s", 0),
             "stable_weight": stable_weight,
             "official_plate": plate or "none",

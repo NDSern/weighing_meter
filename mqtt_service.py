@@ -37,6 +37,62 @@ def _log(level: str, msg: str):
     print(f"{ts} [MQTT/{level:<7}] {msg}", flush=True)
 
 
+def _normalize_event_timestamp(value) -> str:
+    if value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.astimezone()
+            return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def build_weighbridge_payload(session_result: dict,
+                              transaction_type: str = DEFAULT_TRANSACTION_TYPE) -> dict:
+    plate = session_result.get("official_plate", "none")
+    weight = session_result.get("stable_weight")
+
+    if plate == "none" or weight is None or weight <= 0:
+        raise ValueError(f"invalid weighbridge payload plate={plate}, weight={weight}")
+
+    payload = {
+        "edge_event_id": session_result.get("offline_event_id") or str(uuid.uuid4()),
+        "weighbridge_id": WEIGHBRIDGE_ID,
+        "timestamp": _normalize_event_timestamp(
+            session_result.get("timestamp") or session_result.get("end") or session_result.get("start")
+        ),
+        "vehicle_plate": plate,
+        "transaction_type": transaction_type,
+        "gross_weight_kg": round(weight, 3),
+        "ocr_plate_read": plate,
+        "photos": session_result.get("photos", []),
+    }
+
+    tare_weight = session_result.get("tare_weight_kg")
+    if tare_weight is not None:
+        if tare_weight < 0:
+            raise ValueError(f"invalid tare weight={tare_weight}")
+        payload["tare_weight_kg"] = round(tare_weight, 3)
+
+    net_weight = session_result.get("net_weight_kg")
+    if net_weight is not None:
+        payload["net_weight_kg"] = round(net_weight, 3)
+
+    return payload
+
+
+def serialize_weighbridge_payload(payload: dict) -> str:
+    """Serialize one MQTT payload as strict raw UTF-8 JSON."""
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
 class MqttService:
     """Manages MQTT connection and publishes weighbridge events."""
 
@@ -106,27 +162,23 @@ class MqttService:
         Returns:
             True if publish was queued successfully, or acknowledged when wait_for_ack=True.
         """
-        plate = session_result.get("official_plate", "none")
-        weight = session_result.get("stable_weight")
-
-        if plate == "none" or weight is None or weight <= 0:
-            self._log("WARNING", f"Skipping MQTT publish — plate={plate}, weight={weight}")
+        try:
+            payload = build_weighbridge_payload(session_result, transaction_type)
+            payload_json = serialize_weighbridge_payload(payload)
+        except (TypeError, ValueError) as exc:
+            self._log("WARNING", f"Skipping MQTT publish — {exc}")
             return False
 
-        payload = {
-            "event_id": session_result.get("offline_event_id"),
-            "weighbridge_id": WEIGHBRIDGE_ID,
-            "vehicle_plate": plate,
-            "transaction_type": transaction_type,
-            "gross_weight_kg": round(weight, 3),
-            "ocr_plate_read": plate,
-            "photos": session_result.get("photos", []),
-        }
-
-        payload_json = json.dumps(payload, ensure_ascii=False)
+        plate = payload["vehicle_plate"]
+        weight = payload["gross_weight_kg"]
 
         try:
-            info = self._client.publish(MQTT_TOPIC, payload_json, qos=MQTT_QOS)
+            info = self._client.publish(
+                MQTT_TOPIC,
+                payload_json,
+                qos=MQTT_QOS,
+                retain=False,
+            )
             if info.rc != mqtt.MQTT_ERR_SUCCESS:
                 self._log("ERROR", f"MQTT publish rejected rc={info.rc}: plate={plate}, weight={weight:.3f} kg")
                 return False

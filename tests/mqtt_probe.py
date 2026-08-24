@@ -8,31 +8,28 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
 
-from config import CAPTURE_DIR, SERVICE_DIR, WEIGHT_THRESHOLD
-
-
-# MQTT Broker Config
-MQTT_HOST = "103.75.184.185"
-MQTT_PORT = 1883
-MQTT_USERNAME = "90157317-f4b2-48d2-8d8b-d5a9e899bad2"
-MQTT_PASSWORD = "0b91a95f-7b15-4778-a700-a1994878112c"
-MQTT_QOS = 1
-MQTT_KEEPALIVE = 60
-
-# Device Config
-WEIGHBRIDGE_ID = "9aa29a10-6605-47dd-9460-970d66c3d1c3"
-MQTT_CLIENT_ID = f"smartport-weighbridge-test-{WEIGHBRIDGE_ID}"
-MQTT_TOPIC = (
-    "m/2e206e45-9c8e-4be0-a97a-b25e49cac58d/"
-    "c/d3fc99f9-76ac-4047-807d-b04759f798fc/"
-    "Hub/AIBOXCAN/weighbridge/"
-    f"{WEIGHBRIDGE_ID}/events"
+from config import (
+    CAPTURE_DIR,
+    MQTT_HOST,
+    MQTT_KEEPALIVE,
+    MQTT_PASSWORD,
+    MQTT_PORT,
+    MQTT_QOS,
+    MQTT_TOPIC,
+    MQTT_USERNAME,
+    SERVICE_DIR,
+    WEIGHT_THRESHOLD,
 )
+from mqtt_service import build_weighbridge_payload
+
+
+MQTT_CLIENT_ID = f"smartport-weighbridge-test-{uuid.uuid4()}"
 
 # Default transaction type
 DEFAULT_TRANSACTION_TYPE = "gate_in"
@@ -60,6 +57,7 @@ def parse_args():
     parser.add_argument("--publish", action="store_true", help="Actually publish to MQTT. Defaults to dry-run.")
     parser.add_argument("--plate", help="Override plate. Defaults to parsed plate from latest image filename.")
     parser.add_argument("--weight", type=float, help="Override weight in kg. Defaults to latest valid DB row.")
+    parser.add_argument("--event-id", help="Stable edge event ID. Reuse to test backend deduplication.")
     parser.add_argument(
         "--transaction-type",
         default=DEFAULT_TRANSACTION_TYPE,
@@ -199,22 +197,12 @@ def build_session_result(args, scale_row, image_set):
         "official_plate_count": 1,
         "all_plates": {plate: 1},
         "photos": build_photos(image_set, args.capture_dir),
+        "offline_event_id": args.event_id or str(uuid.uuid4()),
     }
 
 
 def build_mqtt_payload(session_result, transaction_type):
-    plate = session_result.get("official_plate", "none")
-    weight = session_result.get("stable_weight")
-    if plate == "none" or weight is None or weight <= 0:
-        raise RuntimeError(f"Invalid publish payload: plate={plate}, weight={weight}")
-    return {
-        "weighbridge_id": WEIGHBRIDGE_ID,
-        "vehicle_plate": plate,
-        "transaction_type": transaction_type,
-        "gross_weight_kg": round(weight, 3),
-        "ocr_plate_read": plate,
-        "photos": session_result.get("photos", []),
-    }
+    return build_weighbridge_payload(session_result, transaction_type)
 
 
 def publish(session_result, transaction_type, connect_timeout):
