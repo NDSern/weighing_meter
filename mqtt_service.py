@@ -66,9 +66,15 @@ def build_weighbridge_payload(session_result: dict,
         "vehicle_plate": plate,
         "transaction_type": transaction_type,
         "gross_weight_kg": round(weight, 3),
-        "ocr_plate_read": plate,
+        "ocr_plate_read": session_result.get("ocr_plate_read", plate),
         "photos": session_result.get("photos", []),
     }
+
+    metadata = session_result.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise ValueError("invalid weighbridge metadata")
+        payload["metadata"] = metadata
 
     tare_weight = session_result.get("tare_weight_kg")
     if tare_weight is not None:

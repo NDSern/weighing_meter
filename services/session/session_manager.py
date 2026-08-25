@@ -1315,11 +1315,45 @@ class SessionManager:
                 f"processed={lpr_diagnostics.get('processed_frames', 0)} "
                 f"regions={lpr_diagnostics.get('detected_regions', 0)}",
             )
-            markSessionFinalized(session_id, "no_plate", {
-                "event": "session_no_plate", "id": session_id,
+            unknown_plate = "UNKNOWN"
+            publish_result = self._build_publish_result(
+                metadata["stable_weight"], unknown_plate, 0, {}, metadata,
+            )
+            publish_result.update({
+                "offline_event_id": session_id,
+                "ocr_plate_read": None,
+                "metadata": {
+                    "plate_status": "unreadable",
+                    "lpr_classification": classification,
+                    "weight_source": metadata.get("weight_source"),
+                    "raw_peak_weight": metadata.get("raw_peak_weight"),
+                    "filtered_peak_weight": metadata.get("filtered_peak_weight"),
+                },
+            })
+            outbox_event_id = None
+            if MQTT_ENABLED and self.mqtt_svc:
+                outbox_event_id = PublishOutbox.enqueue(publish_result, activate=False)
+                log_fn(
+                    "OFFLINE",
+                    f"Weight event queued without plate id={session_id} "
+                    f"weight={metadata['stable_weight']:g}kg",
+                )
+            terminal_record = {
+                "event": "session_publish_queued", "id": session_id,
+                "plate": unknown_plate, "plate_status": "unreadable",
                 "classification": classification,
                 "stable_weight_kg": metadata["stable_weight"], **metadata,
-            })
+            }
+            if outbox_event_id:
+                terminal_record["outbox_event_id"] = outbox_event_id
+            markSessionFinalized(session_id, "published", terminal_record)
+            if outbox_event_id and not PublishOutbox.activate(outbox_event_id):
+                log_fn(
+                    "ERROR",
+                    f"Session publication evidence missing id={session_id} "
+                    f"outbox_id={outbox_event_id}",
+                )
+                return False
             log_metric(
                 log_fn, "session_no_plate", id=metadata["session_id"],
                 started_at=metadata["started_at"], ended_at=metadata["ended_at"],
@@ -1338,6 +1372,12 @@ class SessionManager:
                 id=metadata["session_id"], classification=classification,
                 stable_weight_kg=metadata["stable_weight"],
                 lpr_diagnostics=lpr_diagnostics,
+            )
+            log_metric(
+                log_fn, "session_publish_queued", id=session_id,
+                plate=unknown_plate, plate_status="unreadable",
+                stable_weight_kg=metadata["stable_weight"],
+                classification=classification,
             )
             return True
         result = self.publish_result(

@@ -266,11 +266,40 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
                 self.deferred_metadata("ordered"), tracker, Mock(),
             ))
 
+    def test_weight_backed_session_without_plate_is_published(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = (None, 0, 0)
+        metadata = self.deferred_metadata("no-plate-event")
+        metadata.update({
+            "stable_weight": 39220,
+            "weight_source": "stable",
+            "raw_peak_weight": 39300,
+            "filtered_peak_weight": 39300,
+            "lpr_diagnostics": {"detector_successes": 30, "detected_regions": 0},
+        })
+
+        with patch.object(manager, "_load_lpr_diagnostic_frames", return_value={}), patch.object(
+            manager, "_load_diagnostic_frames", return_value={"cam1": Mock()},
+        ), patch.object(manager, "_save_diagnostic_frames", return_value=1):
+            self.assertTrue(manager.finalize_deferred_session(metadata, tracker, Mock()))
+
+        outcome, terminal = session_module.getSessionFinalization("no-plate-event")
+        self.assertEqual(outcome, "published")
+        self.assertEqual(terminal["plate"], "UNKNOWN")
+        self.assertEqual(terminal["plate_status"], "unreadable")
+        self.assertEqual(module._publish_queue.get_nowait(), "no-plate-event")
+        queued = module._pending_events["no-plate-event"]["session_result"]
+        self.assertEqual(queued["official_plate"], "UNKNOWN")
+        self.assertEqual(queued["stable_weight"], 39220)
+        self.assertIsNone(queued["ocr_plate_read"])
+        self.assertEqual(queued["metadata"]["plate_status"], "unreadable")
+
     def test_publish_success_logs_one_prominent_line_and_metric(self):
         event_id = "1234567890abcdef"
         module._pending_events[event_id] = {
             "id": event_id,
-            "created_at": "2026-07-23T00:00:00",
+            "created_at": module.datetime.now().isoformat(timespec="seconds"),
             "image_paths": [],
             "session_result": {
                 "official_plate": "14C-017.80",

@@ -65,6 +65,25 @@ class MqttPayloadTests(unittest.TestCase):
         self.assertEqual(payload["transaction_type"], "gate_out")
         self.assertEqual(payload["tare_weight_kg"], 9000)
 
+    def test_builds_weight_event_when_plate_is_unreadable(self):
+        with patch("mqtt_service.WEIGHBRIDGE_ID", "100ecc11-dbcb-4c23-8e89-d41ccefcda37"):
+            payload = build_weighbridge_payload({
+                "offline_event_id": "session-no-plate",
+                "timestamp": "2026-08-24T15:20:37.532+00:00",
+                "official_plate": "UNKNOWN",
+                "ocr_plate_read": None,
+                "stable_weight": 39220,
+                "metadata": {
+                    "plate_status": "unreadable",
+                    "lpr_classification": "no_plate_detection",
+                },
+            })
+
+        self.assertEqual(payload["vehicle_plate"], "UNKNOWN")
+        self.assertIsNone(payload["ocr_plate_read"])
+        self.assertEqual(payload["gross_weight_kg"], 39220)
+        self.assertEqual(payload["metadata"]["plate_status"], "unreadable")
+
     def test_serializes_strict_raw_utf8_json(self):
         payload = {
             "weighbridge_id": "07ad7452-a66f-442b-9029-3d7abd2443f5",
