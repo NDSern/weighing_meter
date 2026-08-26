@@ -298,6 +298,36 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertTrue(received[0]["incomplete"])
             self.assertEqual(received[0]["errors"], ["metadata-error", "disk cap reached"])
 
+    def test_frame_timestamps_are_passed_privately_to_finalizer(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "timed", [])
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest["frame_metadata"] = {
+                "cam2-000001-sample.jpg": {
+                    "captured_at": "2026-07-15T00:00:01.200+00:00",
+                    "frame_id": 10,
+                },
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            received = []
+            spool = FakeSpool([path])
+            worker = DeferredLprWorker(
+                spool, [], [], lambda metadata, _tracker: received.append(dict(metadata)) or True,
+                tracker_factory=Tracker, cv2_module=FakeCv2({}),
+            )
+
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: spool.acknowledged))
+            self.assertTrue(worker.stop())
+
+            self.assertEqual(received[0]["_frame_metadata"], manifest["frame_metadata"])
+            self.assertEqual(
+                received[0]["_spool_started_at"],
+                "2026-07-15T00:00:00+00:00",
+            )
+
     def test_cleans_memory_and_logs_rss_after_job(self):
         with tempfile.TemporaryDirectory() as root:
             path = self.make_manifest(root, "one", [])

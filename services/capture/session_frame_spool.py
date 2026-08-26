@@ -267,9 +267,11 @@ class SessionFrameSpool:
             with self._lock:
                 if self._active is not None:
                     for camera, grabber in self._grabbers.items():
-                        frame, frame_id = self._read_frame(grabber)
+                        frame, frame_id, captured_at = self._read_frame(grabber)
                         if frame is not None:
-                            self._save_frame_locked(camera, frame, "sample", frame_id)
+                            self._save_frame_locked(
+                                camera, frame, "sample", frame_id, captured_at,
+                            )
             if time.monotonic() >= next_cleanup:
                 self._resume_cleanup()
                 next_cleanup = time.monotonic() + 10.0
@@ -370,18 +372,24 @@ class SessionFrameSpool:
     @staticmethod
     def _read_frame(grabber):
         if grabber is None:
-            return None, None
+            return None, None, None
+        snapshot = getattr(grabber, "peek_latest_frame_snapshot", None)
+        if snapshot:
+            return snapshot(copy_frame=True)
         peek_with_id = getattr(grabber, "peek_latest_frame_with_id", None)
         if peek_with_id:
-            return peek_with_id(copy_frame=True)
+            frame, frame_id = peek_with_id(copy_frame=True)
+            return frame, frame_id, None
         peek = getattr(grabber, "peek_latest_frame", None)
         if peek:
-            return peek(copy_frame=True), None
+            return peek(copy_frame=True), None, None
         if callable(grabber):
-            return grabber(), None
+            return grabber(), None, None
         raise TypeError("grabber must be callable or expose peek_latest_frame")
 
-    def _save_frame_locked(self, camera, frame, kind, frame_id=None):
+    def _save_frame_locked(
+        self, camera, frame, kind, frame_id=None, captured_at=None,
+    ):
         active = self._active
         index = active["counts"][camera]
         name = "%s-%06d-%s.jpg" % (camera, index, kind)
@@ -404,15 +412,17 @@ class SessionFrameSpool:
             active["counts"][camera] += 1
             active["files"].append(os.path.relpath(path, active["session_dir"]))
             relative_path = os.path.relpath(path, active["session_dir"])
-            active["frame_metadata"][relative_path] = self._frame_metadata(camera, frame_id)
+            active["frame_metadata"][relative_path] = self._frame_metadata(
+                camera, frame_id, captured_at,
+            )
             return True
         except Exception as exc:
             active["incomplete"] = True
             active["errors"].append("%s: %s" % (camera, exc))
             return False
 
-    def _frame_metadata(self, camera, frame_id=None):
-        captured_at = self._now()
+    def _frame_metadata(self, camera, frame_id=None, captured_at=None):
+        captured_at = captured_at or self._now()
         tracks = []
         if self._metadata_provider:
             tracks = self._metadata_provider(camera, frame_id)

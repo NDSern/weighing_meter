@@ -30,6 +30,12 @@ class Grabber:
         return self.frame.copy() if copy_frame else self.frame
 
 
+class TimestampedGrabber(Grabber):
+    def peek_latest_frame_snapshot(self, copy_frame=False):
+        frame = self.peek_latest_frame(copy_frame=copy_frame)
+        return frame, 7, "2026-07-15T00:00:00.123+00:00"
+
+
 class Frame:
     def __init__(self, value):
         self.value = value
@@ -127,6 +133,26 @@ class SessionFrameSpoolTests(unittest.TestCase):
             cam1 = next(name for name in manifest["files"] if name.startswith("cam1-"))
             self.assertIn("captured_at", manifest["frame_metadata"][cam1])
             self.assertEqual(manifest["frame_metadata"][cam1]["tracks"][0]["track_id"], 7)
+
+    def test_records_camera_acquisition_timestamp(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = SessionFrameSpool(
+                root, TimestampedGrabber(40), Grabber(180), interval=0.03,
+                min_free_bytes=0, cv2_module=FakeCv2,
+            )
+            spool.start()
+            spool.begin_session("timestamped")
+            time.sleep(0.04)
+            job = spool.end_session("timestamped", {})
+            self.assertTrue(spool.stop(1))
+
+            with open(job, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            cam1 = next(name for name in manifest["files"] if name.startswith("cam1-"))
+            self.assertEqual(
+                manifest["frame_metadata"][cam1]["captured_at"],
+                "2026-07-15T00:00:00.123+00:00",
+            )
 
     def test_pending_jobs_recover_fifo_after_queue_overflow_and_restart(self):
         with tempfile.TemporaryDirectory() as root:

@@ -3,6 +3,7 @@
 import threading
 import time
 import re
+from datetime import datetime, timezone
 
 import cv2
 
@@ -50,6 +51,7 @@ class _LatestFrameSource:
         self._running = False
         self._latest_frame = None
         self._latest_frame_id = 0
+        self._latest_frame_captured_at = None
         self._frame_lock = threading.Lock()
         self._capture_lock = threading.Lock()
         self._capture = None
@@ -95,9 +97,22 @@ class _LatestFrameSource:
                 return None, None
             return (frame.copy() if copy_frame else frame), self._latest_frame_id
 
+    def peek_latest_frame_snapshot(self, copy_frame=False):
+        """Return latest frame, generation, and RTSP acquisition timestamp."""
+        with self._frame_lock:
+            frame = self._latest_frame
+            if frame is None:
+                return None, None, None
+            return (
+                frame.copy() if copy_frame else frame,
+                self._latest_frame_id,
+                self._latest_frame_captured_at,
+            )
+
     def _clear_latest_frame(self):
         with self._frame_lock:
             self._latest_frame = None
+            self._latest_frame_captured_at = None
 
     def _grab_loop(self):
         interval = 1.0 / DETECT_FPS
@@ -147,6 +162,9 @@ class _LatestFrameSource:
                     with self._frame_lock:
                         self._latest_frame = frame
                         self._latest_frame_id += 1
+                        self._latest_frame_captured_at = datetime.now(timezone.utc).isoformat(
+                            timespec="milliseconds"
+                        )
                     last_retrieve = now
                 grab_took = time.time() - t_grab
                 time.sleep(max(0.0, cam_frame_time - grab_took))

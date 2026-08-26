@@ -177,20 +177,40 @@ class SessionStrategyTests(unittest.TestCase):
         self.assertTrue(self.manager.session.session_active)
         self.assertIsNone(self.manager._plate_absent_since)
 
-    def test_both_camera_loss_for_one_second_ends_plate_session(self):
+    def test_both_camera_loss_waits_for_scale_callback(self):
         with patch("services.session.session_manager.time.monotonic", side_effect=[0.0, 0.0, 1.1]):
             self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam3", {"cam1": False, "cam3": False}, self.log)
+        self.assertTrue(self.manager.session.session_active)
+
+        frame = make_frame(0)
+        frame.status = "UNSTABLE"
+        with patch("services.session.session_manager.time.monotonic", return_value=1.1):
+            self.manager.on_frame(frame, self.log)
         self.assertFalse(self.manager.session.session_active)
 
-    def test_scale_callback_completes_plate_loss_deadline(self):
-        with patch("services.session.session_manager.time.monotonic", side_effect=[0.0, 0.0, 1.1]):
+    def test_plate_loss_does_not_split_continuously_rising_scale_session(self):
+        with patch("services.session.session_manager.time.monotonic", return_value=0.0):
             self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
-            frame = make_frame(5000)
-            frame.status = "UNSTABLE"
+
+        session_id = self.manager.session.session_id
+        generation = self.manager._generation
+        frame = make_frame(5000)
+        frame.status = "UNSTABLE"
+        with patch("services.session.session_manager.time.monotonic", return_value=1.1):
             self.manager.on_frame(frame, self.log)
+
+        self.assertTrue(self.manager.session.session_active)
+        self.assertFalse(self.manager._plate_owned)
+
+        self.feed(self.manager, [5300, 5600, 5900, 5800, 6200, 6600], self.log)
+        self.assertTrue(self.manager.session.session_active)
+        self.assertEqual(self.manager.session.session_id, session_id)
+        self.assertEqual(self.manager._generation, generation)
+
+        self.feed(self.manager, [6300, 6000, 5700, 5800, 5300, 4800], self.log)
         self.assertFalse(self.manager.session.session_active)
 
 

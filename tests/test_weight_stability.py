@@ -404,6 +404,198 @@ class SessionWeightTests(unittest.TestCase):
 
         self.assertEqual(selected, {"cam1": "cam1+1s", "cam3": "cam3+1s"})
 
+    def test_unknown_photos_use_exact_capture_times_nearest_stable_weight(self):
+        metadata = {
+            "session_id": "session-1",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:12+00:00",
+            "weight_observed_at": "2026-07-21T00:00:10+00:00",
+            "weight_source": "stable",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000001-sample.jpg", "cam1-000002-sample.jpg",
+                "cam2-000001-sample.jpg", "cam2-000002-sample.jpg",
+                "cam3-000001-sample.jpg",
+            ],
+            "capture_interval_seconds": 0.2,
+        }
+        frame_metadata = {
+            "cam1-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:09.700+00:00", "frame_id": 10},
+            "cam1-000002-sample.jpg": {"captured_at": "2026-07-21T00:00:10.050+00:00", "frame_id": 11},
+            "cam2-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:09.960+00:00", "frame_id": 20},
+            "cam2-000002-sample.jpg": {"captured_at": "2026-07-21T00:00:10.400+00:00", "frame_id": 21},
+            "cam3-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:08.500+00:00", "frame_id": 30},
+        }
+        frames = {
+            "/spool/session/cam1-000002-sample.jpg": "cam1-stable",
+            "/spool/session/cam2-000001-sample.jpg": "cam2-stable",
+        }
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", side_effect=frames.get, create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, Mock(),
+            )
+
+        self.assertEqual(selected, {"cam1": "cam1-stable", "cam2": "cam2-stable"})
+        self.assertEqual(captured_at, {
+            "cam1": "2026-07-21T00:00:10.050+00:00",
+            "cam2": "2026-07-21T00:00:09.960+00:00",
+        })
+
+    def test_unknown_photo_legacy_job_uses_session_end_timing(self):
+        metadata = {
+            "session_id": "legacy",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:05+00:00",
+            "weight_source": "filtered_peak",
+            "session_dir": "/spool/session",
+            "session_files": ["cam1-000025-sample.jpg"],
+            "capture_interval_seconds": 0.2,
+        }
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", return_value="end-frame", create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, {}, Mock(),
+            )
+
+        self.assertEqual(selected, {"cam1": "end-frame"})
+        self.assertEqual(captured_at, {"cam1": "2026-07-21T00:00:05.000+00:00"})
+
+    def test_unknown_photo_legacy_job_uses_authoritative_spool_start(self):
+        metadata = {
+            "session_id": "legacy-spool-start",
+            "started_at": "2026-07-20T23:59:58+00:00",
+            "ended_at": "2026-07-21T00:00:05+00:00",
+            "weight_source": "filtered_peak",
+            "session_dir": "/spool/session",
+            "session_files": ["cam1-000025-sample.jpg"],
+            "capture_interval_seconds": 0.2,
+        }
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", return_value="end-frame", create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, {}, Mock(), "2026-07-21T00:00:00+00:00",
+            )
+
+        self.assertEqual(selected, {"cam1": "end-frame"})
+        self.assertEqual(captured_at, {"cam1": "2026-07-21T00:00:05.000+00:00"})
+
+    def test_unknown_photos_reject_repeated_stale_camera_frame(self):
+        metadata = {
+            "session_id": "stale-camera",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:10+00:00",
+            "weight_source": "stable",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam2-000001-sample.jpg", "cam2-000002-sample.jpg",
+            ],
+        }
+        frame_metadata = {
+            "cam2-000001-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:01+00:00", "frame_id": 20,
+            },
+            "cam2-000002-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:09.900+00:00", "frame_id": 20,
+            },
+        }
+
+        selected, captured_at = self.manager._load_unknown_publish_frames(
+            metadata, frame_metadata, Mock(),
+        )
+
+        self.assertEqual(selected, {})
+        self.assertEqual(captured_at, {})
+
+    def test_unknown_photos_reject_frame_acquired_before_session(self):
+        metadata = {
+            "session_id": "pre-session-frame",
+            "started_at": "2026-07-21T00:00:10+00:00",
+            "ended_at": "2026-07-21T00:00:10.500+00:00",
+            "weight_observed_at": "2026-07-21T00:00:10.200+00:00",
+            "weight_source": "stable",
+            "session_dir": "/spool/session",
+            "session_files": ["cam2-000000-sample.jpg"],
+            "capture_interval_seconds": 0.2,
+        }
+        frame_metadata = {
+            "cam2-000000-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:05+00:00", "frame_id": 20,
+            },
+        }
+
+        selected, captured_at = self.manager._load_unknown_publish_frames(
+            metadata, frame_metadata, Mock(), "2026-07-21T00:00:10+00:00",
+        )
+
+        self.assertEqual(selected, {})
+        self.assertEqual(captured_at, {})
+
+    def test_unknown_photos_ignore_session_start_snapshot(self):
+        metadata = {
+            "session_id": "start-only",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:00.100+00:00",
+            "weight_observed_at": "2026-07-21T00:00:00.100+00:00",
+            "weight_source": "stable",
+            "session_dir": "/spool/session",
+            "session_files": ["cam1-000000-start.jpg"],
+        }
+        frame_metadata = {
+            "cam1-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00+00:00", "frame_id": None,
+            },
+        }
+
+        selected, captured_at = self.manager._load_unknown_publish_frames(
+            metadata, frame_metadata, Mock(),
+        )
+
+        self.assertEqual(selected, {})
+        self.assertEqual(captured_at, {})
+
+    def test_unknown_cam2_uses_configured_lane_crop(self):
+        class Frame:
+            shape = (2, 4, 3)
+
+            def __getitem__(self, key):
+                return key
+
+        frame = Frame()
+
+        left = SessionManager(Mock(), cam2_result_crop="left")._crop_cam2_result_image(frame)
+        right = SessionManager(Mock(), cam2_result_crop="right")._crop_cam2_result_image(frame)
+        full = SessionManager(Mock(), cam2_result_crop="full")._crop_cam2_result_image(frame)
+
+        self.assertEqual(left, (slice(None), slice(None, 2)))
+        self.assertEqual(right, (slice(None), slice(2, None)))
+        self.assertIs(full, frame)
+
+    def test_peak_only_snapshot_uses_filtered_peak_timestamp(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.session_id = "peak"
+        manager.session.started_at = 1.0
+        manager.session.started_at_iso = "2026-07-24T00:00:00+00:00"
+        manager._session_raw_peak = 1300
+        manager._session_raw_peak_observed_at = "2026-07-24T00:00:04+00:00"
+        manager._session_filtered_peak = 1200
+        manager._session_filtered_peak_observed_at = "2026-07-24T00:00:05+00:00"
+
+        metadata = manager._snapshot_session("weight_trend_falling")
+
+        self.assertEqual(metadata["weight_source"], "filtered_peak")
+        self.assertEqual(metadata["weight_observed_at"], "2026-07-24T00:00:05+00:00")
+        self.assertEqual(metadata["raw_peak_observed_at"], "2026-07-24T00:00:04+00:00")
+        self.assertEqual(metadata["filtered_peak_observed_at"], "2026-07-24T00:00:05+00:00")
+
     def test_stable_frame_does_not_bypass_chained_wait_gate(self):
         manager = SessionManager(Mock())
         manager.session.rearm_block_until = 11.0

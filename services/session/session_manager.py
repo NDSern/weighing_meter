@@ -47,6 +47,7 @@ _registry_family = {}
 _registry_active_count = 0
 MAX_STABLE_WEIGHT_CANDIDATES = 256
 REAR_CAPTURE_FALLBACK_SECONDS = 2.0
+UNKNOWN_PHOTO_MAX_OFFSET_SECONDS = 1.0
 
 
 def set_log_fn(log_fn):
@@ -263,6 +264,7 @@ class WeighingSessionState:
         self.latest_stable_weight = None
         self.stable_weight_observed_at = None
         self.weight_trend_window = deque(maxlen=SESSION_WEIGHT_TREND_FRAMES)
+        self.weight_trend_observation_times = deque(maxlen=SESSION_WEIGHT_TREND_FRAMES)
         self.session_active = False
         self.vehicle_type = None
         self.empty_since = None
@@ -350,6 +352,7 @@ class WeighingSessionState:
         self.stable_weight_sequence = 0
         self.latest_stable_weight = None
         self.weight_trend_window.clear()
+        self.weight_trend_observation_times.clear()
 
 
 class SessionManager:
@@ -404,7 +407,9 @@ class SessionManager:
         self._plate_absent_since = None
         self._plate_presence_revision = 0
         self._session_raw_peak = None
+        self._session_raw_peak_observed_at = None
         self._session_filtered_peak = None
+        self._session_filtered_peak_observed_at = None
         self._session_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
         self.fatal_error = None
         self._spool_failure_logged_for = None
@@ -440,8 +445,19 @@ class SessionManager:
                 return
             if self._plate_absent_since is None:
                 self._plate_absent_since = now
-            elif now - self._plate_absent_since >= 1.0:
-                self._end_session("both_plate_tracks_lost", log_fn)
+
+    def _complete_plate_loss(self, log_fn, current_weight=0.0):
+        observed_weight = max(current_weight, self._session_raw_peak or 0.0)
+        if observed_weight > WEIGHT_THRESHOLD:
+            self._plate_owned = False
+            self._plate_absent_since = None
+            log_fn(
+                "EVENT",
+                f"Session continues under scale lifecycle id={self.session.session_id} "
+                f"after plate tracks lost weight={observed_weight:g}kg",
+            )
+            return
+        self._end_session("both_plate_tracks_lost", log_fn)
 
     def _load_dedup_state(self):
         try:
@@ -530,15 +546,20 @@ class SessionManager:
             and self._plate_absent_since is not None
             and time.monotonic() - self._plate_absent_since >= 1.0
         ):
-            self._end_session("both_plate_tracks_lost", log_fn)
+            self._complete_plate_loss(log_fn, frame.weight)
         self._capture_rear_fallback_if_due(log_fn)
         self._update_peak_candidate(frame, log_fn)
         if self.session.session_active and frame.weight > 0:
-            self._session_raw_peak = max(self._session_raw_peak or frame.weight, frame.weight)
+            observed_at = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+            if self._session_raw_peak is None or frame.weight > self._session_raw_peak:
+                self._session_raw_peak = frame.weight
+                self._session_raw_peak_observed_at = observed_at
             self._session_weight_window.append(frame.weight)
             if len(self._session_weight_window) == self._session_weight_window.maxlen:
                 filtered = sorted(self._session_weight_window)[len(self._session_weight_window) // 2]
-                self._session_filtered_peak = max(self._session_filtered_peak or filtered, filtered)
+                if self._session_filtered_peak is None or filtered > self._session_filtered_peak:
+                    self._session_filtered_peak = filtered
+                    self._session_filtered_peak_observed_at = observed_at
             if time.monotonic() - self._last_spool_weight_checkpoint >= 1.0:
                 self._update_spool_metadata(log_fn)
                 self._last_spool_weight_checkpoint = time.monotonic()
@@ -837,9 +858,11 @@ class SessionManager:
     def _check_weight_trend(self, frame, log_fn):
         if frame.weight <= WEIGHT_THRESHOLD:
             self.session.weight_trend_window.clear()
+            self.session.weight_trend_observation_times.clear()
             return False
         window = self.session.weight_trend_window
         window.append(frame.weight)
+        self.session.weight_trend_observation_times.append(frame.timestamp)
         if len(window) < SESSION_WEIGHT_TREND_FRAMES:
             return False
         net_movement = window[-1] - window[0]
@@ -867,7 +890,10 @@ class SessionManager:
                     "max_weight": max(window),
                     "start_frames": self._capture_lpr_start_frames(log_fn),
                 }
-                self._start_session(frame.decimal_pos, log_fn, trigger="scale_rising")
+                self._start_session(
+                    frame.decimal_pos, log_fn, trigger="scale_rising",
+                    observed_at=frame.timestamp,
+                )
                 return True
             return False
         if self._plate_owned:
@@ -927,7 +953,9 @@ class SessionManager:
             self.session.rearm_reference_weight = None
             return True
 
-    def _start_session(self, decimal_pos: int, log_fn, trigger="scale_rising"):
+    def _start_session(
+        self, decimal_pos: int, log_fn, trigger="scale_rising", observed_at=None,
+    ):
         self.plate_tracker.clear()
         self.session.stable_weight_observed_at = None
         self.session.rearm_block_until = 0.0
@@ -952,16 +980,30 @@ class SessionManager:
             self.session.clear_stable_weight_history()
         elif trigger == "scale_rising":
             rising_window = list(self.session.weight_trend_window)
+            rising_observation_times = list(self.session.weight_trend_observation_times)
             self.session.stable_weight = None
             self.session.last_publish_weight = None
             self.session.clear_stable_weight_history()
             self._session_weight_window.extend(rising_window)
             if self._session_weight_window:
                 self._session_raw_peak = max(self._session_weight_window)
+                if rising_observation_times:
+                    raw_peak_index = max(
+                        range(len(rising_window)), key=rising_window.__getitem__,
+                    )
+                    self._session_raw_peak_observed_at = rising_observation_times[
+                        raw_peak_index
+                    ].astimezone(
+                        timezone.utc
+                    ).isoformat(timespec="milliseconds")
                 if len(self._session_weight_window) == self._session_weight_window.maxlen:
                     self._session_filtered_peak = sorted(self._session_weight_window)[
                         len(self._session_weight_window) // 2
                     ]
+                    if observed_at is not None:
+                        self._session_filtered_peak_observed_at = observed_at.astimezone(
+                            timezone.utc
+                        ).isoformat(timespec="milliseconds")
         self.session.lpr_start_frames = self._attempt["start_frames"]
         self.session.session_active = True
         self._generation += 1
@@ -988,7 +1030,9 @@ class SessionManager:
                         "stability_rule": self.session.stability_rule,
                         "weight_observed_at": self.session.stable_weight_observed_at,
                         "raw_peak_weight": self._session_raw_peak,
+                        "raw_peak_observed_at": self._session_raw_peak_observed_at,
                         "filtered_peak_weight": self._session_filtered_peak,
+                        "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
                         "vehicle_type": self.session.vehicle_type,
                         "rear_start_path": None,
                         "start_frame_paths": {},
@@ -1112,7 +1156,9 @@ class SessionManager:
                     "stability_rule": self.session.stability_rule,
                     "weight_observed_at": self.session.stable_weight_observed_at,
                     "raw_peak_weight": self._session_raw_peak,
+                    "raw_peak_observed_at": self._session_raw_peak_observed_at,
                     "filtered_peak_weight": self._session_filtered_peak,
+                    "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
                     "vehicle_type": self.session.vehicle_type,
                     "rear_start_path": self.session.rear_start_path,
                     "rear_captured_at": self.session.rear_captured_at,
@@ -1188,7 +1234,9 @@ class SessionManager:
         self._plate_owned = False
         self._plate_absent_since = None
         self._session_raw_peak = None
+        self._session_raw_peak_observed_at = None
         self._session_filtered_peak = None
+        self._session_filtered_peak_observed_at = None
         self._session_weight_window.clear()
         self.session.stable_count = 0
         self.session.clear_stable_weight_history()
@@ -1218,10 +1266,13 @@ class SessionManager:
         stable = self.session.stable_weight if self.session.stable_weight and self.session.stable_weight > 0 else None
         if stable is not None:
             assigned, source = stable, "stable"
+            observed_at = self.session.stable_weight_observed_at
         elif self._session_filtered_peak is not None:
             assigned, source = self._session_filtered_peak, "filtered_peak"
+            observed_at = self._session_filtered_peak_observed_at
         else:
             assigned, source = self._session_raw_peak, "raw_peak" if self._session_raw_peak else "none"
+            observed_at = self._session_raw_peak_observed_at
         return {
             "session_id": self.session.session_id,
             "started_at": self.session.started_at_iso,
@@ -1231,10 +1282,10 @@ class SessionManager:
             "stable_weight": assigned,
             "weight_source": source,
             "raw_peak_weight": self._session_raw_peak,
+            "raw_peak_observed_at": self._session_raw_peak_observed_at,
             "filtered_peak_weight": self._session_filtered_peak,
-            "weight_observed_at": (
-                self.session.stable_weight_observed_at if source == "stable" else None
-            ),
+            "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
+            "weight_observed_at": observed_at,
             "decimal_pos": self.session.last_publish_decimal_pos,
             "vehicle_type": self.session.vehicle_type,
             "rear_start_path": self.session.rear_start_path,
@@ -1260,6 +1311,8 @@ class SessionManager:
         """Finalize one immutable ended session after deferred LPR completes."""
         log_fn = log_fn or log
         session_id = metadata["session_id"]
+        frame_metadata = metadata.pop("_frame_metadata", {})
+        spool_started_at = metadata.pop("_spool_started_at", None)
         finalization = getSessionFinalization(session_id)
         if finalization:
             outcome, record = finalization
@@ -1330,9 +1383,42 @@ class SessionManager:
                     "filtered_peak_weight": metadata.get("filtered_peak_weight"),
                 },
             })
+            publish_frames, captured_at = self._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, spool_started_at,
+            )
+            self._attach_unknown_publish_images(
+                publish_result, publish_frames, captured_at, session_id,
+            )
+            image_object_keys = publish_result.pop("_image_object_keys", [])
+            image_paths = publish_result.pop("_image_paths", [])
+            save_items = publish_result.pop("_image_save_items", [])
+            saved_photos = []
+            saved_object_keys = []
+            saved_paths = []
+            for photo, item, object_key, image_path in zip(
+                publish_result["photos"], save_items, image_object_keys, image_paths,
+            ):
+                if ImageSaveWorker.save_and_enqueue_upload([item]):
+                    saved_photos.append(photo)
+                    saved_object_keys.append(object_key)
+                    saved_paths.append(image_path)
+                else:
+                    log_fn(
+                        "WARNING",
+                        f"Unknown publication image dropped id={session_id} "
+                        f"camera={photo['type']}",
+                    )
+            publish_result["photos"] = saved_photos
+            image_object_keys = saved_object_keys
+            image_paths = saved_paths
             outbox_event_id = None
             if MQTT_ENABLED and self.mqtt_svc:
-                outbox_event_id = PublishOutbox.enqueue(publish_result, activate=False)
+                outbox_event_id = PublishOutbox.enqueue(
+                    publish_result,
+                    image_object_keys=image_object_keys,
+                    image_paths=image_paths,
+                    activate=False,
+                )
                 log_fn(
                     "OFFLINE",
                     f"Weight event queued without plate id={session_id} "
@@ -1466,6 +1552,92 @@ class SessionManager:
             if frame is not None:
                 frames[camera] = frame
         return frames or self._load_start_frames(metadata)
+
+    def _load_unknown_publish_frames(
+        self, metadata, frame_metadata, log_fn, spool_started_at=None,
+    ):
+        target_at = (
+            metadata.get("weight_observed_at")
+            or metadata.get("filtered_peak_observed_at")
+            or metadata.get("raw_peak_observed_at")
+            or metadata.get("ended_at")
+        )
+        try:
+            target_ts = datetime.fromisoformat(target_at).timestamp()
+        except (TypeError, ValueError):
+            log_fn("WARNING", f"Unknown photo timing unavailable id={metadata['session_id']}")
+            return {}, {}
+
+        session_dir = metadata.get("session_dir")
+        started_at = spool_started_at or metadata.get("started_at")
+        if not session_dir or not started_at:
+            return {}, {}
+        session_dir = os.path.abspath(session_dir)
+        started_ts = datetime.fromisoformat(started_at).timestamp()
+        interval = float(metadata.get("capture_interval_seconds", 0.2))
+        selected = {}
+        captured_at = {}
+        selection = {}
+        missing = []
+        for camera in ("cam1", "cam2", "cam3"):
+            candidates = []
+            first_seen_by_frame_id = {}
+            for relative_path in metadata.get("session_files", []):
+                if not relative_path.startswith(camera + "-"):
+                    continue
+                if relative_path.endswith("-start.jpg"):
+                    continue
+                item_metadata = frame_metadata.get(relative_path) or {}
+                observed_iso = item_metadata.get("captured_at")
+                try:
+                    observed_ts = datetime.fromisoformat(observed_iso).timestamp()
+                except (TypeError, ValueError):
+                    try:
+                        index = int(relative_path.split("-", 2)[1])
+                    except (ValueError, IndexError):
+                        continue
+                    observed_ts = started_ts + index * interval
+                    observed_iso = datetime.fromtimestamp(
+                        observed_ts, timezone.utc,
+                    ).isoformat(timespec="milliseconds")
+                if observed_ts < started_ts - interval:
+                    continue
+                frame_id = item_metadata.get("frame_id")
+                if frame_id is not None:
+                    observed_ts, observed_iso = first_seen_by_frame_id.setdefault(
+                        frame_id, (observed_ts, observed_iso),
+                    )
+                candidates.append((abs(observed_ts - target_ts), relative_path, observed_iso))
+            if not candidates:
+                missing.append(camera)
+                continue
+            chosen = None
+            for offset, relative_path, observed_iso in sorted(candidates):
+                if offset > UNKNOWN_PHOTO_MAX_OFFSET_SECONDS:
+                    break
+                path = os.path.abspath(os.path.join(session_dir, relative_path))
+                if os.path.commonpath((session_dir, path)) != session_dir:
+                    continue
+                frame = cv2.imread(path)
+                if frame is not None:
+                    chosen = frame, observed_iso, offset
+                    break
+            if chosen is None:
+                missing.append(camera)
+                continue
+            frame, observed_iso, offset = chosen
+            selected[camera] = frame
+            captured_at[camera] = observed_iso
+            selection[camera] = {
+                "captured_at": observed_iso,
+                "offset_ms": round(offset * 1000),
+            }
+        log_metric(
+            log_fn, "unknown_photo_selection", id=metadata["session_id"],
+            target_at=target_at, weight_source=metadata.get("weight_source"),
+            selected=selection, missing_cameras=missing,
+        )
+        return selected, captured_at
 
     @staticmethod
     def _load_lpr_diagnostic_frames(metadata, classification):
@@ -1612,9 +1784,37 @@ class SessionManager:
             "front": _make("photo-front"),
             "rear": _make("photo-rear"),
             "merged": _make("photo-merged"),
+            "cam1": _make("photo-cam1"),
+            "cam2": _make("photo-cam2"),
+            "cam3": _make("photo-cam3"),
             "unchosen_cam1": _make("photo-unchosen-cam1"),
             "unchosen_cam3": _make("photo-unchosen-cam3"),
         }
+
+    def _attach_unknown_publish_images(self, result, frames, captured_at, session_id):
+        available = [
+            camera for camera in ("cam1", "cam2", "cam3")
+            if frames.get(camera) is not None
+        ]
+        result["photos"] = []
+        result["_image_object_keys"] = []
+        result["_image_paths"] = []
+        result["_image_save_items"] = []
+        if not available:
+            return
+
+        paths = self._prepare_capture_paths(datetime.now(), "UNKNOWN", session_id)
+        for camera in available:
+            frame = frames[camera]
+            if camera == "cam2":
+                frame = self._crop_cam2_result_image(frame)
+            fpath, object_key, url = paths[camera]
+            result["photos"].append({
+                "url": url, "type": camera, "captured_at": captured_at.get(camera),
+            })
+            result["_image_object_keys"].append(object_key)
+            result["_image_paths"].append(fpath)
+            result["_image_save_items"].append([fpath, frame, object_key])
 
     def _crop_cam2_result_image(self, frame):
         h, w = frame.shape[:2]

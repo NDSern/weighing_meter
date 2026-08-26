@@ -274,14 +274,19 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         metadata.update({
             "stable_weight": 39220,
             "weight_source": "stable",
+            "weight_observed_at": "2026-07-24T00:00:05.500+00:00",
             "raw_peak_weight": 39300,
             "filtered_peak_weight": 39300,
             "lpr_diagnostics": {"detector_successes": 30, "detected_regions": 0},
         })
 
         with patch.object(manager, "_load_lpr_diagnostic_frames", return_value={}), patch.object(
-            manager, "_load_diagnostic_frames", return_value={"cam1": Mock()},
-        ), patch.object(manager, "_save_diagnostic_frames", return_value=1):
+            manager, "_load_diagnostic_frames", return_value={},
+        ), patch.object(
+            manager, "_load_unknown_publish_frames", return_value=({}, {}),
+        ), patch.object(manager, "_save_diagnostic_frames", return_value=0), patch.object(
+            session_module.ImageSaveWorker, "save_and_enqueue_upload",
+        ) as save_images:
             self.assertTrue(manager.finalize_deferred_session(metadata, tracker, Mock()))
 
         outcome, terminal = session_module.getSessionFinalization("no-plate-event")
@@ -294,6 +299,123 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         self.assertEqual(queued["stable_weight"], 39220)
         self.assertIsNone(queued["ocr_plate_read"])
         self.assertEqual(queued["metadata"]["plate_status"], "unreadable")
+        self.assertEqual(queued["photos"], [])
+        save_images.assert_not_called()
+
+    def test_weight_backed_unknown_persists_evidence_before_outbox_activation(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = (None, 0, 0)
+        metadata = self.deferred_metadata("unknown-with-images")
+        metadata["weight_observed_at"] = "2026-07-24T00:00:05.500+00:00"
+        metadata["_frame_metadata"] = {"private": "spool timestamps"}
+        metadata["_spool_started_at"] = "2026-07-24T00:00:05+00:00"
+        metadata["lpr_diagnostics"] = {"detector_successes": 30, "detected_regions": 0}
+        diagnostic_frames = {"cam1": Mock(name="diagnostic-frame")}
+        frames = {
+            "cam1": Mock(name="cam1-frame"),
+            "cam2": Mock(name="cam2-frame"),
+            "cam3": Mock(name="cam3-frame"),
+        }
+        cropped_cam2 = Mock(name="cropped-cam2-frame")
+        captured_at = {
+            "cam1": "2026-07-24T00:00:05.480+00:00",
+            "cam2": "2026-07-24T00:00:05.510+00:00",
+            "cam3": "2026-07-24T00:00:05.530+00:00",
+        }
+        paths = {
+            "cam1": ("/local/cam1.jpg", "storage/weighbridge/cam1.jpg", "/storage/weighbridge/cam1.jpg"),
+            "cam2": ("/local/cam2.jpg", "storage/weighbridge/cam2.jpg", "/storage/weighbridge/cam2.jpg"),
+            "cam3": ("/local/cam3.jpg", "storage/weighbridge/cam3.jpg", "/storage/weighbridge/cam3.jpg"),
+        }
+        original_activate = PublishOutbox.activate
+
+        def assert_finalized_before_activation(event_id):
+            self.assertTrue(session_module.isSessionFinalized("unknown-with-images"))
+            self.assertFalse(module._pending_events[event_id]["activated"])
+            return original_activate(event_id)
+
+        with patch.object(
+            manager, "_load_lpr_diagnostic_frames", return_value=diagnostic_frames,
+        ), patch.object(
+            manager, "_load_unknown_publish_frames", return_value=(frames, captured_at),
+        ), patch.object(
+            manager, "_save_diagnostic_frames", return_value=1,
+        ), patch.object(
+            manager, "_prepare_capture_paths", return_value=paths,
+        ), patch.object(
+            manager, "_crop_cam2_result_image", return_value=cropped_cam2,
+        ), patch.object(
+            session_module.ImageSaveWorker, "save_and_enqueue_upload", return_value=True,
+        ) as save_images, patch.object(
+            PublishOutbox, "activate", side_effect=assert_finalized_before_activation,
+        ):
+            self.assertTrue(manager.finalize_deferred_session(metadata, tracker, Mock()))
+
+        self.assertEqual(save_images.call_args_list, [
+            unittest.mock.call([["/local/cam1.jpg", frames["cam1"], "storage/weighbridge/cam1.jpg"]]),
+            unittest.mock.call([["/local/cam2.jpg", cropped_cam2, "storage/weighbridge/cam2.jpg"]]),
+            unittest.mock.call([["/local/cam3.jpg", frames["cam3"], "storage/weighbridge/cam3.jpg"]]),
+        ])
+        event = module._pending_events["unknown-with-images"]
+        self.assertEqual(
+            event["image_paths"],
+            ["/local/cam1.jpg", "/local/cam2.jpg", "/local/cam3.jpg"],
+        )
+        self.assertEqual(event["image_object_keys"], [
+            "storage/weighbridge/cam1.jpg",
+            "storage/weighbridge/cam2.jpg",
+            "storage/weighbridge/cam3.jpg",
+        ])
+        self.assertEqual(event["session_result"]["photos"], [
+            {"url": "/storage/weighbridge/cam1.jpg", "type": "cam1", "captured_at": captured_at["cam1"]},
+            {"url": "/storage/weighbridge/cam2.jpg", "type": "cam2", "captured_at": captured_at["cam2"]},
+            {"url": "/storage/weighbridge/cam3.jpg", "type": "cam3", "captured_at": captured_at["cam3"]},
+        ])
+        self.assertNotIn("_frame_metadata", event["session_result"])
+        self.assertNotIn("_spool_started_at", event["session_result"])
+        self.assertNotIn("_frame_metadata", self.terminal_outcome("unknown-with-images"))
+        self.assertNotIn("_spool_started_at", self.terminal_outcome("unknown-with-images"))
+
+    def test_weight_backed_unknown_drops_only_failed_evidence_image(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = (None, 0, 0)
+        metadata = self.deferred_metadata("unknown-save-failed")
+        frames = {"cam1": Mock(name="cam1-frame"), "cam2": Mock(name="cam2-frame")}
+        paths = {
+            "cam1": ("/local/cam1.jpg", "storage/weighbridge/cam1.jpg", "/storage/weighbridge/cam1.jpg"),
+            "cam2": ("/local/cam2.jpg", "storage/weighbridge/cam2.jpg", "/storage/weighbridge/cam2.jpg"),
+        }
+
+        with patch.object(
+            manager, "_load_lpr_diagnostic_frames", return_value=frames,
+        ), patch.object(
+            manager, "_load_unknown_publish_frames", return_value=(frames, {
+                "cam1": "2026-07-24T00:00:05+00:00",
+                "cam2": "2026-07-24T00:00:05+00:00",
+            }),
+        ), patch.object(
+            manager, "_save_diagnostic_frames", return_value=1,
+        ), patch.object(
+            manager, "_prepare_capture_paths", return_value=paths,
+        ), patch.object(
+            manager, "_crop_cam2_result_image", return_value=frames["cam2"],
+        ), patch.object(
+            session_module.ImageSaveWorker, "save_and_enqueue_upload", side_effect=[False, True],
+        ):
+            self.assertTrue(manager.finalize_deferred_session(metadata, tracker, Mock()))
+
+        outcome, _terminal = session_module.getSessionFinalization("unknown-save-failed")
+        self.assertEqual(outcome, "published")
+        event = module._pending_events["unknown-save-failed"]
+        self.assertEqual(event["image_paths"], ["/local/cam2.jpg"])
+        self.assertEqual(event["image_object_keys"], ["storage/weighbridge/cam2.jpg"])
+        self.assertEqual(event["session_result"]["photos"], [{
+            "url": "/storage/weighbridge/cam2.jpg",
+            "type": "cam2",
+            "captured_at": "2026-07-24T00:00:05+00:00",
+        }])
 
     def test_publish_success_logs_one_prominent_line_and_metric(self):
         event_id = "1234567890abcdef"

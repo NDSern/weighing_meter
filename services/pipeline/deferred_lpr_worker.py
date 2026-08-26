@@ -233,6 +233,8 @@ class DeferredLprWorker:
         metadata["session_dir"] = session_dir
         metadata["session_files"] = files
         metadata["capture_interval_seconds"] = float(job.get("capture_interval_seconds", 0.2))
+        metadata["_frame_metadata"] = frame_metadata
+        metadata["_spool_started_at"] = job.get("started_at")
         metadata["incomplete"] = bool(metadata.get("incomplete") or job.get("incomplete"))
         metadata["errors"] = list(dict.fromkeys([
             *(metadata.get("errors") or []), *(job.get("errors") or []),
