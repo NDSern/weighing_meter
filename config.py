@@ -42,7 +42,7 @@ MQTT_TOPIC = (
     "Hub/AIBOXCAN/weighbridge/"
     f"{MQTT_WEIGHBRIDGE_TOPIC_ID}/events"
 )
-DEFAULT_TRANSACTION_TYPE = "gate_in"
+DEFAULT_TRANSACTION_TYPE = "gate_out"
 IMAGE_RETENTION_ENABLED = True
 IMAGE_RETENTION_DAYS = 30
 IMAGE_RETENTION_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
@@ -64,6 +64,7 @@ MINIO_BUCKET = "smartport"
 MINIO_SECURE = False
 STABLE_COUNT_THRESHOLD = 1
 SESSION_END_EMPTY_DWELL_SECONDS = 2.0
+SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT = True
 SESSION_WEIGHT_DEPARTURE_KG = 500.0
 SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS = 2.0
 SESSION_WEIGHT_TREND_FRAMES = 6
@@ -144,6 +145,7 @@ VEHICLE_CLASSES = [
 ]
 
 _LOCAL_CONFIG = os.path.join(SERVICE_DIR, "config.local.py")
+_LOCAL_OVERRIDES = set()
 if os.path.exists(_LOCAL_CONFIG):
     _spec = importlib.util.spec_from_file_location("config_local", _LOCAL_CONFIG)
     _module = importlib.util.module_from_spec(_spec)
@@ -151,3 +153,88 @@ if os.path.exists(_LOCAL_CONFIG):
     for _name in dir(_module):
         if _name.isupper():
             globals()[_name] = getattr(_module, _name)
+            _LOCAL_OVERRIDES.add(_name)
+
+if "MQTT_WEIGHBRIDGE_TOPIC_ID" not in _LOCAL_OVERRIDES:
+    MQTT_WEIGHBRIDGE_TOPIC_ID = WEIGHBRIDGE_ID
+if "MQTT_CLIENT_ID" not in _LOCAL_OVERRIDES:
+    MQTT_CLIENT_ID = f"smartport-weighbridge-{MQTT_WEIGHBRIDGE_TOPIC_ID}"
+if "MQTT_TOPIC" not in _LOCAL_OVERRIDES:
+    MQTT_TOPIC = (
+        "m/2e206e45-9c8e-4be0-a97a-b25e49cac58d/"
+        "c/d3fc99f9-76ac-4047-807d-b04759f798fc/"
+        "Hub/AIBOXCAN/weighbridge/"
+        f"{MQTT_WEIGHBRIDGE_TOPIC_ID}/events"
+    )
+
+_HOST_POLICIES = {
+    "100ecc11-dbcb-4c23-8e89-d41ccefcda37": {
+        "DEFAULT_TRANSACTION_TYPE": "gate_in",
+        "SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT": False,
+    },
+    "9aa29a10-6605-47dd-9460-970d66c3d1c3": {
+        "DEFAULT_TRANSACTION_TYPE": "gate_out",
+        "SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT": True,
+    },
+}
+_HOST_POLICY = _HOST_POLICIES.get(WEIGHBRIDGE_ID)
+if _HOST_POLICY:
+    for _name, _value in _HOST_POLICY.items():
+        if _name not in _LOCAL_OVERRIDES:
+            globals()[_name] = _value
+
+
+def validate_runtime_config():
+    errors = []
+
+    def require_text(name):
+        value = globals().get(name)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{name} must be a non-empty string")
+
+    for name in (
+        "MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET",
+    ):
+        require_text(name)
+    if DEFAULT_TRANSACTION_TYPE not in (
+        "gate_in", "gate_out", "vgm", "reweigh", "spot_check",
+    ):
+        errors.append("DEFAULT_TRANSACTION_TYPE is invalid")
+    if not isinstance(SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT, bool):
+        errors.append("SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT must be a boolean")
+    if _HOST_POLICY:
+        for name, expected in _HOST_POLICY.items():
+            if globals().get(name) != expected:
+                errors.append(f"{name} conflicts with canonical host policy")
+
+    if MQTT_ENABLED:
+        for name in (
+            "WEIGHBRIDGE_ID", "MQTT_WEIGHBRIDGE_TOPIC_ID", "MQTT_CLIENT_ID",
+            "MQTT_HOST", "MQTT_USERNAME", "MQTT_PASSWORD", "MQTT_TOPIC",
+        ):
+            require_text(name)
+        if not isinstance(MQTT_PORT, int) or isinstance(MQTT_PORT, bool) or MQTT_PORT <= 0:
+            errors.append("MQTT_PORT must be a positive integer")
+        if MQTT_QOS not in (0, 1, 2):
+            errors.append("MQTT_QOS must be 0, 1, or 2")
+        if MQTT_WEIGHBRIDGE_TOPIC_ID != WEIGHBRIDGE_ID:
+            errors.append("MQTT_WEIGHBRIDGE_TOPIC_ID must equal WEIGHBRIDGE_ID")
+        if (
+            isinstance(MQTT_WEIGHBRIDGE_TOPIC_ID, str)
+            and isinstance(MQTT_CLIENT_ID, str)
+            and MQTT_WEIGHBRIDGE_TOPIC_ID
+            and MQTT_CLIENT_ID
+            and MQTT_WEIGHBRIDGE_TOPIC_ID not in MQTT_CLIENT_ID
+        ):
+            errors.append("MQTT_CLIENT_ID does not contain MQTT_WEIGHBRIDGE_TOPIC_ID")
+        if (
+            isinstance(MQTT_WEIGHBRIDGE_TOPIC_ID, str)
+            and isinstance(MQTT_TOPIC, str)
+            and MQTT_WEIGHBRIDGE_TOPIC_ID
+            and MQTT_TOPIC
+            and MQTT_WEIGHBRIDGE_TOPIC_ID not in MQTT_TOPIC
+        ):
+            errors.append("MQTT_TOPIC does not contain MQTT_WEIGHBRIDGE_TOPIC_ID")
+
+    if errors:
+        raise ValueError("Invalid runtime configuration: " + "; ".join(errors))

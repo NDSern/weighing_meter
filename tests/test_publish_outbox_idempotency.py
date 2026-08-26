@@ -8,7 +8,6 @@ from unittest.mock import patch
 from unittest.mock import Mock
 
 sys.modules.setdefault("cv2", Mock())
-sys.modules.setdefault("numpy", Mock())
 sys.modules.setdefault("minio", Mock())
 sys.modules.setdefault("minio.error", Mock())
 
@@ -32,6 +31,7 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         )
         self.finalization_patch.start()
         module._pending_events.clear()
+        module._stop_event.clear()
         while not module._publish_queue.empty():
             module._publish_queue.get_nowait()
 
@@ -440,6 +440,52 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         human = [entry for entry in logs if entry[0] != "METRIC"]
         self.assertEqual(human, [(">>> SENT <<<", "plate=14C-017.80 wt=34780kg id=12345678")])
         self.assertEqual(len([entry for entry in logs if entry[0] == "METRIC"]), 1)
+
+    def test_publish_failure_keeps_pending_event_and_requeues(self):
+        event_id = PublishOutbox.enqueue({
+            "offline_event_id": "mqtt-failure",
+            "official_plate": "14C-017.80",
+            "stable_weight": 34780.0,
+        })
+        self.assertEqual(module._publish_queue.get_nowait(), event_id)
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = False
+
+        with patch.object(module, "_mqtt_svc", mqtt), patch.object(
+            module._stop_event, "wait", return_value=False,
+        ):
+            PublishOutbox._publish_event(event_id)
+
+        self.assertEqual(PublishOutbox.pending_count(), 1)
+        self.assertEqual(module._publish_queue.get_nowait(), event_id)
+        mqtt.publish_weighbridge_event.assert_called_once_with(
+            module._pending_events[event_id]["session_result"],
+            wait_for_ack=True,
+            timeout=10.0,
+        )
+
+    def test_restart_loads_and_drains_pending_event_after_ack(self):
+        event_id = PublishOutbox.enqueue({
+            "offline_event_id": "restart-drain",
+            "official_plate": "14C-017.80",
+            "stable_weight": 34780.0,
+        })
+        module._pending_events.clear()
+        while not module._publish_queue.empty():
+            module._publish_queue.get_nowait()
+
+        PublishOutbox._load_pending()
+        recovered_id = module._publish_queue.get_nowait()
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = True
+        with patch.object(module, "_mqtt_svc", mqtt):
+            PublishOutbox._publish_event(recovered_id)
+
+        self.assertEqual(recovered_id, event_id)
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+        self.assertTrue(PublishOutbox._is_published(event_id))
+        published_result = mqtt.publish_weighbridge_event.call_args.args[0]
+        self.assertEqual(published_result["offline_event_id"], event_id)
 
 
 if __name__ == "__main__":

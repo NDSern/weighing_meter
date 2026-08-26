@@ -66,8 +66,9 @@ RTSP_URL_2 = "rtsp://user:pass@camera/rear"
 RTSP_URL_3 = "rtsp://user:pass@camera/side"
 CAM2_RESULT_CROP = "left"  # left, right, or full
 WEIGHBRIDGE_ID = "..."
-MQTT_WEIGHBRIDGE_TOPIC_ID = WEIGHBRIDGE_ID[:8]
 ```
+
+Known HP-01 and HP-02 identities select their canonical transaction direction and plate-loss policy automatically. Any explicit local policy must match that canonical mapping.
 
 Do not commit `config.local.py` or `weighing_service.service`.
 
@@ -76,8 +77,10 @@ Do not commit `config.local.py` or `weighing_service.service`.
 Run unit tests from repository root:
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
+make verify
 ```
+
+This runs model checksums and the complete unit test suite. Use `make test` for unit tests only.
 
 The manual MQTT probe is intentionally outside test discovery:
 

@@ -142,6 +142,7 @@ class MqttService:
             self._log("INFO", f"MQTT client starting — broker {MQTT_HOST}:{MQTT_PORT}")
         except Exception as exc:
             self._log("ERROR", f"MQTT connect error: {exc}")
+            raise
 
     def stop(self):
         """Disconnect and stop the network loop."""

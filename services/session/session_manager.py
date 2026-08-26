@@ -26,6 +26,7 @@ from config import (
     PEAK_MOVEMENT_CONFIRM_FRAMES,
     SAME_PLATE_DUPLICATE_SECONDS,
     SESSION_DEDUP_STATE_FILE,
+    SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT,
     SESSION_FINALIZATION_DB,
     SESSION_END_EMPTY_DWELL_SECONDS,
     SESSION_STABLE_WEIGHT_WINDOW,
@@ -448,7 +449,10 @@ class SessionManager:
 
     def _complete_plate_loss(self, log_fn, current_weight=0.0):
         observed_weight = max(current_weight, self._session_raw_peak or 0.0)
-        if observed_weight > WEIGHT_THRESHOLD:
+        if (
+            SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT
+            and observed_weight > WEIGHT_THRESHOLD
+        ):
             self._plate_owned = False
             self._plate_absent_since = None
             log_fn(
@@ -1005,10 +1009,6 @@ class SessionManager:
                             timezone.utc
                         ).isoformat(timespec="milliseconds")
         self.session.lpr_start_frames = self._attempt["start_frames"]
-        self.session.session_active = True
-        self._generation += 1
-        self._plate_owned = trigger == "plate_detected"
-        self._plate_absent_since = None
         self.session.started_at = time.time()
         self.session.session_id = self._attempt["id"]
         self.session.started_at_iso = self._attempt["started_at"]
@@ -1050,7 +1050,18 @@ class SessionManager:
                 except Exception as abort_exc:
                     log_fn("ERROR", f"Session frame spool abort failed: {abort_exc}")
                 self.session.spool_active = False
-                log_fn("ERROR", f"Session frame spool unavailable: {exc}")
+                self.fatal_error = "Session frame spool admission failed: %s" % exc
+                log_fn("FATAL", self.fatal_error)
+                log_metric(
+                    log_fn, "session_spool_admission_failed",
+                    id=self.session.session_id, started_at=self.session.started_at_iso,
+                    trigger=trigger, error=str(exc),
+                )
+                return False
+        self.session.session_active = True
+        self._generation += 1
+        self._plate_owned = trigger == "plate_detected"
+        self._plate_absent_since = None
         if not self._capture_and_save_rear("promotion", "cam2-start.jpg", log_fn):
             self.session.rear_fallback_deadline = (
                 self.session.started_at + REAR_CAPTURE_FALLBACK_SECONDS
@@ -1075,6 +1086,7 @@ class SessionManager:
             stable_weight_kg=self.session.stable_weight,
             stability_rule=self.session.stability_rule,
         )
+        return True
 
     def _capture_lpr_start_frames(self, log_fn):
         frames = {}

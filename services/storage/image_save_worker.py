@@ -44,12 +44,8 @@ def log(level: str, msg: str):
         _log_fn(level, msg)
 
 
-_minio = Minio(
-    MINIO_ENDPOINT,
-    access_key=MINIO_ACCESS_KEY,
-    secret_key=MINIO_SECRET_KEY,
-    secure=MINIO_SECURE,
-)
+_minio = None
+_minio_lock = threading.Lock()
 
 _pending_file = os.path.join(SERVICE_DIR, "storage", "upload_pending.jsonl")
 _upload_queue = queue.Queue(maxsize=UPLOAD_QUEUE_SIZE)
@@ -141,6 +137,19 @@ class ImageSaveWorker:
             return _sync_executor
 
     @staticmethod
+    def _get_minio():
+        global _minio
+        with _minio_lock:
+            if _minio is None:
+                _minio = Minio(
+                    MINIO_ENDPOINT,
+                    access_key=MINIO_ACCESS_KEY,
+                    secret_key=MINIO_SECRET_KEY,
+                    secure=MINIO_SECURE,
+                )
+            return _minio
+
+    @staticmethod
     def wait_for_pending(timeout=15.0):
         """Wait briefly for queued uploads during shutdown."""
         deadline = time.time() + timeout
@@ -181,6 +190,7 @@ class ImageSaveWorker:
         with _worker_lock:
             if _worker_started:
                 return
+            ImageSaveWorker._get_minio()
             os.makedirs(os.path.dirname(_pending_file), exist_ok=True)
             ImageSaveWorker._load_pending_uploads()
             _stop_event.clear()
@@ -239,7 +249,9 @@ class ImageSaveWorker:
             return False
         log("MINIO", f"Uploading {object_key} ...")
         try:
-            res = _minio.fput_object(MINIO_BUCKET, object_key, fpath, content_type="image/jpeg")
+            res = ImageSaveWorker._get_minio().fput_object(
+                MINIO_BUCKET, object_key, fpath, content_type="image/jpeg",
+            )
             log("MINIO", f"Upload OK — etag={res.etag}")
             return True
         except S3Error as exc:
@@ -274,7 +286,7 @@ class ImageSaveWorker:
         log("MINIO", f"Uploading {object_key} ...")
         try:
             upload_started_at = time.time()
-            res = _minio.put_object(
+            res = ImageSaveWorker._get_minio().put_object(
                 MINIO_BUCKET,
                 object_key,
                 io.BytesIO(data),
@@ -418,7 +430,9 @@ class ImageSaveWorker:
 
         log("MINIO", f"Uploading {object_key} ...")
         try:
-            res = _minio.fput_object(MINIO_BUCKET, object_key, fpath, content_type="image/jpeg")
+            res = ImageSaveWorker._get_minio().fput_object(
+                MINIO_BUCKET, object_key, fpath, content_type="image/jpeg",
+            )
             log("MINIO", f"Upload OK — etag={res.etag}")
             ImageSaveWorker._mark_uploaded(object_key)
         except S3Error as exc:

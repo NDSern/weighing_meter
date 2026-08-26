@@ -16,6 +16,7 @@ import paho.mqtt.client as mqtt
 
 from config import (
     CAPTURE_DIR,
+    DEFAULT_TRANSACTION_TYPE,
     MQTT_HOST,
     MQTT_KEEPALIVE,
     MQTT_PASSWORD,
@@ -30,9 +31,6 @@ from mqtt_service import build_weighbridge_payload
 
 
 MQTT_CLIENT_ID = f"smartport-weighbridge-test-{uuid.uuid4()}"
-
-# Default transaction type
-DEFAULT_TRANSACTION_TYPE = "gate_in"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 PHOTO_SUFFIXES = {

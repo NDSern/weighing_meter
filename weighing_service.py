@@ -75,6 +75,7 @@ from config import (
     SESSION_FRAME_QUEUE_SIZE,
     UNDETECTABLE_DIR,
     WEIGHT_THRESHOLD,
+    validate_runtime_config,
 )
 from services.runtime.lpr_bundle import verify_lpr_bundle
 
@@ -152,6 +153,7 @@ def main():
             return False
 
     try:
+        validate_runtime_config()
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
         os.makedirs(CAPTURE_DIR, exist_ok=True)

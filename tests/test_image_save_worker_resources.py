@@ -87,6 +87,21 @@ class ImageSaveWorkerResourceTests(unittest.TestCase):
         self.assertEqual(self.pending["key"]["next_attempt_at"], 2000)
         self.assertTrue(self.queue.empty())
 
+    def test_minio_client_is_created_lazily_once(self):
+        client = mock.Mock()
+        with mock.patch.object(module, "_minio", None), mock.patch.object(
+            module, "Minio", return_value=client,
+        ) as constructor:
+            self.assertIs(ImageSaveWorker._get_minio(), client)
+            self.assertIs(ImageSaveWorker._get_minio(), client)
+
+        constructor.assert_called_once_with(
+            module.MINIO_ENDPOINT,
+            access_key=module.MINIO_ACCESS_KEY,
+            secret_key=module.MINIO_SECRET_KEY,
+            secure=module.MINIO_SECURE,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

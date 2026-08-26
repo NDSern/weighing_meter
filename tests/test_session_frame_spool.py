@@ -333,6 +333,28 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(restarted.active_dir,
                                                          "interrupted.json")))
 
+    def test_restart_recovers_zero_frame_active_session_as_pending(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, disk_cap_bytes=0)
+            spool.begin_session("interrupted", metadata={
+                "session_id": "interrupted",
+                "started_at": "2026-07-15T00:00:00+00:00",
+                "stable_weight": 9000,
+                "decimal_pos": 0,
+            })
+
+            restarted = self.make_spool(root, disk_cap_bytes=0)
+            processing = restarted.get_pending_job(timeout=0)
+            with open(processing, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+
+            self.assertEqual(manifest["files"], [])
+            self.assertEqual(manifest["metadata"]["stable_weight"], 9000)
+            self.assertTrue(manifest["metadata"]["recovered_after_restart"])
+            self.assertIn("no frames captured", manifest["errors"])
+            self.assertFalse(os.path.exists(os.path.join(restarted.active_dir,
+                                                         "interrupted.json")))
+
     def test_orphans_and_corrupt_manifests_are_quarantined(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root)

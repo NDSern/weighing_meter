@@ -7,7 +7,6 @@ from unittest.mock import Mock
 
 sys.modules.setdefault("serial", Mock())
 sys.modules.setdefault("cv2", Mock())
-sys.modules.setdefault("numpy", Mock())
 sys.modules.setdefault("minio", Mock())
 sys.modules.setdefault("minio.error", Mock())
 
@@ -687,6 +686,34 @@ class SessionWeightTests(unittest.TestCase):
         )
         self.assertEqual(manager.session.rear_capture_source, "promotion")
         self.assertIsNone(manager.session.rear_fallback_deadline)
+
+    def test_spool_admission_failure_does_not_activate_or_clear_attempt(self):
+        spool = Mock()
+        spool.begin_session.side_effect = OSError("disk failed")
+        manager = SessionManager(Mock(), frame_spool=spool)
+        manager.session.stable_weight = 1200
+        manager.session.stability_rule = "exact_5"
+        manager._attempt = {
+            "id": "session-1",
+            "started_at": "2026-07-24T00:00:00+00:00",
+            "max_weight": 1200,
+            "start_frames": {},
+        }
+        log = Mock()
+
+        result = manager._start_session(0, log)
+
+        self.assertFalse(result)
+        self.assertFalse(manager.session.session_active)
+        self.assertFalse(manager.session.spool_active)
+        self.assertEqual(manager._attempt["id"], "session-1")
+        self.assertEqual(manager._generation, 0)
+        self.assertIn("disk failed", manager.fatal_error)
+        spool.abort_session.assert_called_once_with("session-1")
+        self.assertTrue(any(
+            call.args[0] == "METRIC" and '"event":"session_spool_admission_failed"' in call.args[1]
+            for call in log.call_args_list
+        ))
 
     def test_spool_finalize_failure_preserves_session_and_sets_fatal_error(self):
         spool = Mock()

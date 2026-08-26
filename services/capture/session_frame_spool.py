@@ -493,49 +493,44 @@ class SessionFrameSpool:
                 self._unlink_durable(path)
                 continue
             files = self._session_files(session_dir)
-            if files:
-                metadata = active.get("metadata")
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                ended_at = self._now()
-                started_at = metadata.get("started_at") or active.get("started_at")
-                try:
-                    duration_s = max(
-                        0.0,
-                        datetime.fromisoformat(ended_at).timestamp()
-                        - datetime.fromisoformat(started_at).timestamp(),
-                    )
-                except (TypeError, ValueError):
-                    duration_s = 0.0
-                metadata.setdefault("end_reason", "machine_offline")
-                metadata.setdefault("ended_at", ended_at)
-                metadata.setdefault("duration_s", duration_s)
-                metadata["recovered_after_restart"] = True
-                metadata["incomplete"] = True
-                manifest = {
-                    "session_id": session_id,
-                    "session_dir": session_dir,
-                    "started_at": active.get("started_at"),
-                    "ended_at": ended_at,
-                    "files": files,
-                    "frame_metadata": dict(active.get("frame_metadata", {})),
-                    "frame_counts": active.get("counts", {"cam1": 0, "cam3": 0}),
-                    "capture_interval_seconds": active.get("capture_interval_seconds", self._interval),
-                    "metadata": metadata,
-                    "incomplete": True,
-                    "errors": list(active.get("errors", [])) + ["recovered after restart"],
-                }
-                target = os.path.join(self.jobs_dir, self._job_name())
-                self._atomic_json(target, manifest)
-                self._unlink_durable(path)
-                referenced.add(session_dir)
-            else:
-                target = os.path.join(self.orphan_dir, session_id)
-                if os.path.exists(target):
-                    target += "-" + uuid.uuid4().hex
-                if os.path.isdir(session_dir):
-                    os.replace(session_dir, target)
-                self._move_failed(path)
+            metadata = active.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            ended_at = self._now()
+            started_at = metadata.get("started_at") or active.get("started_at")
+            try:
+                duration_s = max(
+                    0.0,
+                    datetime.fromisoformat(ended_at).timestamp()
+                    - datetime.fromisoformat(started_at).timestamp(),
+                )
+            except (TypeError, ValueError):
+                duration_s = 0.0
+            metadata.setdefault("end_reason", "machine_offline")
+            metadata.setdefault("ended_at", ended_at)
+            metadata.setdefault("duration_s", duration_s)
+            metadata["recovered_after_restart"] = True
+            metadata["incomplete"] = True
+            errors = list(active.get("errors", [])) + ["recovered after restart"]
+            if not files:
+                errors.append("no frames captured")
+            manifest = {
+                "session_id": session_id,
+                "session_dir": session_dir,
+                "started_at": active.get("started_at"),
+                "ended_at": ended_at,
+                "files": files,
+                "frame_metadata": dict(active.get("frame_metadata", {})),
+                "frame_counts": active.get("counts", {"cam1": 0, "cam3": 0}),
+                "capture_interval_seconds": active.get("capture_interval_seconds", self._interval),
+                "metadata": metadata,
+                "incomplete": True,
+                "errors": errors,
+            }
+            target = os.path.join(self.jobs_dir, self._job_name())
+            self._atomic_json(target, manifest)
+            self._unlink_durable(path)
+            referenced.add(session_dir)
 
         for name in os.listdir(self.sessions_dir):
             path = os.path.abspath(os.path.join(self.sessions_dir, name))

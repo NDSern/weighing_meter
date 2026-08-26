@@ -4,7 +4,6 @@ from unittest.mock import Mock, patch
 
 sys.modules.setdefault("serial", Mock())
 sys.modules.setdefault("cv2", Mock())
-sys.modules.setdefault("numpy", Mock())
 sys.modules.setdefault("minio", Mock())
 sys.modules.setdefault("minio.error", Mock())
 
@@ -211,6 +210,21 @@ class SessionStrategyTests(unittest.TestCase):
         self.assertEqual(self.manager._generation, generation)
 
         self.feed(self.manager, [6300, 6000, 5700, 5800, 5300, 4800], self.log)
+        self.assertFalse(self.manager.session.session_active)
+
+    def test_plate_loss_can_end_weighted_session_by_host_policy(self):
+        with patch("services.session.session_manager.time.monotonic", return_value=0.0):
+            self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
+            self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
+
+        frame = make_frame(5000)
+        frame.status = "UNSTABLE"
+        with patch(
+            "services.session.session_manager.SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT",
+            False,
+        ), patch("services.session.session_manager.time.monotonic", return_value=1.1):
+            self.manager.on_frame(frame, self.log)
+
         self.assertFalse(self.manager.session.session_active)
 
 

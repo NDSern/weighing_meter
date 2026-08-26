@@ -1,13 +1,14 @@
-import os
 import json
 import sys
 import unittest
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.modules.setdefault("paho", Mock())
-sys.modules.setdefault("paho.mqtt", Mock())
-sys.modules.setdefault("paho.mqtt.client", Mock())
+try:
+    import paho.mqtt.client  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules.setdefault("paho", Mock())
+    sys.modules.setdefault("paho.mqtt", Mock())
+    sys.modules.setdefault("paho.mqtt.client", Mock())
 
 from mqtt_service import MqttService, build_weighbridge_payload, serialize_weighbridge_payload
 
@@ -125,6 +126,68 @@ class MqttPayloadTests(unittest.TestCase):
         _, kwargs = service._client.publish.call_args
         self.assertEqual(kwargs, {"qos": 1, "retain": False})
         self.assertEqual(json.loads(service._client.publish.call_args.args[1])["edge_event_id"], "event-002")
+
+    def test_publish_rejection_returns_false(self):
+        info = Mock(rc=4)
+        service = MqttService.__new__(MqttService)
+        service._client = Mock()
+        service._client.publish.return_value = info
+        service._log = Mock()
+
+        with patch("mqtt_service.mqtt.MQTT_ERR_SUCCESS", 0):
+            result = service.publish_weighbridge_event({
+                "offline_event_id": "event-rejected",
+                "official_plate": "15C-240.84",
+                "stable_weight": 28400,
+            })
+
+        self.assertFalse(result)
+        self.assertIn("rejected rc=4", service._log.call_args.args[1])
+
+    def test_publish_ack_timeout_returns_false(self):
+        info = Mock(rc=0, mid=42)
+        info.is_published.return_value = False
+        service = MqttService.__new__(MqttService)
+        service._client = Mock()
+        service._client.publish.return_value = info
+        service._log = Mock()
+
+        with patch("mqtt_service.mqtt.MQTT_ERR_SUCCESS", 0):
+            result = service.publish_weighbridge_event({
+                "offline_event_id": "event-timeout",
+                "official_plate": "15C-240.84",
+                "stable_weight": 28400,
+            }, wait_for_ack=True, timeout=0.25)
+
+        self.assertFalse(result)
+        info.wait_for_publish.assert_called_once_with(timeout=0.25)
+        self.assertIn("ack timeout", service._log.call_args.args[1])
+
+    def test_publish_exception_returns_false(self):
+        service = MqttService.__new__(MqttService)
+        service._client = Mock()
+        service._client.publish.side_effect = RuntimeError("socket failed")
+        service._log = Mock()
+
+        result = service.publish_weighbridge_event({
+            "offline_event_id": "event-exception",
+            "official_plate": "15C-240.84",
+            "stable_weight": 28400,
+        })
+
+        self.assertFalse(result)
+        self.assertIn("socket failed", service._log.call_args.args[1])
+
+    def test_start_propagates_synchronous_connection_failure(self):
+        service = MqttService.__new__(MqttService)
+        service._client = Mock()
+        service._client.connect_async.side_effect = RuntimeError("bad broker config")
+        service._log = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "bad broker config"):
+            service.start()
+
+        service._client.loop_start.assert_not_called()
 
     def test_legacy_local_end_timestamp_is_normalized(self):
         payload = build_weighbridge_payload({
