@@ -198,7 +198,10 @@ class SessionStrategyTests(unittest.TestCase):
         generation = self.manager._generation
         frame = make_frame(5000)
         frame.status = "UNSTABLE"
-        with patch("services.session.session_manager.time.monotonic", return_value=1.1):
+        with patch(
+            "services.session.session_manager.SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT",
+            True,
+        ), patch("services.session.session_manager.time.monotonic", return_value=1.1):
             self.manager.on_frame(frame, self.log)
 
         self.assertTrue(self.manager.session.session_active)
