@@ -8,7 +8,6 @@ import shutil
 import sqlite3
 import sys
 import subprocess
-from collections import Counter
 from pathlib import Path
 
 
@@ -36,62 +35,74 @@ def parse_args():
     return parser.parse_args()
 
 
-def read_rows(conn):
+def validate_source_schema(conn):
     columns = [row[1] for row in conn.execute("PRAGMA table_info(weight_log)")]
     required = ["id", "timestamp", "weight_kg", "sign", "decimal_pos", "checksum_ok", "status"]
     if columns != required:
         raise RuntimeError(f"Unexpected weight_log schema: {columns}")
-    rows = conn.execute(
-        "SELECT id, timestamp, weight_kg, sign, decimal_pos, checksum_ok, status "
-        "FROM weight_log ORDER BY id"
-    ).fetchall()
-    dates = Counter()
-    for row in rows:
-        if len(row[1]) < 10:
-            raise RuntimeError(f"Invalid weight timestamp for id={row[0]}: {row[1]!r}")
-        dates[row[1][:10]] += 1
-    return rows, dates
 
 
 def migrate(source, destination_dir, source_conn=None):
     if source_conn is None:
         with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as conn:
             return migrate(source, destination_dir, conn)
-    rows, source_counts = read_rows(source_conn)
-    for date_text in source_counts:
-        target = destination_dir / f"{date_text}.db"
-        if target.exists():
-            raise RuntimeError(f"Target already exists: {target}")
+    validate_source_schema(source_conn)
+    cursor = source_conn.execute(
+        "SELECT id, timestamp, weight_kg, sign, decimal_pos, checksum_ok, status "
+        "FROM weight_log ORDER BY substr(timestamp, 1, 10), id"
+    )
+    current_date = target = target_conn = None
+    batch = []
+    source_count = target_count = migrated_count = 0
 
-    for date_text in source_counts:
-        target = destination_dir / f"{date_text}.db"
-        target_rows = [row for row in rows if row[1].startswith(date_text)]
-        with sqlite3.connect(target) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(WEIGHT_LOG_SCHEMA)
-            conn.executemany(
+    def flush():
+        nonlocal batch
+        if batch:
+            target_conn.executemany(
                 "INSERT INTO weight_log "
                 "(id, timestamp, weight_kg, sign, decimal_pos, checksum_ok, status) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                target_rows,
+                batch,
             )
-            conn.commit()
-            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-            count, low, high = conn.execute(
-                "SELECT count(*), min(timestamp), max(timestamp) FROM weight_log"
-            ).fetchone()
-            source_low = min(row[1] for row in target_rows)
-            source_high = max(row[1] for row in target_rows)
-            if integrity != "ok" or count != len(target_rows) or low != source_low or high != source_high:
-                raise RuntimeError(f"Validation failed for {target}")
+            batch = []
 
-    target_counts = Counter()
-    for target in destination_dir.glob("????-??-??.db"):
-        with sqlite3.connect(target) as conn:
-            count = conn.execute("SELECT count(*) FROM weight_log").fetchone()[0]
-        target_counts[target.stem] = count
-    if target_counts != source_counts:
-        raise RuntimeError(f"Row count mismatch source={source_counts} target={target_counts}")
+    def close_target():
+        nonlocal target_conn, target_count, migrated_count
+        if target_conn is None:
+            return
+        flush()
+        target_conn.commit()
+        integrity = target_conn.execute("PRAGMA integrity_check").fetchone()[0]
+        count = target_conn.execute("SELECT count(*) FROM weight_log").fetchone()[0]
+        target_conn.close()
+        if integrity != "ok" or count != target_count:
+            raise RuntimeError(f"Validation failed for {target}")
+        migrated_count += count
+        target_conn = None
+
+    for row in cursor:
+        date_text = row[1][:10]
+        if len(date_text) != 10:
+            raise RuntimeError(f"Invalid weight timestamp for id={row[0]}: {row[1]!r}")
+        if date_text != current_date:
+            close_target()
+            current_date = date_text
+            target = destination_dir / f"{date_text}.db"
+            if target.exists():
+                raise RuntimeError(f"Target already exists: {target}")
+            target_conn = sqlite3.connect(target)
+            target_conn.execute("PRAGMA journal_mode=WAL")
+            target_conn.execute(WEIGHT_LOG_SCHEMA)
+            target_count = 0
+        batch.append(row)
+        source_count += 1
+        target_count += 1
+        if len(batch) >= 10000:
+            flush()
+    close_target()
+
+    if migrated_count != source_count:
+        raise RuntimeError(f"Row count mismatch source={source_count} target={migrated_count}")
 
 
 def require_exclusive_source(source):
