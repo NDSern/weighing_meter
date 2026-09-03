@@ -157,9 +157,6 @@ def main():
                     raise RuntimeError("Stop the service before migrating scale_data.db")
                 conn.execute("BEGIN EXCLUSIVE")
                 migrate(source, destination_dir, conn, created_targets)
-            require_exclusive_source(source)
-            if any(Path(str(source) + suffix).exists() for suffix in ("-wal", "-shm")):
-                raise RuntimeError("Stop the service before archiving scale_data.db")
             shutil.move(source, archive)
             for suffix in ("-wal", "-shm"):
                 Path(str(source) + suffix).unlink(missing_ok=True)
