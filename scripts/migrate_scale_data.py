@@ -60,9 +60,9 @@ def migrate(source, destination_dir, source_conn=None, created_targets=None):
         if batch:
             target_conn.executemany(
                 "INSERT INTO weight_log "
-                "(id, timestamp, weight_kg, sign, decimal_pos, checksum_ok, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                batch,
+                "(timestamp, weight_kg, sign, decimal_pos, checksum_ok, status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [row[1:] for row in batch],
             )
             batch = []
 

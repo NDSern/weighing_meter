@@ -46,9 +46,9 @@ class ScaleDataMigrationTests(unittest.TestCase):
             migration.migrate(source, destination)
 
             with sqlite3.connect(destination / "2026-07-14.db") as conn:
-                self.assertEqual(conn.execute("SELECT id, weight_kg FROM weight_log").fetchall(), [(1, 100.0)])
+                self.assertEqual(conn.execute("SELECT weight_kg FROM weight_log").fetchall(), [(100.0,)])
             with sqlite3.connect(destination / "2026-07-15.db") as conn:
-                self.assertEqual(conn.execute("SELECT id, weight_kg FROM weight_log ORDER BY id").fetchall(), [(2, 200.0), (3, 300.0)])
+                self.assertEqual(conn.execute("SELECT weight_kg FROM weight_log ORDER BY timestamp").fetchall(), [(300.0,), (200.0,)])
 
     def test_merges_rows_into_existing_daily_database(self):
         with tempfile.TemporaryDirectory() as root:
