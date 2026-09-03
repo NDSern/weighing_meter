@@ -121,6 +121,7 @@ Runtime data is intentionally untracked:
 ```text
 /storage/
 /logs/
+/scale_data/
 /captures/
 *.db
 *.db-shm
@@ -130,13 +131,25 @@ Runtime data is intentionally untracked:
 Important runtime files:
 
 ```text
-scale_data.db                         scale readings
+logs/YYYY-MM-DD/weighing_service.log  service logs (60-day retention)
+scale_data/YYYY-MM-DD.db              daily scale readings (365-day retention)
+scale_data/scale_data.archive.db      legacy root database after migration
 confirmed_license_plates.db           confirmed plate counts
 storage/upload_pending.jsonl          MinIO upload retry queue
 storage/publish_pending.jsonl         MQTT publish retry queue
 storage/weighbridge/YYYY/MM/DD/       evidence images
 storage/undetectable/                 unknown plate evidence
 ```
+
+After deploying daily scale storage, stop the service and migrate its legacy root database once:
+
+```bash
+sudo systemctl stop weighing_service.service
+python3 scripts/migrate_scale_data.py
+sudo systemctl start weighing_service.service
+```
+
+The script partitions readings by local date, validates each daily database, then moves the verified source to `scale_data/scale_data.archive.db`.
 
 ## Plate Confirmation
 

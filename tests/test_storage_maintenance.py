@@ -21,16 +21,16 @@ class DeadLetterTests(unittest.TestCase):
 class StorageMaintenanceTests(unittest.TestCase):
     def test_removes_only_matching_expired_files(self):
         with tempfile.TemporaryDirectory() as root:
-            old_log = os.path.join(root, "weighing_service_2026-01-01.log")
-            recent_log = os.path.join(root, "weighing_service_2026-07-13.log")
+            now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
+            old_dir = os.path.join(root, "2026-05-13")
+            recent_dir = os.path.join(root, "2026-07-13")
+            os.makedirs(old_dir)
+            os.makedirs(recent_dir)
+            old_log = os.path.join(old_dir, "weighing_service.log")
+            recent_log = os.path.join(recent_dir, "weighing_service.log")
             unrelated = os.path.join(root, "other.log")
             for path in (old_log, recent_log, unrelated):
                 open(path, "w").close()
-            now = time.time()
-            os.utime(old_log, (now - 61 * 86400, now - 61 * 86400))
-            os.utime(recent_log, (now - 1 * 86400, now - 1 * 86400))
-            os.utime(unrelated, (now - 365 * 86400, now - 365 * 86400))
-
             with patch("services.storage.retention_cleaner.LOG_DIR", root):
                 result = StorageMaintenance(86400).run_once(now=now)
 
@@ -38,6 +38,37 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(old_log))
             self.assertTrue(os.path.exists(recent_log))
             self.assertTrue(os.path.exists(unrelated))
+
+    def test_scale_retention_keeps_archive_and_removes_sidecars(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name in (
+                "2025-07-13.db", "2025-07-13.db-wal", "2025-07-13.db-shm",
+                "2026-07-13.db", "scale_data.archive.db",
+            ):
+                open(os.path.join(root, name), "w").close()
+            now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
+
+            with patch("services.storage.retention_cleaner.SCALE_DATA_DIR", root):
+                result = StorageMaintenance(86400).run_once(now=now)
+
+            self.assertEqual(result["scale_databases_deleted"], 3)
+            self.assertTrue(os.path.exists(os.path.join(root, "2026-07-13.db")))
+            self.assertTrue(os.path.exists(os.path.join(root, "scale_data.archive.db")))
+
+    def test_retention_removes_cutoff_date(self):
+        with tempfile.TemporaryDirectory() as logs, tempfile.TemporaryDirectory() as scale_data:
+            os.makedirs(os.path.join(logs, "2026-05-15"))
+            open(os.path.join(logs, "2026-05-15", "weighing_service.log"), "w").close()
+            open(os.path.join(scale_data, "2025-07-14.db"), "w").close()
+            now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
+
+            with patch("services.storage.retention_cleaner.LOG_DIR", logs), patch(
+                "services.storage.retention_cleaner.SCALE_DATA_DIR", scale_data,
+            ):
+                result = StorageMaintenance(86400).run_once(now=now)
+
+            self.assertEqual(result["logs_deleted"], 1)
+            self.assertEqual(result["scale_databases_deleted"], 1)
 
     def test_diagnostic_path_date_removes_images_and_metadata_after_30_days(self):
         with tempfile.TemporaryDirectory() as root:

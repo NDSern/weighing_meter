@@ -73,6 +73,7 @@ from config import (
     SESSION_FRAME_JPEG_QUALITY,
     SESSION_FRAME_MIN_FREE_BYTES,
     SESSION_FRAME_QUEUE_SIZE,
+    SCALE_DATA_DIR,
     UNDETECTABLE_DIR,
     WEIGHT_THRESHOLD,
     validate_runtime_config,
@@ -209,7 +210,7 @@ def main():
         reader = D2008Reader(
             port=SERIAL_PORT,
             baud=BAUD_RATE,
-            db_file=os.path.join(SERVICE_DIR, "scale_data.db"),
+            db_file=SCALE_DATA_DIR,
             log_interval=0.2,
         )
         storage_maintenance = StorageMaintenance(IMAGE_RETENTION_CHECK_INTERVAL_SECONDS, log_fn=log)

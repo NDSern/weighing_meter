@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import threading
 import time
@@ -36,6 +37,18 @@ class AsyncLoggingTests(unittest.TestCase):
             record = logger._queue.get_nowait()
 
             self.assertIn("[>>> SENT <<<] plate=14C-017.80", record[1][0])
+
+    def test_writes_logs_inside_date_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logger = AsyncLogger(directory, "test", stdout=io.StringIO())
+            logger._ensure_thread = lambda: None
+            now = unittest.mock.Mock()
+            now.strftime.return_value = "2026-07-14"
+
+            self.assertEqual(
+                logger._path_for_date("2026-07-14"),
+                os.path.join(directory, "2026-07-14", "test.log"),
+            )
 
     def test_full_queue_drops_oldest_record(self):
         with tempfile.TemporaryDirectory() as directory:

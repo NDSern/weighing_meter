@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import sys
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
@@ -112,6 +113,28 @@ class WeightStabilityTests(unittest.TestCase):
             timestamps = [row[0] for row in self.reader._db._conn.execute("SELECT timestamp FROM weight_log")]
 
         self.assertEqual(timestamps, [recent])
+
+    def test_scale_database_rotates_to_frame_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reader = D2008Reader(db_file=directory)
+            try:
+                first = make_frame(100)
+                first.timestamp = datetime(2026, 7, 14, 23, 59, 59)
+                second = make_frame(200)
+                second.timestamp = datetime(2026, 7, 15, 0, 0, 1)
+
+                reader._db.save(first)
+                reader._db.save(second)
+
+                for date_text, expected_weight in (("2026-07-14", 100), ("2026-07-15", 200)):
+                    path = os.path.join(directory, f"{date_text}.db")
+                    self.assertTrue(os.path.exists(path))
+                    with sqlite3.connect(path) as conn:
+                        self.assertEqual(conn.execute(
+                            "SELECT weight_kg FROM weight_log"
+                        ).fetchone()[0], expected_weight)
+            finally:
+                reader._db.close()
 
     def test_maintenance_failure_does_not_fail_weight_save(self):
         frame = make_frame(39120)

@@ -18,6 +18,7 @@ RECONNECT_DELAY = 5
 LOG_DIR = os.path.join(SERVICE_DIR, "logs")
 LOG_FILE_PREFIX = "weighing_service"
 LOG_FILE_PATH = os.path.join(LOG_DIR, f"{LOG_FILE_PREFIX}.log")
+SCALE_DATA_DIR = os.path.join(SERVICE_DIR, "scale_data")
 CAPTURE_DIR = os.path.join(SERVICE_DIR, "storage", "weighbridge")
 UNDETECTABLE_DIR = os.path.join(SERVICE_DIR, "storage", "undetectable")
 NO_STABLE_DIR = os.path.join(SERVICE_DIR, "storage", "no-stable")

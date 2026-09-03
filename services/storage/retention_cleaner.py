@@ -12,6 +12,8 @@ from config import (
     LOG_DIR,
     LOG_FILE_PREFIX,
     LOG_RETENTION_DAYS,
+    SCALE_DATA_DIR,
+    SCALE_DATA_RETENTION_DAYS,
     MQTT_DEAD_LETTER_RETENTION_DAYS,
     SERVICE_DIR,
 )
@@ -287,15 +289,62 @@ class StorageMaintenance:
                 continue
         return deleted
 
+    @staticmethod
+    def _dated_name(name):
+        try:
+            return datetime.strptime(name, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    def _remove_expired_logs(self, now):
+        cutoff = datetime.fromtimestamp(now - LOG_RETENTION_DAYS * 86400).date()
+        deleted = directories_deleted = 0
+        if not os.path.isdir(LOG_DIR):
+            return deleted, directories_deleted
+        for name in os.listdir(LOG_DIR):
+            path = os.path.join(LOG_DIR, name)
+            if os.path.islink(path) or not os.path.isdir(path):
+                continue
+            date_value = self._dated_name(name)
+            if date_value is None or date_value > cutoff:
+                continue
+            log_path = os.path.join(path, f"{LOG_FILE_PREFIX}.log")
+            try:
+                if os.path.isfile(log_path) and not os.path.islink(log_path):
+                    os.remove(log_path)
+                    deleted += 1
+                if not os.listdir(path):
+                    os.rmdir(path)
+                    directories_deleted += 1
+            except OSError:
+                continue
+        return deleted, directories_deleted
+
+    def _remove_expired_scale_databases(self, now):
+        cutoff = datetime.fromtimestamp(now - SCALE_DATA_RETENTION_DAYS * 86400).date()
+        deleted = 0
+        if not os.path.isdir(SCALE_DATA_DIR):
+            return deleted
+        for name in os.listdir(SCALE_DATA_DIR):
+            match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.db(?:-(?:wal|shm))?", name)
+            if not match:
+                continue
+            date_value = self._dated_name(match.group(1))
+            if date_value is None or date_value > cutoff:
+                continue
+            path = os.path.join(SCALE_DATA_DIR, name)
+            try:
+                if os.path.isfile(path) and not os.path.islink(path):
+                    os.remove(path)
+                    deleted += 1
+            except OSError:
+                continue
+        return deleted
+
     def run_once(self, now=None):
         now = time.time() if now is None else now
-        current_log = f"{LOG_FILE_PREFIX}_{datetime.fromtimestamp(now):%Y-%m-%d}.log"
-        log_deleted = self._remove_older_than(
-            LOG_DIR,
-            LOG_RETENTION_DAYS,
-            lambda name: name.startswith(f"{LOG_FILE_PREFIX}_") and name.endswith(".log") and name != current_log,
-            now,
-        )
+        log_deleted, log_directories_deleted = self._remove_expired_logs(now)
+        scale_databases_deleted = self._remove_expired_scale_databases(now)
         dead_letter_dir = os.path.join(SERVICE_DIR, "storage", "dead-letter")
         mqtt_deleted = self._remove_older_than(
             dead_letter_dir,
@@ -312,6 +361,14 @@ class StorageMaintenance:
         self._log(
             "INFO",
             f"Storage maintenance complete: logs_deleted={log_deleted} "
+            f"log_directories_deleted={log_directories_deleted} "
+            f"scale_databases_deleted={scale_databases_deleted} "
             f"mqtt_dead_letters_deleted={mqtt_deleted} image_dead_letters_deleted={image_deleted}",
         )
-        return {"logs_deleted": log_deleted, "mqtt_deleted": mqtt_deleted, "image_deleted": image_deleted}
+        return {
+            "logs_deleted": log_deleted,
+            "log_directories_deleted": log_directories_deleted,
+            "scale_databases_deleted": scale_databases_deleted,
+            "mqtt_deleted": mqtt_deleted,
+            "image_deleted": image_deleted,
+        }

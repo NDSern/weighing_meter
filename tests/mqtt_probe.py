@@ -24,6 +24,7 @@ from config import (
     MQTT_QOS,
     MQTT_TOPIC,
     MQTT_USERNAME,
+    SCALE_DATA_DIR,
     SERVICE_DIR,
     WEIGHT_THRESHOLD,
 )
@@ -61,7 +62,11 @@ def parse_args():
         default=DEFAULT_TRANSACTION_TYPE,
         help=f"MQTT transaction type. Default: {DEFAULT_TRANSACTION_TYPE}.",
     )
-    parser.add_argument("--db", default=os.path.join(SERVICE_DIR, "scale_data.db"), help="SQLite DB path.")
+    parser.add_argument(
+        "--db",
+        default=os.path.join(SCALE_DATA_DIR, f"{datetime.now():%Y-%m-%d}.db"),
+        help="SQLite DB path (defaults to today's daily database).",
+    )
     parser.add_argument("--capture-dir", default=CAPTURE_DIR, help="Image storage root.")
     parser.add_argument("--connect-timeout", type=float, default=10.0, help="Seconds to wait for MQTT connection.")
     return parser.parse_args()

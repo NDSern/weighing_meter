@@ -21,7 +21,7 @@ class AsyncLogger:
         self._closing = False
 
     def _path_for_date(self, date_text):
-        return os.path.join(self.log_dir, f"{self.file_prefix}_{date_text}.log")
+        return os.path.join(self.log_dir, date_text, f"{self.file_prefix}.log")
 
     def _ensure_file(self, now):
         date_text = now.strftime("%Y-%m-%d")
@@ -29,8 +29,9 @@ class AsyncLogger:
             return self._file
         if self._file is not None:
             self._file.close()
-        os.makedirs(self.log_dir, exist_ok=True)
-        self._file = open(self._path_for_date(date_text), "a", buffering=1)
+        path = self._path_for_date(date_text)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._file = open(path, "a", buffering=1)
         self._date = date_text
         return self._file
 

@@ -15,6 +15,8 @@ Cấu hình trên cân D2008:
 """
 
 import serial
+import fcntl
+import os
 import time
 import sqlite3
 import threading
@@ -36,7 +38,7 @@ from config import (
 # ─────────────────────────────────────────────
 SERIAL_PORT   = "/dev/ttyS6"       # Windows: "COM3", Linux: "/dev/ttyUSB0"
 BAUD_RATE     = 9600
-DB_FILE       = "scale_data.db"
+DB_FILE       = "scale_data"
 SERIAL_DUMP_FILE = None
 LOG_INTERVAL  = 0.2          # Persist at the scale's nominal 5 Hz frame rate
 
@@ -191,35 +193,74 @@ class ScaleDatabase:
     """Lưu dữ liệu cân vào SQLite."""
 
     def __init__(self, db_file: str):
-        self.db_file = db_file
+        self.db_file = None
+        self.db_dir = None if db_file.endswith(".db") else db_file
+        self._fixed_db_file = db_file if self.db_dir is None else None
+        self._lock_file = None
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self._conn = None
+        self._date = None
         self._last_retention = 0.0
         self._last_passive_checkpoint = 0.0
         self._last_truncate_checkpoint = 0.0
         self.last_maintenance_error = None
+        if self.db_dir:
+            os.makedirs(self.db_dir, exist_ok=True)
+            self._lock_file = open(os.path.join(self.db_dir, ".scale_data.lock"), "a")
+            fcntl.flock(self._lock_file, fcntl.LOCK_SH)
+        if self._fixed_db_file:
+            self._open(self._fixed_db_file)
+
+    @staticmethod
+    def path_for_date(db_dir, value):
+        return os.path.join(db_dir, f"{value:%Y-%m-%d}.db")
+
+    def _open(self, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.db_file = path
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._date = None if self._fixed_db_file else os.path.basename(path)[:-3]
         self._init_db()
 
+    def _close_current_locked(self):
+        if self._conn is None:
+            return
+        self._conn.commit()
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._conn.close()
+        self._conn = None
+
+    def _ensure_date_locked(self, timestamp):
+        if self._fixed_db_file:
+            return
+        date_text = timestamp.strftime("%Y-%m-%d")
+        if self._conn is not None and self._date == date_text:
+            return
+        self._close_current_locked()
+        self._last_passive_checkpoint = 0.0
+        self._last_truncate_checkpoint = 0.0
+        self._open(self.path_for_date(self.db_dir, timestamp))
+
     def _init_db(self):
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("""
-                CREATE TABLE IF NOT EXISTS weight_log (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp   TEXT    NOT NULL,
-                    weight_kg   REAL    NOT NULL,
-                    sign        TEXT    NOT NULL,
-                    decimal_pos INTEGER NOT NULL,
-                    checksum_ok INTEGER NOT NULL,
-                    status      TEXT    NOT NULL DEFAULT 'UNSTABLE'
-                )
-            """)
-            self._conn.commit()
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS weight_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT    NOT NULL,
+                weight_kg   REAL    NOT NULL,
+                sign        TEXT    NOT NULL,
+                decimal_pos INTEGER NOT NULL,
+                checksum_ok INTEGER NOT NULL,
+                status      TEXT    NOT NULL DEFAULT 'UNSTABLE'
+            )
+        """)
+        self._conn.commit()
         print(f"[DB] Database sẵn sàng: {self.db_file}")
 
     def save(self, frame: WeightFrame):
         with self._lock:
+            self._ensure_date_locked(frame.timestamp)
             self._conn.execute("""
                 INSERT INTO weight_log
                     (timestamp, weight_kg, sign, decimal_pos, checksum_ok, status)
@@ -273,6 +314,8 @@ class ScaleDatabase:
 
     def get_recent(self, limit: int = 20) -> list[dict]:
         with self._lock:
+            if self._conn is None:
+                return []
             old_row_factory = self._conn.row_factory
             self._conn.row_factory = sqlite3.Row
             rows = self._conn.execute("""
@@ -284,9 +327,11 @@ class ScaleDatabase:
 
     def close(self):
         with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
+            self._close_current_locked()
+            if self._lock_file is not None:
+                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+                self._lock_file.close()
+                self._lock_file = None
 
 
 class D2008Reader:
