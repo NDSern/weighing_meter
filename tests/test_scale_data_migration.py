@@ -50,15 +50,23 @@ class ScaleDataMigrationTests(unittest.TestCase):
             with sqlite3.connect(destination / "2026-07-15.db") as conn:
                 self.assertEqual(conn.execute("SELECT id, weight_kg FROM weight_log ORDER BY id").fetchall(), [(2, 200.0), (3, 300.0)])
 
-    def test_rejects_existing_daily_database(self):
+    def test_merges_rows_into_existing_daily_database(self):
         with tempfile.TemporaryDirectory() as root:
             source = self.make_legacy_database(root)
             destination = Path(root) / "scale_data"
             destination.mkdir()
-            (destination / "2026-07-14.db").touch()
+            target = destination / "2026-07-14.db"
+            with sqlite3.connect(target) as conn:
+                conn.execute(migration.WEIGHT_LOG_SCHEMA)
+                conn.execute(
+                    "INSERT INTO weight_log (id, timestamp, weight_kg, sign, decimal_pos, checksum_ok, status) "
+                    "VALUES (99, '2026-07-14T00:00:01', 400, '+', 0, 1, 'STABLE')"
+                )
 
-            with self.assertRaisesRegex(RuntimeError, "Target already exists"):
-                migration.migrate(source, destination)
+            migration.migrate(source, destination)
+
+            with sqlite3.connect(target) as conn:
+                self.assertEqual(conn.execute("SELECT count(*) FROM weight_log").fetchone()[0], 2)
 
     def test_rejects_database_owned_by_another_process(self):
         result = mock.Mock(returncode=0)

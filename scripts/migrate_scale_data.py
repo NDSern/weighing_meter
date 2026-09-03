@@ -42,10 +42,10 @@ def validate_source_schema(conn):
         raise RuntimeError(f"Unexpected weight_log schema: {columns}")
 
 
-def migrate(source, destination_dir, source_conn=None):
+def migrate(source, destination_dir, source_conn=None, created_targets=None):
     if source_conn is None:
         with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as conn:
-            return migrate(source, destination_dir, conn)
+            return migrate(source, destination_dir, conn, created_targets)
     validate_source_schema(source_conn)
     cursor = source_conn.execute(
         "SELECT id, timestamp, weight_kg, sign, decimal_pos, checksum_ok, status "
@@ -53,7 +53,7 @@ def migrate(source, destination_dir, source_conn=None):
     )
     current_date = target = target_conn = None
     batch = []
-    source_count = target_count = migrated_count = 0
+    source_count = target_count = migrated_count = existing_count = target_base_count = 0
 
     def flush():
         nonlocal batch
@@ -67,7 +67,7 @@ def migrate(source, destination_dir, source_conn=None):
             batch = []
 
     def close_target():
-        nonlocal target_conn, target_count, migrated_count
+        nonlocal target_conn, target_count, migrated_count, target_base_count
         if target_conn is None:
             return
         flush()
@@ -75,7 +75,7 @@ def migrate(source, destination_dir, source_conn=None):
         integrity = target_conn.execute("PRAGMA integrity_check").fetchone()[0]
         count = target_conn.execute("SELECT count(*) FROM weight_log").fetchone()[0]
         target_conn.close()
-        if integrity != "ok" or count != target_count:
+        if integrity != "ok" or count != target_base_count + target_count:
             raise RuntimeError(f"Validation failed for {target}")
         migrated_count += count
         target_conn = None
@@ -88,11 +88,13 @@ def migrate(source, destination_dir, source_conn=None):
             close_target()
             current_date = date_text
             target = destination_dir / f"{date_text}.db"
-            if target.exists():
-                raise RuntimeError(f"Target already exists: {target}")
             target_conn = sqlite3.connect(target)
             target_conn.execute("PRAGMA journal_mode=WAL")
             target_conn.execute(WEIGHT_LOG_SCHEMA)
+            target_base_count = target_conn.execute("SELECT count(*) FROM weight_log").fetchone()[0]
+            existing_count += target_base_count
+            if target_base_count == 0 and created_targets is not None:
+                created_targets.add(target)
             target_count = 0
         batch.append(row)
         source_count += 1
@@ -101,8 +103,10 @@ def migrate(source, destination_dir, source_conn=None):
             flush()
     close_target()
 
-    if migrated_count != source_count:
-        raise RuntimeError(f"Row count mismatch source={source_count} target={migrated_count}")
+    if migrated_count != source_count + existing_count:
+        raise RuntimeError(
+            f"Row count mismatch source={source_count} existing={existing_count} target={migrated_count}"
+        )
 
 
 def require_exclusive_source(source):
@@ -142,10 +146,8 @@ def main():
         raise SystemExit(f"Archive already exists: {archive}")
 
     destination_dir.mkdir(exist_ok=True)
-    existing = list(destination_dir.glob("????-??-??.db*"))
-    if existing:
-        raise SystemExit(f"Daily scale databases already exist: {existing[0]}")
     lock = acquire_migration_lock(destination_dir)
+    created_targets = set()
     try:
         try:
             require_exclusive_source(source)
@@ -154,7 +156,7 @@ def main():
                 if conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:
                     raise RuntimeError("Stop the service before migrating scale_data.db")
                 conn.execute("BEGIN EXCLUSIVE")
-                migrate(source, destination_dir, conn)
+                migrate(source, destination_dir, conn, created_targets)
             require_exclusive_source(source)
             if any(Path(str(source) + suffix).exists() for suffix in ("-wal", "-shm")):
                 raise RuntimeError("Stop the service before archiving scale_data.db")
@@ -162,8 +164,9 @@ def main():
             for suffix in ("-wal", "-shm"):
                 Path(str(source) + suffix).unlink(missing_ok=True)
         except Exception:
-            for path in destination_dir.glob("????-??-??.db*"):
-                path.unlink(missing_ok=True)
+            for target in created_targets:
+                for suffix in ("", "-wal", "-shm"):
+                    Path(str(target) + suffix).unlink(missing_ok=True)
             raise
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
