@@ -80,7 +80,9 @@ def migrate(source, destination_dir, source_conn=None):
             count, low, high = conn.execute(
                 "SELECT count(*), min(timestamp), max(timestamp) FROM weight_log"
             ).fetchone()
-            if integrity != "ok" or count != len(target_rows) or low != target_rows[0][1] or high != target_rows[-1][1]:
+            source_low = min(row[1] for row in target_rows)
+            source_high = max(row[1] for row in target_rows)
+            if integrity != "ok" or count != len(target_rows) or low != source_low or high != source_high:
                 raise RuntimeError(f"Validation failed for {target}")
 
     target_counts = Counter()
