@@ -100,6 +100,7 @@ class ImageSaveWorkerResourceTests(unittest.TestCase):
             access_key=module.MINIO_ACCESS_KEY,
             secret_key=module.MINIO_SECRET_KEY,
             secure=module.MINIO_SECURE,
+            region=module.MINIO_REGION,
         )
 
 

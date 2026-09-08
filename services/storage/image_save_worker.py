@@ -17,6 +17,7 @@ from config import (
     MINIO_ACCESS_KEY,
     MINIO_BUCKET,
     MINIO_ENDPOINT,
+    MINIO_REGION,
     MINIO_SECRET_KEY,
     MINIO_SECURE,
     PENDING_RETENTION_DAYS,
@@ -146,6 +147,7 @@ class ImageSaveWorker:
                     access_key=MINIO_ACCESS_KEY,
                     secret_key=MINIO_SECRET_KEY,
                     secure=MINIO_SECURE,
+                    region=MINIO_REGION,
                 )
             return _minio
 
