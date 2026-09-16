@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 import sys
@@ -269,6 +270,505 @@ class SessionWeightTests(unittest.TestCase):
             frames[-2].timestamp.isoformat(timespec="milliseconds"),
         )
 
+    def test_local_peak_confirms_after_dwell_and_ignores_later_rise(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        started = datetime(2026, 7, 24, tzinfo=timezone.utc)
+        weights = [1000, 20000, 20000, 20000, 20000, 20000, 20000, 45000]
+
+        for index, weight in enumerate(weights):
+            frame = self.stable_frame(weight)
+            frame.timestamp = started + timedelta(seconds=index * 0.5)
+            manager.on_frame(frame, Mock())
+
+        self.assertTrue(manager._session_local_peak_confirmed)
+        self.assertEqual(manager._session_local_peak, 20000)
+        self.assertEqual(
+            manager._session_local_peak_observed_at,
+            (started + timedelta(seconds=0.5)).isoformat(timespec="milliseconds"),
+        )
+
+    def test_local_peak_confirms_on_weight_drop(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        started = datetime(2026, 7, 24, tzinfo=timezone.utc)
+
+        for index, weight in enumerate([30000, 29000]):
+            frame = self.stable_frame(weight)
+            frame.timestamp = started + timedelta(seconds=index * 0.2)
+            manager.on_frame(frame, Mock())
+
+        self.assertTrue(manager._session_local_peak_confirmed)
+        self.assertEqual(manager._session_local_peak, 30000)
+        self.assertEqual(
+            manager._session_local_peak_observed_at,
+            started.isoformat(timespec="milliseconds"),
+        )
+
+    def test_unknown_lpr_photos_do_not_fall_back_after_session_start(self):
+        metadata = {
+            "session_id": "local-peak",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:20+00:00",
+            "weight_observed_at": "2026-07-21T00:00:18+00:00",
+            "local_peak_observed_at": "2026-07-21T00:00:05+00:00",
+            "weight_source": "stable",
+            "session_dir": "/spool/session",
+            "unknown_snapshot_paths": {},
+            "session_files": [
+                "cam1-000001-sample.jpg", "cam1-000002-sample.jpg",
+                "cam2-000001-sample.jpg",
+            ],
+            "capture_interval_seconds": 0.2,
+        }
+        frame_metadata = {
+            "cam1-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:01.800+00:00", "frame_id": 10},
+            "cam1-000002-sample.jpg": {"captured_at": "2026-07-21T00:00:02.100+00:00", "frame_id": 11},
+            "cam2-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:17.900+00:00", "frame_id": 20},
+        }
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", return_value="later-frame", create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, Mock(),
+            )
+
+        self.assertEqual(selected, {})
+        self.assertEqual(captured_at, {})
+
+    def test_unknown_photos_use_only_available_session_start_frames(self):
+        metadata = {
+            "session_id": "weighted",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:09+00:00",
+            "session_dir": "/spool/session",
+            "session_files": ["cam1-000000-start.jpg"],
+            "unknown_snapshot_paths": {"cam1": "/spool/cam1-2s.jpg", "cam2": "/spool/cam2-2s.jpg"},
+            "unknown_snapshot_captured_at": {
+                "cam1": "2026-07-21T00:00:02.030+00:00",
+                "cam2": "2026-07-21T00:00:02.040+00:00",
+            },
+            "unknown_weight_snapshot_paths": {"cam1": "/spool/cam1-weight.jpg"},
+            "unknown_weight_snapshot_captured_at": {"cam1": "2026-07-21T00:00:01.030+00:00"},
+        }
+
+        frame_metadata = {
+            "cam1-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00.010+00:00", "frame_id": 1,
+            },
+        }
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: {
+                "/spool/session/cam1-000000-start.jpg": "cam1-start",
+                "/spool/cam1-2s.jpg": "cam1-2s",
+                "/spool/cam2-2s.jpg": "cam2-2s",
+            }.get(path),
+            create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, Mock(),
+            )
+
+        self.assertEqual(selected, {"cam1": "cam1-start"})
+        self.assertEqual(captured_at, {"cam1": "2026-07-21T00:00:00.010+00:00"})
+
+    def test_unknown_photos_choose_session_start_over_synchronized_weight_set(self):
+        metadata = {
+            "session_id": "synchronized-weight",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:09+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000000-start.jpg",
+                "cam2-000000-start.jpg",
+                "cam3-000000-start.jpg",
+                "cam1-000005-sample.jpg",
+                "cam2-000005-sample.jpg",
+                "cam3-000005-sample.jpg",
+            ],
+            "unknown_snapshot_paths": {},
+            "unknown_weight_snapshot_triggered_at": "2026-07-21T00:00:01+00:00",
+            "unknown_weight_snapshot_paths": {
+                "cam1": "/spool/cam1-weight.jpg",
+                "cam2": "/spool/cam2-weight.jpg",
+                "cam3": "/spool/cam3-weight.jpg",
+            },
+            "unknown_weight_snapshot_captured_at": {
+                "cam1": "2026-07-21T00:00:01.100+00:00",
+                "cam2": "2026-07-21T00:00:02.500+00:00",
+                "cam3": "2026-07-21T00:00:01.120+00:00",
+            },
+        }
+        frame_metadata = {
+            "cam1-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00.010+00:00", "frame_id": 1,
+            },
+            "cam2-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00.030+00:00", "frame_id": 2,
+            },
+            "cam3-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00.020+00:00", "frame_id": 3,
+            },
+            "cam1-000005-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:01.090+00:00", "frame_id": 10,
+            },
+            "cam2-000005-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:01.130+00:00", "frame_id": 20,
+            },
+            "cam3-000005-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:01.110+00:00", "frame_id": 30,
+            },
+        }
+        frames = {
+            "/spool/session/cam1-000000-start.jpg": "cam1",
+            "/spool/session/cam2-000000-start.jpg": "cam2",
+            "/spool/session/cam3-000000-start.jpg": "cam3",
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", side_effect=frames.get, create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn,
+            )
+
+        self.assertEqual(selected, {"cam1": "cam1", "cam2": "cam2", "cam3": "cam3"})
+        self.assertEqual(captured_at["cam2"], "2026-07-21T00:00:00.030+00:00")
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["lpr_target_source"], "session_start")
+        self.assertEqual(metric["synchronized_gap_ms"], 20)
+        self.assertTrue(all(
+            item["source"] == "session_start" for item in metric["selected"].values()
+        ))
+
+    def test_unknown_ocr_photos_anchor_to_first_plate_detection(self):
+        metadata = {
+            "session_id": "unknown-ocr",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000004-sample.jpg",
+                "cam2-000004-sample.jpg",
+                "cam3-000004-sample.jpg",
+            ],
+            "lpr_diagnostics": {
+                "detected_regions": 1,
+                "evidence": {
+                    "cam1": {"plate_detected": "cam1-000004-sample.jpg"},
+                },
+            },
+        }
+        frame_metadata = {
+            "cam1-000004-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:00.800+00:00", "frame_id": 4,
+                "tracks": [{"bbox": [1, 2, 3, 4]}],
+            },
+            "cam2-000004-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:00.820+00:00", "frame_id": 4,
+            },
+            "cam3-000004-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:00.780+00:00", "frame_id": 4,
+            },
+        }
+        frames = {
+            "/spool/session/cam1-000004-sample.jpg": "cam1-detection",
+            "/spool/session/cam2-000004-sample.jpg": "cam2-detection",
+            "/spool/session/cam3-000004-sample.jpg": "cam3-detection",
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", side_effect=frames.get, create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_OCR",
+            )
+
+        self.assertEqual(selected, {
+            "cam1": "cam1-detection", "cam2": "cam2-detection", "cam3": "cam3-detection",
+        })
+        self.assertEqual(captured_at["cam1"], "2026-07-21T00:00:00.800+00:00")
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["unknown_type"], "UNKNOWN_OCR")
+        self.assertEqual(metric["lpr_target_source"], "plate_detection")
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:00.800+00:00")
+        self.assertEqual(metric["synchronized_gap_ms"], 40)
+
+    def test_unknown_detection_photos_use_early_session_offset(self):
+        metadata = {
+            "session_id": "unknown-detection",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000013-sample.jpg",
+                "cam2-000013-sample.jpg",
+                "cam3-000013-sample.jpg",
+            ],
+            "lpr_diagnostics": {"detector_successes": 3, "detected_regions": 0},
+        }
+        frame_metadata = {
+            "cam1-000013-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:01.990+00:00", "frame_id": 13,
+            },
+            "cam2-000013-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:02.020+00:00", "frame_id": 13,
+            },
+            "cam3-000013-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:02.010+00:00", "frame_id": 13,
+            },
+        }
+        frames = {
+            "/spool/session/cam1-000013-sample.jpg": "cam1-early",
+            "/spool/session/cam2-000013-sample.jpg": "cam2-early",
+            "/spool/session/cam3-000013-sample.jpg": "cam3-early",
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", side_effect=frames.get, create=True,
+        ):
+            selected, _captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_DETECTION",
+            )
+
+        self.assertEqual(selected, {
+            "cam1": "cam1-early", "cam2": "cam2-early", "cam3": "cam3-early",
+        })
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["unknown_type"], "UNKNOWN_DETECTION")
+        self.assertEqual(metric["lpr_target_source"], "session_early")
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:02.000+00:00")
+        self.assertEqual(metric["synchronized_gap_ms"], 30)
+
+    def test_unknown_detection_drops_camera_outside_target_window(self):
+        metadata = {
+            "session_id": "unknown-detection-stale-camera",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:40+00:00",
+            "session_dir": "/spool/session",
+            "session_files": ["cam1-000035-sample.jpg", "cam2-000001-sample.jpg"],
+            "lpr_diagnostics": {"detector_successes": 2, "detected_regions": 0},
+        }
+        frame_metadata = {
+            "cam1-000035-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:02.050+00:00", "frame_id": 35,
+            },
+            "cam2-000001-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:37.100+00:00", "frame_id": 1,
+            },
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: "cam1" if "cam1" in path else "cam2",
+            create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_DETECTION",
+            )
+
+        self.assertEqual(selected, {"cam1": "cam1"})
+        self.assertEqual(captured_at, {"cam1": "2026-07-21T00:00:02.050+00:00"})
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["missing_cameras"], ["cam2", "cam3"])
+        self.assertEqual(metric["rejected"]["cam2"], {
+            "source": "session_early",
+            "reason": "outside_target_window",
+            "captured_at": "2026-07-21T00:00:37.100+00:00",
+            "offset_ms": 35100,
+        })
+
+    def test_unknown_detection_drops_camera_outside_synchronized_group(self):
+        metadata = {
+            "session_id": "unknown-detection-skewed-camera",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000031-sample.jpg", "cam2-000039-sample.jpg",
+                "cam3-000040-sample.jpg",
+            ],
+            "lpr_diagnostics": {"detector_successes": 3, "detected_regions": 0},
+        }
+        frame_metadata = {
+            "cam1-000031-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:01.100+00:00", "frame_id": 31,
+            },
+            "cam2-000039-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:02.800+00:00", "frame_id": 39,
+            },
+            "cam3-000040-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:02.900+00:00", "frame_id": 40,
+            },
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: path.split("/")[-1].split("-", 1)[0],
+            create=True,
+        ):
+            selected, _captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_DETECTION",
+            )
+
+        self.assertEqual(selected, {"cam2": "cam2", "cam3": "cam3"})
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["synchronized_gap_ms"], 100)
+        self.assertEqual(metric["rejected"]["cam1"]["reason"], "inter_camera_skew")
+
+    def test_unknown_photos_ignore_late_weight_snapshot_without_start_frame(self):
+        metadata = {
+            "session_id": "late-weight",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:09+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [],
+            "unknown_snapshot_paths": {"cam1": "/spool/cam1-2s.jpg"},
+            "unknown_snapshot_captured_at": {"cam1": "2026-07-21T00:00:02.030+00:00"},
+            "unknown_weight_snapshot_paths": {"cam1": "/spool/cam1-weight.jpg"},
+            "unknown_weight_snapshot_captured_at": {"cam1": "2026-07-21T00:00:05.030+00:00"},
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", return_value="later-frame", create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, {}, log_fn,
+            )
+
+        self.assertEqual(selected, {})
+        self.assertEqual(captured_at, {})
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["lpr_target_source"], "session_start")
+        self.assertEqual(metric["rejected"]["cam1"]["reason"], "late_or_invalid_timestamp")
+
+    def test_unknown_two_second_snapshots_include_rear_and_are_captured_once(self):
+        cam1 = Mock()
+        cam1.peek_latest_frame_snapshot = None
+        cam1.peek_latest_frame.return_value = "cam1-frame"
+        cam2 = Mock()
+        cam2.peek_latest_frame_snapshot = None
+        cam2.peek_latest_frame.return_value = "cam2-frame"
+        spool = Mock()
+        spool.save_session_frame.side_effect = [
+            "/spool/cam1-unknown-2s.jpg", "/spool/cam2-unknown-2s.jpg",
+        ]
+        manager = SessionManager(
+            Mock(), rear_grabber=cam2, lpr_grabbers={"cam1": cam1}, frame_spool=spool,
+        )
+        manager.session.session_active = True
+        manager.session.spool_active = True
+        manager.session.session_id = "session-1"
+        manager.session.unknown_snapshot_deadline = 12.0
+
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time", side_effect=[11.9, 12.0, 13.0],
+        ), unittest.mock.patch(
+            "services.session.session_manager.datetime"
+        ) as datetime_mock:
+            datetime_mock.now.return_value.isoformat.return_value = "2026-07-21T00:00:02.000+00:00"
+            datetime_mock.fromtimestamp.return_value.isoformat.return_value = "2026-07-21T00:00:02.000+00:00"
+            self.assertFalse(manager._capture_unknown_snapshots_if_due(Mock()))
+            self.assertTrue(manager._capture_unknown_snapshots_if_due(Mock()))
+            self.assertFalse(manager._capture_unknown_snapshots_if_due(Mock()))
+
+        cam1.peek_latest_frame.assert_called_once_with(copy_frame=True)
+        cam2.peek_latest_frame.assert_called_once_with(copy_frame=True)
+        self.assertEqual(spool.save_session_frame.call_args_list, [
+            unittest.mock.call("session-1", "cam1-unknown-2s.jpg", "cam1-frame"),
+            unittest.mock.call("session-1", "cam2-unknown-2s.jpg", "cam2-frame"),
+        ])
+
+    def test_unknown_weight_snapshots_capture_once_after_ten_tons(self):
+        cam1 = Mock()
+        cam1.peek_latest_frame_snapshot.return_value = (
+            "cam1-frame", 42, "2026-07-21T00:00:01.100+00:00",
+        )
+        spool = Mock()
+        spool.save_session_frame.return_value = "/spool/cam1-unknown-weight-10000.jpg"
+        manager = SessionManager(Mock(), lpr_grabbers={"cam1": cam1}, frame_spool=spool)
+        manager.session.session_active = True
+        manager.session.spool_active = True
+        manager.session.session_id = "session-1"
+        started_at = datetime(2026, 7, 21, tzinfo=timezone.utc).timestamp()
+        manager.session.started_at = started_at
+
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time", return_value=started_at + 1.0,
+        ), unittest.mock.patch(
+            "services.session.session_manager.datetime", wraps=datetime,
+        ) as datetime_mock:
+            datetime_mock.now.return_value = datetime(
+                2026, 7, 21, 0, 0, 1, tzinfo=timezone.utc,
+            )
+            self.assertFalse(manager._capture_unknown_weight_snapshots_if_due(9990, Mock()))
+            self.assertFalse(manager._capture_unknown_weight_snapshots_if_due(10000, Mock()))
+            self.assertTrue(manager._capture_unknown_weight_snapshots_if_due(10000, Mock()))
+        self.assertFalse(manager._capture_unknown_weight_snapshots_if_due(20000, Mock()))
+
+        cam1.peek_latest_frame_snapshot.assert_called_once_with(copy_frame=True)
+        spool.save_session_frame.assert_called_once_with(
+            "session-1", "cam1-unknown-weight-10000.jpg", "cam1-frame",
+        )
+
+    def test_unknown_weight_snapshot_stops_retrying_after_deadline(self):
+        cam1 = Mock()
+        cam1.peek_latest_frame_snapshot.return_value = (
+            "stale-frame", 41, "2026-07-21T00:00:00.900+00:00",
+        )
+        spool = Mock()
+        manager = SessionManager(Mock(), lpr_grabbers={"cam1": cam1}, frame_spool=spool)
+        manager.session.session_active = True
+        manager.session.spool_active = True
+        manager.session.session_id = "session-1"
+        started_at = datetime(2026, 7, 21, tzinfo=timezone.utc).timestamp()
+        manager.session.started_at = started_at
+
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time",
+            side_effect=[started_at + 1.0, started_at + 1.1, started_at + 3.1],
+        ), unittest.mock.patch(
+            "services.session.session_manager.datetime", wraps=datetime,
+        ) as datetime_mock:
+            datetime_mock.now.return_value = datetime(
+                2026, 7, 21, 0, 0, 1, tzinfo=timezone.utc,
+            )
+            self.assertFalse(manager._capture_unknown_weight_snapshots_if_due(10000, Mock()))
+            self.assertFalse(manager._capture_unknown_weight_snapshots_if_due(10000, Mock()))
+            self.assertFalse(manager._capture_unknown_weight_snapshots_if_due(10000, Mock()))
+
+        self.assertTrue(manager.session.unknown_weight_snapshot_attempted)
+        cam1.peek_latest_frame_snapshot.assert_called_once_with(copy_frame=True)
+        spool.save_session_frame.assert_not_called()
+
     def test_rearm_rejects_same_nonzero_plateau(self):
         self.manager.session.session_active = False
         self.manager.session.rearm_block_until = 11.0
@@ -426,7 +926,7 @@ class SessionWeightTests(unittest.TestCase):
 
         self.assertEqual(selected, {"cam1": "cam1+1s", "cam3": "cam3+1s"})
 
-    def test_unknown_photos_use_exact_capture_times_nearest_stable_weight(self):
+    def test_unknown_photos_require_session_start_frames_for_current_jobs(self):
         metadata = {
             "session_id": "session-1",
             "started_at": "2026-07-21T00:00:00+00:00",
@@ -434,6 +934,7 @@ class SessionWeightTests(unittest.TestCase):
             "weight_observed_at": "2026-07-21T00:00:10+00:00",
             "weight_source": "stable",
             "session_dir": "/spool/session",
+            "unknown_snapshot_paths": {},
             "session_files": [
                 "cam1-000001-sample.jpg", "cam1-000002-sample.jpg",
                 "cam2-000001-sample.jpg", "cam2-000002-sample.jpg",
@@ -442,29 +943,21 @@ class SessionWeightTests(unittest.TestCase):
             "capture_interval_seconds": 0.2,
         }
         frame_metadata = {
-            "cam1-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:09.700+00:00", "frame_id": 10},
-            "cam1-000002-sample.jpg": {"captured_at": "2026-07-21T00:00:10.050+00:00", "frame_id": 11},
-            "cam2-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:09.960+00:00", "frame_id": 20},
+            "cam1-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:01.700+00:00", "frame_id": 10},
+            "cam1-000002-sample.jpg": {"captured_at": "2026-07-21T00:00:02.050+00:00", "frame_id": 11},
+            "cam2-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:01.960+00:00", "frame_id": 20},
             "cam2-000002-sample.jpg": {"captured_at": "2026-07-21T00:00:10.400+00:00", "frame_id": 21},
             "cam3-000001-sample.jpg": {"captured_at": "2026-07-21T00:00:08.500+00:00", "frame_id": 30},
         }
-        frames = {
-            "/spool/session/cam1-000002-sample.jpg": "cam1-stable",
-            "/spool/session/cam2-000001-sample.jpg": "cam2-stable",
-        }
-
         with unittest.mock.patch(
-            "services.session.session_manager.cv2.imread", side_effect=frames.get, create=True,
+            "services.session.session_manager.cv2.imread", return_value="later-frame", create=True,
         ):
             selected, captured_at = self.manager._load_unknown_publish_frames(
                 metadata, frame_metadata, Mock(),
             )
 
-        self.assertEqual(selected, {"cam1": "cam1-stable", "cam2": "cam2-stable"})
-        self.assertEqual(captured_at, {
-            "cam1": "2026-07-21T00:00:10.050+00:00",
-            "cam2": "2026-07-21T00:00:09.960+00:00",
-        })
+        self.assertEqual(selected, {})
+        self.assertEqual(captured_at, {})
 
     def test_unknown_photo_legacy_job_uses_session_end_timing(self):
         metadata = {
@@ -529,9 +1022,12 @@ class SessionWeightTests(unittest.TestCase):
             },
         }
 
-        selected, captured_at = self.manager._load_unknown_publish_frames(
-            metadata, frame_metadata, Mock(),
-        )
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", return_value="start-frame", create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, Mock(),
+            )
 
         self.assertEqual(selected, {})
         self.assertEqual(captured_at, {})
@@ -560,7 +1056,7 @@ class SessionWeightTests(unittest.TestCase):
         self.assertEqual(selected, {})
         self.assertEqual(captured_at, {})
 
-    def test_unknown_photos_ignore_session_start_snapshot(self):
+    def test_unknown_photos_fall_back_to_session_start_snapshot(self):
         metadata = {
             "session_id": "start-only",
             "started_at": "2026-07-21T00:00:00+00:00",
@@ -576,12 +1072,71 @@ class SessionWeightTests(unittest.TestCase):
             },
         }
 
-        selected, captured_at = self.manager._load_unknown_publish_frames(
-            metadata, frame_metadata, Mock(),
-        )
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", return_value="start-frame", create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, Mock(),
+            )
 
-        self.assertEqual(selected, {})
-        self.assertEqual(captured_at, {})
+        self.assertEqual(selected, {"cam1": "start-frame"})
+        self.assertEqual(captured_at, {"cam1": "2026-07-21T00:00:00+00:00"})
+
+    def test_unknown_photos_use_complete_session_start_set_instead_of_mixed_times(self):
+        metadata = {
+            "session_id": "complete-start",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:09+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000000-start.jpg",
+                "cam2-000000-start.jpg",
+                "cam3-000000-start.jpg",
+            ],
+            "unknown_snapshot_paths": {
+                "cam1": "/spool/cam1-2s.jpg",
+                "cam3": "/spool/cam3-2s.jpg",
+            },
+            "unknown_snapshot_captured_at": {
+                "cam1": "2026-07-21T00:00:02.050+00:00",
+                "cam3": "2026-07-21T00:00:02.100+00:00",
+            },
+        }
+        frame_metadata = {
+            "cam1-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00.050+00:00", "frame_id": 1,
+            },
+            "cam2-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00.070+00:00", "frame_id": 2,
+            },
+            "cam3-000000-start.jpg": {
+                "captured_at": "2026-07-21T00:00:00.060+00:00", "frame_id": 3,
+            },
+        }
+        frames = {
+            "/spool/session/cam1-000000-start.jpg": "cam1-start",
+            "/spool/session/cam2-000000-start.jpg": "cam2-start",
+            "/spool/session/cam3-000000-start.jpg": "cam3-start",
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread", side_effect=frames.get, create=True,
+        ):
+            selected, _captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn,
+            )
+
+        self.assertEqual(selected, {
+            "cam1": "cam1-start", "cam2": "cam2-start", "cam3": "cam3-start",
+        })
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["lpr_target_source"], "session_start")
+        self.assertEqual(metric["synchronized_gap_ms"], 20)
 
     def test_unknown_cam2_uses_configured_lane_crop(self):
         class Frame:

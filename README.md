@@ -96,10 +96,13 @@ Compare explicit RKNN variants on device without changing production model paths
 ```bash
 python3 benchmark_lpr.py storage/lpr-samples \
   --variant fine-tuned models/lpr/license_plate_detector.rknn models/lpr/license_plate_recognizer.rknn models/lpr/charset.txt 960 \
-  --manifest storage/lpr-samples/manifest.json
+  --fastalpr-variant fastalpr /tmp/alpr-rknn/yolo-v9-t-384-license-plates-pre-nms-fp16-rk3588.rknn /tmp/alpr-rknn/cct_xs_v2_global-fp16-rk3588.rknn \
+  --labels-from-filenames \
+  --manifest storage/lpr-samples/manifest.json \
+  --output storage/lpr-benchmark.json
 ```
 
-Each repeated `--variant` takes its own detector, recognizer, charset, and image size. Output includes artifact hashes, source dimensions, detector/OCR timing, optional exact-match labels, and per-image plate results. Variants load sequentially on the selected NPU core; use `--core 1` or `--core 2` when needed.
+Each repeated `--variant` takes its own detector, recognizer, charset, and image size. `--fastalpr-variant` takes a YOLOv9 detector and CCT-XS v2 recognizer using their fixed 384x384 and 128x64 contracts. Output includes artifact hashes, source dimensions, detector/OCR timing, process RSS, detection and valid-format rates, optional exact-match labels, and per-image plate results. `--labels-from-filenames` reads labels from `UUID_PLATE_photo-*.jpg` archives and ignores `UNKNOWN`. Explicit manifest entries override inferred labels. Variants load sequentially on the selected NPU core; use `--core 1` or `--core 2` when needed.
 
 ## Fine-Tuned LPR Deployment
 
@@ -140,6 +143,16 @@ storage/publish_pending.jsonl         MQTT publish retry queue
 storage/weighbridge/YYYY/MM/DD/       evidence images
 storage/undetectable/                 unknown plate evidence
 ```
+
+## Unknown Sessions
+
+Weight-backed sessions without a confirmed plate publish one of two explicit values:
+
+- `UNKNOWN_OCR`: detector found a plate, but OCR did not produce a confirmed plate. Published thumbnails use the first detector-hit frame and synchronized camera frames nearest that capture time.
+- `UNKNOWN_DETECTION`: no plate region was detected. Published thumbnails target 2 seconds after session start, preserving early vehicle evidence. A camera is omitted when its nearest frame is more than 1 second from that target or more than 1 second from the synchronized camera group, preventing stale cameras from creating mixed-time photo sets.
+- RTSP sources use a native GStreamer pipeline with a 500ms bounded jitter buffer and `appsink max-buffers=1 drop=true sync=false`. This drops superseded decoded frames instead of allowing decoder queues to drift behind real time. Rockchip hosts decode H.265 through `mppvideodec` and convert its stride-padded NV12 output after the one-frame sink; other hosts use `avdec_h265`.
+
+The 2-second target treats every session as potential no-detection evidence and captures before the vehicle can leave the camera view. Each photo's `captured_at` remains its actual frame acquisition time, not the target time.
 
 After deploying daily scale storage, stop the service and migrate its legacy root database once:
 
@@ -308,6 +321,22 @@ Expected normal state after network recovery:
 upload_pending.jsonl: 0
 publish_pending.jsonl: 0
 ```
+
+Image retention runs hourly. Files older than 30 days are removed first. When free disk
+falls below 7 GiB, oldest uploaded local JPEG/PNG evidence is removed until the target
+is restored; files still queued in `storage/upload_pending.jsonl` are never removed.
+Session capture keeps a separate 5 GiB hard reserve.
+
+Recover capture after a stopped service or low-disk incident:
+
+```bash
+scripts/recover_image_capture.sh
+```
+
+The script installs a persistent 1 GiB system-journal cap, vacuums archived journals, runs
+storage cleanup, verifies the 5 GiB session reserve, and starts an inactive service. It
+never restarts an active service; an inactive service is allowed to recover its durable
+session markers on startup.
 
 ## Known Operational Notes
 

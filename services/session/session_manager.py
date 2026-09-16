@@ -7,6 +7,7 @@ import time
 import uuid
 from collections import Counter, deque
 from datetime import datetime, timezone
+from itertools import combinations as candidate_combinations, product
 
 import cv2
 import numpy as np
@@ -24,6 +25,7 @@ from config import (
     PEAK_FILTER_FRAMES,
     PEAK_MOVEMENT_CANCEL_KG,
     PEAK_MOVEMENT_CONFIRM_FRAMES,
+    PUSH_IMAGE_DEBUG_OVERLAY,
     SAME_PLATE_DUPLICATE_SECONDS,
     SESSION_DEDUP_STATE_FILE,
     SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT,
@@ -36,6 +38,8 @@ from config import (
     SESSION_WEIGHT_TREND_FRAMES,
     SERVICE_DIR,
     STABLE_COUNT_THRESHOLD,
+    UNKNOWN_PHOTO_LOCAL_PEAK_DROP_KG,
+    UNKNOWN_PHOTO_LOCAL_PEAK_DWELL_SECONDS,
     WEIGHT_THRESHOLD,
 )
 
@@ -49,6 +53,13 @@ _registry_active_count = 0
 MAX_STABLE_WEIGHT_CANDIDATES = 256
 REAR_CAPTURE_FALLBACK_SECONDS = 2.0
 UNKNOWN_PHOTO_MAX_OFFSET_SECONDS = 1.0
+UNKNOWN_THUMBNAIL_OFFSET_SECONDS = 2.0
+UNKNOWN_THUMBNAIL_WEIGHT_KG = 10000.0
+# Capture early evidence before a vehicle can leave the camera view.
+UNKNOWN_DETECTION_THUMBNAIL_OFFSET_SECONDS = 2.0
+UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS = (
+    UNKNOWN_THUMBNAIL_OFFSET_SECONDS + UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
+)
 
 
 def set_log_fn(log_fn):
@@ -101,6 +112,19 @@ def classify_lpr_failure(diagnostics):
     if diagnostics.get("detector_errors", 0):
         return "detector_inference_error"
     return "no_plate_detection"
+
+
+def classify_unknown_plate(diagnostics):
+    diagnostics = diagnostics or {}
+    plate_seen_fields = (
+        "detected_regions", "tracked_regions", "tracked_plate_frames",
+        "crop_failures", "crop_too_small",
+        "ocr_attempts", "ocr_successes", "ocr_blank",
+        "ocr_invalid_format", "ocr_low_confidence", "ocr_valid_candidates",
+    )
+    if any(diagnostics.get(field, 0) for field in plate_seen_fields):
+        return "UNKNOWN_OCR"
+    return "UNKNOWN_DETECTION"
 
 
 def saveConfirmedLicensePlate(license_plate, session_id=None):
@@ -280,6 +304,14 @@ class WeighingSessionState:
         self.rear_capture_source = None
         self.rear_fallback_deadline = None
         self.rear_fallback_attempted = False
+        self.unknown_snapshot_paths = {}
+        self.unknown_snapshot_captured_at = {}
+        self.unknown_snapshot_deadline = None
+        self.unknown_snapshot_attempted = False
+        self.unknown_weight_snapshot_paths = {}
+        self.unknown_weight_snapshot_captured_at = {}
+        self.unknown_weight_snapshot_triggered_at = None
+        self.unknown_weight_snapshot_attempted = False
         self.started_at = None
         self.started_at_iso = None
         self.session_id = None
@@ -411,6 +443,10 @@ class SessionManager:
         self._session_raw_peak_observed_at = None
         self._session_filtered_peak = None
         self._session_filtered_peak_observed_at = None
+        self._session_local_peak = None
+        self._session_local_peak_observed_at = None
+        self._session_local_peak_ts = None
+        self._session_local_peak_confirmed = False
         self._session_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
         self.fatal_error = None
         self._spool_failure_logged_for = None
@@ -552,6 +588,8 @@ class SessionManager:
         ):
             self._complete_plate_loss(log_fn, frame.weight)
         self._capture_rear_fallback_if_due(log_fn)
+        self._capture_unknown_snapshots_if_due(log_fn)
+        self._capture_unknown_weight_snapshots_if_due(frame.weight, log_fn)
         self._update_peak_candidate(frame, log_fn)
         if self.session.session_active and frame.weight > 0:
             observed_at = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
@@ -564,6 +602,7 @@ class SessionManager:
                 if self._session_filtered_peak is None or filtered > self._session_filtered_peak:
                     self._session_filtered_peak = filtered
                     self._session_filtered_peak_observed_at = observed_at
+            self._update_local_peak(frame.weight, observed_at, frame.timestamp)
             if time.monotonic() - self._last_spool_weight_checkpoint >= 1.0:
                 self._update_spool_metadata(log_fn)
                 self._last_spool_weight_checkpoint = time.monotonic()
@@ -606,6 +645,26 @@ class SessionManager:
         if self._check_scale_empty(frame, log_fn):
             return
         self._update_vehicle_type(log_fn)
+
+    def _update_local_peak(self, weight, observed_iso, observed_ts):
+        """Track first sustained local weight maximum for UNKNOWN evidence timing."""
+        if weight <= WEIGHT_THRESHOLD:
+            return
+        timestamp = observed_ts.timestamp()
+        if self._session_local_peak_confirmed:
+            # First sustained maximum is the evidence anchor; later rises must not move it.
+            return
+        if self._session_local_peak is None or weight > self._session_local_peak:
+            self._session_local_peak = weight
+            self._session_local_peak_observed_at = observed_iso
+            self._session_local_peak_ts = timestamp
+            return
+        if self._session_local_peak_ts is None:
+            return
+        held = timestamp - self._session_local_peak_ts >= UNKNOWN_PHOTO_LOCAL_PEAK_DWELL_SECONDS
+        dropped = self._session_local_peak - weight >= UNKNOWN_PHOTO_LOCAL_PEAK_DROP_KG
+        if held or dropped:
+            self._session_local_peak_confirmed = True
 
     def _update_peak_candidate(self, frame, log_fn):
         """Record shadow peak evidence without changing session behavior."""
@@ -832,13 +891,20 @@ class SessionManager:
              "maximum_weight_kg": attempt["max_weight"]},
             log_fn,
         )
+        end_reason = "weight_departure" if require_new_rise else "scale_empty"
+        log_fn(
+            "SUPPRESS",
+            f"MQTT id={attempt['id']} reason=no_stable_weight end={end_reason} "
+            f"max_peak={attempt['max_weight']:.1f}kg current={current_weight}kg "
+            f"departure_threshold={SESSION_WEIGHT_DEPARTURE_KG:g}kg",
+        )
         log_fn("EVENT", f"NO STABLE id={attempt['id']} max_wt={attempt['max_weight']:.1f}kg images={saved}")
         log_metric(
             log_fn, "no_stable_weight", id=attempt["id"],
             started_at=attempt["started_at"],
             ended_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             maximum_weight_kg=attempt["max_weight"], images=saved,
-            end_reason="weight_departure" if require_new_rise else "scale_empty",
+            end_reason=end_reason,
         )
         self._clear_attempt()
         if require_new_rise:
@@ -1033,6 +1099,8 @@ class SessionManager:
                         "raw_peak_observed_at": self._session_raw_peak_observed_at,
                         "filtered_peak_weight": self._session_filtered_peak,
                         "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
+                        "local_peak_weight": self._session_local_peak,
+                        "local_peak_observed_at": self._session_local_peak_observed_at,
                         "vehicle_type": self.session.vehicle_type,
                         "rear_start_path": None,
                         "start_frame_paths": {},
@@ -1059,6 +1127,9 @@ class SessionManager:
                 )
                 return False
         self.session.session_active = True
+        self.session.unknown_snapshot_deadline = (
+            self.session.started_at + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
+        )
         self._generation += 1
         self._plate_owned = trigger == "plate_detected"
         self._plate_absent_since = None
@@ -1105,21 +1176,31 @@ class SessionManager:
 
     def _capture_rear_start_frame(self, log_fn):
         if not self.rear_grabber:
-            return None
+            return None, None
         try:
-            frame = self.rear_grabber.peek_latest_frame(copy_frame=True)
+            snapshot = getattr(self.rear_grabber, "peek_latest_frame_snapshot", None)
+            if snapshot:
+                result = snapshot(copy_frame=True)
+                if isinstance(result, tuple) and len(result) == 3:
+                    frame, _frame_id, captured_at = result
+                else:
+                    frame = self.rear_grabber.peek_latest_frame(copy_frame=True)
+                    captured_at = None
+            else:
+                frame = self.rear_grabber.peek_latest_frame(copy_frame=True)
+                captured_at = None
         except Exception as exc:
             log_fn("ERROR", f"Session start rear snapshot failed camera=cam2: {exc}")
-            return None
+            return None, None
         log_fn("EVENT", f"Session start rear snapshot cam2={'yes' if frame is not None else 'no'}")
-        return frame
+        return frame, captured_at
 
     def _capture_and_save_rear(self, source, filename, log_fn):
-        frame = self._capture_rear_start_frame(log_fn)
+        frame, captured_at = self._capture_rear_start_frame(log_fn)
         if frame is None:
             return False
         self.session.rear_start_frame = frame
-        self.session.rear_captured_at = datetime.now(timezone.utc).isoformat(
+        self.session.rear_captured_at = captured_at or datetime.now(timezone.utc).isoformat(
             timespec="milliseconds"
         )
         self.session.rear_capture_source = source
@@ -1154,6 +1235,127 @@ class SessionManager:
         self._update_spool_metadata(log_fn)
         return saved
 
+    def _capture_unknown_snapshots_if_due(self, log_fn):
+        deadline = self.session.unknown_snapshot_deadline
+        if (
+            not self.session.session_active
+            or deadline is None
+            or self.session.unknown_snapshot_attempted
+            or time.time() < deadline
+        ):
+            return False
+        self.session.unknown_snapshot_attempted = True
+        captured = self._capture_unknown_snapshot_set("2s", log_fn)
+        self._update_spool_metadata(log_fn)
+        log_metric(
+            log_fn, "unknown_snapshot_captured", id=self.session.session_id,
+            source="start_2s",
+            target_at=datetime.fromtimestamp(deadline, timezone.utc).isoformat(timespec="milliseconds"),
+            captured_at=captured,
+        )
+        return bool(captured)
+
+    def _capture_unknown_weight_snapshots_if_due(self, weight, log_fn):
+        if (
+            not self.session.session_active
+            or self.session.started_at is None
+            or self.session.unknown_weight_snapshot_attempted
+        ):
+            return False
+        capture_deadline = self.session.started_at + UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS
+        if time.time() > capture_deadline:
+            self.session.unknown_weight_snapshot_attempted = True
+            log_metric(
+                log_fn, "unknown_weight_snapshot_expired", id=self.session.session_id,
+                deadline_at=datetime.fromtimestamp(
+                    capture_deadline, timezone.utc,
+                ).isoformat(timespec="milliseconds"),
+                captured_cameras=sorted(self.session.unknown_weight_snapshot_paths),
+            )
+            return False
+        if (
+            self.session.unknown_weight_snapshot_triggered_at is None
+            and weight < UNKNOWN_THUMBNAIL_WEIGHT_KG
+        ):
+            return False
+        if self.session.unknown_weight_snapshot_triggered_at is None:
+            self.session.unknown_weight_snapshot_triggered_at = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            self._update_spool_metadata(log_fn)
+            return False
+        captured = self._capture_unknown_snapshot_set(
+            "weight-10000", log_fn,
+            minimum_captured_ts=datetime.fromisoformat(
+                self.session.unknown_weight_snapshot_triggered_at
+            ).timestamp(),
+            maximum_captured_ts=capture_deadline,
+        )
+        expected_cameras = set(self.lpr_grabbers)
+        if self.rear_grabber is not None:
+            expected_cameras.add("cam2")
+        self.session.unknown_weight_snapshot_attempted = expected_cameras.issubset(
+            self.session.unknown_weight_snapshot_paths
+        )
+        self._update_spool_metadata(log_fn)
+        if captured:
+            log_metric(
+                log_fn, "unknown_snapshot_captured", id=self.session.session_id,
+                source="weight_10000", weight_kg=weight,
+                triggered_at=self.session.unknown_weight_snapshot_triggered_at,
+                captured_at=captured,
+            )
+        return bool(captured)
+
+    def _capture_unknown_snapshot_set(
+        self, source, log_fn, minimum_captured_ts=None, maximum_captured_ts=None,
+    ):
+        captured = {}
+        grabbers = dict(self.lpr_grabbers)
+        if self.rear_grabber is not None:
+            grabbers["cam2"] = self.rear_grabber
+        for camera, grabber in grabbers.items():
+            if source == "weight-10000" and camera in self.session.unknown_weight_snapshot_paths:
+                continue
+            try:
+                snapshot = getattr(grabber, "peek_latest_frame_snapshot", None)
+                if snapshot:
+                    frame, _frame_id, captured_at = snapshot(copy_frame=True)
+                else:
+                    frame = grabber.peek_latest_frame(copy_frame=True)
+                    captured_at = None
+            except Exception as exc:
+                log_fn("ERROR", f"UNKNOWN {source} snapshot failed camera={camera}: {exc}")
+                continue
+            if frame is None:
+                continue
+            captured_at = captured_at or datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            try:
+                captured_ts = datetime.fromisoformat(captured_at).timestamp()
+            except (TypeError, ValueError):
+                continue
+            if minimum_captured_ts is not None and captured_ts < minimum_captured_ts:
+                continue
+            if maximum_captured_ts is not None and captured_ts > maximum_captured_ts:
+                continue
+            path = None
+            if self.frame_spool and self.session.spool_active:
+                try:
+                    path = self.frame_spool.save_session_frame(
+                        self.session.session_id, f"{camera}-unknown-{source}.jpg", frame,
+                    )
+                except Exception as exc:
+                    log_fn("ERROR", f"UNKNOWN {source} snapshot save failed camera={camera}: {exc}")
+            if path:
+                if source == "weight-10000":
+                    self.session.unknown_weight_snapshot_paths[camera] = path
+                    self.session.unknown_weight_snapshot_captured_at[camera] = captured_at
+                else:
+                    self.session.unknown_snapshot_paths[camera] = path
+                    self.session.unknown_snapshot_captured_at[camera] = captured_at
+                captured[camera] = captured_at
+        return captured
+
     def _update_spool_metadata(self, log_fn):
         if not self.frame_spool or not self.session.spool_active:
             return
@@ -1171,11 +1373,18 @@ class SessionManager:
                     "raw_peak_observed_at": self._session_raw_peak_observed_at,
                     "filtered_peak_weight": self._session_filtered_peak,
                     "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
+                    "local_peak_weight": self._session_local_peak,
+                    "local_peak_observed_at": self._session_local_peak_observed_at,
                     "vehicle_type": self.session.vehicle_type,
                     "rear_start_path": self.session.rear_start_path,
                     "rear_captured_at": self.session.rear_captured_at,
                     "rear_capture_source": self.session.rear_capture_source,
                     "start_frame_paths": dict(self.session.start_frame_paths),
+                    "unknown_snapshot_paths": dict(self.session.unknown_snapshot_paths),
+                    "unknown_snapshot_captured_at": dict(self.session.unknown_snapshot_captured_at),
+                    "unknown_weight_snapshot_paths": dict(self.session.unknown_weight_snapshot_paths),
+                    "unknown_weight_snapshot_captured_at": dict(self.session.unknown_weight_snapshot_captured_at),
+                    "unknown_weight_snapshot_triggered_at": self.session.unknown_weight_snapshot_triggered_at,
                 },
             )
         except Exception as exc:
@@ -1249,6 +1458,10 @@ class SessionManager:
         self._session_raw_peak_observed_at = None
         self._session_filtered_peak = None
         self._session_filtered_peak_observed_at = None
+        self._session_local_peak = None
+        self._session_local_peak_observed_at = None
+        self._session_local_peak_ts = None
+        self._session_local_peak_confirmed = False
         self._session_weight_window.clear()
         self.session.stable_count = 0
         self.session.clear_stable_weight_history()
@@ -1263,6 +1476,14 @@ class SessionManager:
         self.session.rear_capture_source = None
         self.session.rear_fallback_deadline = None
         self.session.rear_fallback_attempted = False
+        self.session.unknown_snapshot_paths = {}
+        self.session.unknown_snapshot_captured_at = {}
+        self.session.unknown_snapshot_deadline = None
+        self.session.unknown_snapshot_attempted = False
+        self.session.unknown_weight_snapshot_paths = {}
+        self.session.unknown_weight_snapshot_captured_at = {}
+        self.session.unknown_weight_snapshot_triggered_at = None
+        self.session.unknown_weight_snapshot_attempted = False
         self.session.started_at = None
         self.session.started_at_iso = None
         self.session.session_id = None
@@ -1297,6 +1518,8 @@ class SessionManager:
             "raw_peak_observed_at": self._session_raw_peak_observed_at,
             "filtered_peak_weight": self._session_filtered_peak,
             "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
+            "local_peak_weight": self._session_local_peak,
+            "local_peak_observed_at": self._session_local_peak_observed_at,
             "weight_observed_at": observed_at,
             "decimal_pos": self.session.last_publish_decimal_pos,
             "vehicle_type": self.session.vehicle_type,
@@ -1304,6 +1527,11 @@ class SessionManager:
             "rear_captured_at": self.session.rear_captured_at,
             "rear_capture_source": self.session.rear_capture_source,
             "start_frame_paths": dict(self.session.start_frame_paths),
+            "unknown_snapshot_paths": dict(self.session.unknown_snapshot_paths),
+            "unknown_snapshot_captured_at": dict(self.session.unknown_snapshot_captured_at),
+            "unknown_weight_snapshot_paths": dict(self.session.unknown_weight_snapshot_paths),
+            "unknown_weight_snapshot_captured_at": dict(self.session.unknown_weight_snapshot_captured_at),
+            "unknown_weight_snapshot_triggered_at": self.session.unknown_weight_snapshot_triggered_at,
         }
 
     def _should_skip_duplicate_publish(self, plate, stable_weight, session_started_at=None):
@@ -1350,6 +1578,13 @@ class SessionManager:
             )
             if saved is False:
                 return False
+            log_fn(
+                "SUPPRESS",
+                f"MQTT id={session_id} reason=no_usable_weight "
+                f"end={metadata.get('end_reason')} assigned={metadata.get('stable_weight')}kg "
+                f"source={metadata.get('weight_source')} raw_peak={metadata.get('raw_peak_weight')}kg "
+                f"filtered_peak={metadata.get('filtered_peak_weight')}kg threshold={WEIGHT_THRESHOLD:g}kg",
+            )
             log_fn("EVENT", f"DEFERRED END id={session_id} weight=none published=False")
             markSessionFinalized(session_id, "no_weight", {
                 "event": "no_stable_attempt", "id": session_id, **metadata,
@@ -1380,7 +1615,7 @@ class SessionManager:
                 f"processed={lpr_diagnostics.get('processed_frames', 0)} "
                 f"regions={lpr_diagnostics.get('detected_regions', 0)}",
             )
-            unknown_plate = "UNKNOWN"
+            unknown_plate = classify_unknown_plate(lpr_diagnostics)
             publish_result = self._build_publish_result(
                 metadata["stable_weight"], unknown_plate, 0, {}, metadata,
             )
@@ -1389,6 +1624,7 @@ class SessionManager:
                 "ocr_plate_read": None,
                 "metadata": {
                     "plate_status": "unreadable",
+                    "unknown_type": unknown_plate,
                     "lpr_classification": classification,
                     "weight_source": metadata.get("weight_source"),
                     "raw_peak_weight": metadata.get("raw_peak_weight"),
@@ -1396,10 +1632,10 @@ class SessionManager:
                 },
             })
             publish_frames, captured_at = self._load_unknown_publish_frames(
-                metadata, frame_metadata, log_fn, spool_started_at,
+                metadata, frame_metadata, log_fn, spool_started_at, unknown_plate,
             )
             self._attach_unknown_publish_images(
-                publish_result, publish_frames, captured_at, session_id,
+                publish_result, publish_frames, captured_at, session_id, unknown_plate,
             )
             image_object_keys = publish_result.pop("_image_object_keys", [])
             image_paths = publish_result.pop("_image_paths", [])
@@ -1463,11 +1699,13 @@ class SessionManager:
                 weight_observed_at=metadata.get("weight_observed_at"),
                 recovered_after_restart=bool(metadata.get("recovered_after_restart")),
                 incomplete=bool(metadata.get("incomplete")), errors=metadata.get("errors", []),
-                classification=classification, lpr_diagnostics=lpr_diagnostics,
+                classification=classification, unknown_type=unknown_plate,
+                lpr_diagnostics=lpr_diagnostics,
             )
             log_metric(
                 log_fn, "weight_backed_lpr_no_result",
                 id=metadata["session_id"], classification=classification,
+                unknown_type=unknown_plate,
                 stable_weight_kg=metadata["stable_weight"],
                 lpr_diagnostics=lpr_diagnostics,
             )
@@ -1475,7 +1713,7 @@ class SessionManager:
                 log_fn, "session_publish_queued", id=session_id,
                 plate=unknown_plate, plate_status="unreadable",
                 stable_weight_kg=metadata["stable_weight"],
-                classification=classification,
+                classification=classification, unknown_type=unknown_plate,
             )
             return True
         result = self.publish_result(
@@ -1518,6 +1756,12 @@ class SessionManager:
             weight_observed_at=metadata.get("weight_observed_at"),
             recovered_after_restart=bool(metadata.get("recovered_after_restart")),
             incomplete=bool(metadata.get("incomplete")), errors=metadata.get("errors", []),
+            first_valid_ocr_captured_at=(metadata.get("lpr_diagnostics") or {}).get(
+                "first_valid_ocr_captured_at"
+            ),
+            first_valid_ocr_delay_seconds=(metadata.get("lpr_diagnostics") or {}).get(
+                "first_valid_ocr_delay_seconds"
+            ),
         )
         return True
 
@@ -1567,6 +1811,7 @@ class SessionManager:
 
     def _load_unknown_publish_frames(
         self, metadata, frame_metadata, log_fn, spool_started_at=None,
+        unknown_plate="UNKNOWN",
     ):
         target_at = (
             metadata.get("weight_observed_at")
@@ -1577,8 +1822,10 @@ class SessionManager:
         try:
             target_ts = datetime.fromisoformat(target_at).timestamp()
         except (TypeError, ValueError):
-            log_fn("WARNING", f"Unknown photo timing unavailable id={metadata['session_id']}")
-            return {}, {}
+            target_ts = None
+            if unknown_plate == "UNKNOWN":
+                log_fn("WARNING", f"Unknown photo timing unavailable id={metadata['session_id']}")
+                return {}, {}
 
         session_dir = metadata.get("session_dir")
         started_at = spool_started_at or metadata.get("started_at")
@@ -1587,67 +1834,327 @@ class SessionManager:
         session_dir = os.path.abspath(session_dir)
         started_ts = datetime.fromisoformat(started_at).timestamp()
         interval = float(metadata.get("capture_interval_seconds", 0.2))
-        selected = {}
-        captured_at = {}
-        selection = {}
-        missing = []
-        for camera in ("cam1", "cam2", "cam3"):
-            candidates = []
-            first_seen_by_frame_id = {}
-            for relative_path in metadata.get("session_files", []):
-                if not relative_path.startswith(camera + "-"):
+        has_snapshot_metadata = "unknown_snapshot_paths" in metadata
+        start_target_ts = started_ts + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
+        lpr_target_ts = start_target_ts if has_snapshot_metadata else target_ts
+        lpr_target_source = "start_2s" if has_snapshot_metadata else "legacy_weight"
+        deadline_ts = started_ts + UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS
+        cameras = ("cam1", "cam2", "cam3")
+        timeline = {camera: [] for camera in cameras}
+        start_snapshots = {}
+        candidates_by_path = {}
+        tracked_detection_candidates = []
+        first_seen_by_frame_id = {camera: {} for camera in cameras}
+        rejected = {}
+
+        for relative_path in metadata.get("session_files", []):
+            camera = relative_path.split("-", 1)[0]
+            if camera not in timeline:
+                continue
+            item_metadata = frame_metadata.get(relative_path) or {}
+            observed_iso = item_metadata.get("captured_at")
+            try:
+                observed_ts = datetime.fromisoformat(observed_iso).timestamp()
+            except (TypeError, ValueError):
+                try:
+                    index = int(relative_path.split("-", 2)[1])
+                except (ValueError, IndexError):
                     continue
-                if relative_path.endswith("-start.jpg"):
+                observed_ts = started_ts + index * interval
+                observed_iso = datetime.fromtimestamp(
+                    observed_ts, timezone.utc,
+                ).isoformat(timespec="milliseconds")
+            if observed_ts < started_ts - interval:
+                continue
+            path = os.path.abspath(os.path.join(session_dir, relative_path))
+            if os.path.commonpath((session_dir, path)) != session_dir:
+                continue
+            candidate = {
+                "path": path, "captured_at": observed_iso, "timestamp": observed_ts,
+                "origin": "timeline", "camera": camera,
+            }
+            candidates_by_path[relative_path] = candidate
+            if item_metadata.get("tracks"):
+                tracked_detection_candidates.append(candidate)
+            frame_id = item_metadata.get("frame_id")
+            if frame_id is not None:
+                first_seen = first_seen_by_frame_id[camera]
+                if frame_id in first_seen:
                     continue
-                item_metadata = frame_metadata.get(relative_path) or {}
-                observed_iso = item_metadata.get("captured_at")
+                first_seen[frame_id] = observed_ts
+            if relative_path.endswith("-start.jpg"):
+                start_snapshots[camera] = candidate
+            else:
+                timeline[camera].append(candidate)
+
+        def dedicated_candidates(paths_key, times_key, source):
+            candidates = {camera: [] for camera in cameras}
+            paths = metadata.get(paths_key) or {}
+            times = metadata.get(times_key) or {}
+            for camera in cameras:
+                path, observed_iso = paths.get(camera), times.get(camera)
+                if not path or not observed_iso:
+                    continue
                 try:
                     observed_ts = datetime.fromisoformat(observed_iso).timestamp()
                 except (TypeError, ValueError):
-                    try:
-                        index = int(relative_path.split("-", 2)[1])
-                    except (ValueError, IndexError):
-                        continue
-                    observed_ts = started_ts + index * interval
-                    observed_iso = datetime.fromtimestamp(
-                        observed_ts, timezone.utc,
-                    ).isoformat(timespec="milliseconds")
-                if observed_ts < started_ts - interval:
+                    rejected[camera] = {
+                        "source": source, "reason": "invalid_timestamp",
+                        "captured_at": observed_iso,
+                    }
                     continue
-                frame_id = item_metadata.get("frame_id")
-                if frame_id is not None:
-                    observed_ts, observed_iso = first_seen_by_frame_id.setdefault(
-                        frame_id, (observed_ts, observed_iso),
-                    )
-                candidates.append((abs(observed_ts - target_ts), relative_path, observed_iso))
-            if not candidates:
-                missing.append(camera)
-                continue
-            chosen = None
-            for offset, relative_path, observed_iso in sorted(candidates):
-                if offset > UNKNOWN_PHOTO_MAX_OFFSET_SECONDS:
-                    break
-                path = os.path.abspath(os.path.join(session_dir, relative_path))
-                if os.path.commonpath((session_dir, path)) != session_dir:
-                    continue
-                frame = cv2.imread(path)
-                if frame is not None:
-                    chosen = frame, observed_iso, offset
-                    break
-            if chosen is None:
-                missing.append(camera)
-                continue
-            frame, observed_iso, offset = chosen
-            selected[camera] = frame
-            captured_at[camera] = observed_iso
-            selection[camera] = {
-                "captured_at": observed_iso,
-                "offset_ms": round(offset * 1000),
+                candidates[camera].append({
+                    "path": os.path.abspath(path), "captured_at": observed_iso,
+                    "timestamp": observed_ts, "origin": "dedicated", "camera": camera,
+                })
+            return candidates
+
+        start_candidates = dedicated_candidates(
+            "unknown_snapshot_paths", "unknown_snapshot_captured_at", "start_2s",
+        )
+        for camera in cameras:
+            eligible = []
+            for candidate in start_candidates[camera]:
+                if abs(candidate["timestamp"] - start_target_ts) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS:
+                    eligible.append(candidate)
+                else:
+                    rejected[camera] = {
+                        "source": "start_2s", "reason": "late_or_invalid_timestamp",
+                        "captured_at": candidate["captured_at"],
+                    }
+            start_candidates[camera] = eligible
+            start_candidates[camera].extend(
+                candidate for candidate in timeline[camera]
+                if abs(candidate["timestamp"] - start_target_ts) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
+            )
+
+        threshold_candidates = dedicated_candidates(
+            "unknown_weight_snapshot_paths", "unknown_weight_snapshot_captured_at",
+            "weight_10000",
+        )
+        trigger_at = metadata.get("unknown_weight_snapshot_triggered_at")
+        try:
+            threshold_target_ts = datetime.fromisoformat(trigger_at).timestamp()
+            threshold_target_valid = started_ts <= threshold_target_ts <= deadline_ts
+        except (TypeError, ValueError):
+            timely_dedicated = [
+                candidate["timestamp"]
+                for candidates in threshold_candidates.values()
+                for candidate in candidates
+                if started_ts <= candidate["timestamp"] <= deadline_ts
+            ]
+            threshold_target_ts = min(timely_dedicated) if timely_dedicated else None
+            threshold_target_valid = threshold_target_ts is not None
+        if threshold_target_valid:
+            for camera in cameras:
+                threshold_candidates[camera].extend(
+                    candidate for candidate in timeline[camera]
+                    if threshold_target_ts <= candidate["timestamp"] <= deadline_ts
+                )
+                eligible = []
+                for candidate in threshold_candidates[camera]:
+                    if threshold_target_ts <= candidate["timestamp"] <= deadline_ts:
+                        eligible.append(candidate)
+                    elif candidate["origin"] == "dedicated":
+                        rejected[camera] = {
+                            "source": "weight_10000",
+                            "reason": "late_or_invalid_timestamp",
+                            "captured_at": candidate["captured_at"],
+                        }
+                threshold_candidates[camera] = eligible
+        else:
+            for camera in cameras:
+                for candidate in threshold_candidates[camera]:
+                    rejected[camera] = {
+                        "source": "weight_10000",
+                        "reason": "late_or_invalid_timestamp",
+                        "captured_at": candidate["captured_at"],
+                    }
+            threshold_candidates = {camera: [] for camera in cameras}
+
+        session_start_candidates = {camera: [] for camera in cameras}
+        for camera in cameras:
+            if camera in start_snapshots:
+                start_snapshot = dict(start_snapshots[camera])
+                start_snapshot["origin"] = "session_start"
+                session_start_candidates[camera].append(start_snapshot)
+        if metadata.get("rear_start_path"):
+            try:
+                rear_ts = datetime.fromisoformat(metadata.get("rear_captured_at")).timestamp()
+            except (TypeError, ValueError):
+                rear_ts = None
+            if rear_ts is not None:
+                session_start_candidates["cam2"].append({
+                    "path": os.path.abspath(metadata["rear_start_path"]),
+                    "captured_at": metadata["rear_captured_at"],
+                    "timestamp": rear_ts, "origin": "session_start",
+                })
+
+        if unknown_plate == "UNKNOWN_OCR":
+            diagnostics = metadata.get("lpr_diagnostics") or {}
+            detection_paths = []
+            first_detection_frame = diagnostics.get("first_plate_detected_frame")
+            if first_detection_frame:
+                detection_paths.append(first_detection_frame)
+            for paths in (diagnostics.get("evidence") or {}).values():
+                relative_path = next((
+                    paths.get(key) for key in (
+                        "plate_detected", "valid", "plate_detected_ocr_low_confidence",
+                        "plate_detected_ocr_invalid_format", "plate_detected_ocr_blank",
+                        "crop_failed", "ocr_inference_error",
+                    ) if paths.get(key)
+                ), None)
+                if relative_path:
+                    detection_paths.append(relative_path)
+            detection_candidates = [
+                candidates_by_path[path] for path in dict.fromkeys(detection_paths)
+                if path in candidates_by_path
+            ]
+            detection_candidates.extend(tracked_detection_candidates)
+            source = "plate_detection"
+            if detection_candidates:
+                anchor = min(detection_candidates, key=lambda item: item["timestamp"])
+                target = anchor["timestamp"]
+                candidate_sets = {
+                    camera: [
+                        candidate for candidate in [
+                            *session_start_candidates[camera], *timeline[camera],
+                        ]
+                        if abs(candidate["timestamp"] - target) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
+                    ]
+                    for camera in cameras
+                }
+                candidate_sets[anchor["camera"]] = [anchor]
+            else:
+                target = started_ts
+                candidate_sets = {camera: [] for camera in cameras}
+        elif unknown_plate == "UNKNOWN_DETECTION":
+            source = "session_early"
+            target = started_ts + UNKNOWN_DETECTION_THUMBNAIL_OFFSET_SECONDS
+            candidate_sets = {}
+            for camera in cameras:
+                candidates = [
+                    *session_start_candidates[camera], *timeline[camera],
+                    *start_candidates[camera], *threshold_candidates[camera],
+                ]
+                nearest = min(
+                    candidates, key=lambda item: abs(item["timestamp"] - target),
+                    default=None,
+                )
+                if (
+                    nearest is not None
+                    and abs(nearest["timestamp"] - target) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
+                ):
+                    candidate_sets[camera] = [nearest]
+                else:
+                    candidate_sets[camera] = []
+                    if nearest is not None:
+                        rejected[camera] = {
+                            "source": source, "reason": "outside_target_window",
+                            "captured_at": nearest["captured_at"],
+                            "offset_ms": round((nearest["timestamp"] - target) * 1000),
+                        }
+        elif has_snapshot_metadata or any(session_start_candidates[camera] for camera in cameras):
+            source = "session_start"
+            target = started_ts
+            candidate_sets = session_start_candidates
+        else:
+            source = "legacy_weight"
+            target = target_ts
+            candidate_sets = {
+                camera: [
+                    candidate for candidate in timeline[camera]
+                    if abs(candidate["timestamp"] - target_ts) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
+                ]
+                for camera in cameras
             }
+
+        available_cameras = [camera for camera in cameras if candidate_sets[camera]]
+        if unknown_plate == "UNKNOWN_DETECTION" and len(available_cameras) > 1:
+            synchronized_groups = [
+                group
+                for size in range(1, len(available_cameras) + 1)
+                for group in candidate_combinations(available_cameras, size)
+                if (
+                    max(candidate_sets[camera][0]["timestamp"] for camera in group)
+                    - min(candidate_sets[camera][0]["timestamp"] for camera in group)
+                    <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
+                )
+            ]
+            synchronized_cameras = min(
+                synchronized_groups,
+                key=lambda group: (
+                    -len(group),
+                    sum(abs(candidate_sets[camera][0]["timestamp"] - target) for camera in group),
+                    max(candidate_sets[camera][0]["timestamp"] for camera in group)
+                    - min(candidate_sets[camera][0]["timestamp"] for camera in group),
+                    group,
+                ),
+            )
+            for camera in set(available_cameras) - set(synchronized_cameras):
+                candidate = candidate_sets[camera][0]
+                rejected[camera] = {
+                    "source": source, "reason": "inter_camera_skew",
+                    "captured_at": candidate["captured_at"],
+                    "offset_ms": round((candidate["timestamp"] - target) * 1000),
+                }
+                candidate_sets[camera] = []
+            available_cameras = [camera for camera in cameras if candidate_sets[camera]]
+        selected = {}
+        captured_at = {}
+        selection = {}
+        synchronized_gap_ms = None
+        ranked = []
+        if available_cameras:
+            combinations = product(*(candidate_sets[camera] for camera in available_cameras))
+            if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
+                ranked = sorted(
+                    combinations,
+                    key=lambda items: (
+                        sum(abs(item["timestamp"] - target) for item in items),
+                        max(item["timestamp"] for item in items)
+                        - min(item["timestamp"] for item in items),
+                    ),
+                )
+            else:
+                ranked = sorted(
+                    combinations,
+                    key=lambda items: (
+                        max(item["timestamp"] for item in items)
+                        - min(item["timestamp"] for item in items),
+                        sum(abs(item["timestamp"] - target) for item in items),
+                    ),
+                )
+        for combination in ranked:
+            frames = [cv2.imread(item["path"]) for item in combination]
+            if any(frame is None for frame in frames):
+                continue
+            timestamps = [item["timestamp"] for item in combination]
+            synchronized_gap_ms = round((max(timestamps) - min(timestamps)) * 1000)
+            for camera, item, frame in zip(available_cameras, combination, frames):
+                selected[camera] = frame
+                captured_at[camera] = item["captured_at"]
+                selection[camera] = {
+                    "captured_at": item["captured_at"],
+                    "offset_ms": round((item["timestamp"] - target) * 1000),
+                    "source": source,
+                    "fallback": item["origin"] if item["origin"] != "dedicated" else None,
+                }
+            break
+        missing = [camera for camera in cameras if camera not in selected]
         log_metric(
             log_fn, "unknown_photo_selection", id=metadata["session_id"],
-            target_at=target_at, weight_source=metadata.get("weight_source"),
-            selected=selection, missing_cameras=missing,
+            target_at=datetime.fromtimestamp(target, timezone.utc).isoformat(
+                timespec="milliseconds"
+            ),
+            weight_source=metadata.get("weight_source"), unknown_type=unknown_plate,
+            lpr_target_source=source,
+            camera_target_at={
+                camera: datetime.fromtimestamp(target, timezone.utc).isoformat(timespec="milliseconds")
+                for camera in cameras
+            },
+            synchronized_gap_ms=synchronized_gap_ms,
+            selected=selection, rejected=rejected, missing_cameras=missing,
         )
         return selected, captured_at
 
@@ -1803,7 +2310,9 @@ class SessionManager:
             "unchosen_cam3": _make("photo-unchosen-cam3"),
         }
 
-    def _attach_unknown_publish_images(self, result, frames, captured_at, session_id):
+    def _attach_unknown_publish_images(
+        self, result, frames, captured_at, session_id, unknown_plate="UNKNOWN",
+    ):
         available = [
             camera for camera in ("cam1", "cam2", "cam3")
             if frames.get(camera) is not None
@@ -1815,7 +2324,7 @@ class SessionManager:
         if not available:
             return
 
-        paths = self._prepare_capture_paths(datetime.now(), "UNKNOWN", session_id)
+        paths = self._prepare_capture_paths(datetime.now(), unknown_plate, session_id)
         for camera in available:
             frame = frames[camera]
             if camera == "cam2":
@@ -1872,9 +2381,9 @@ class SessionManager:
         attach_started_at = time.time()
 
         tracker = tracker or self.plate_tracker
-        frame, img_plate, camera_name, observed_at = tracker.get_image_frame(
-            plate, aliases=image_aliases
-        )
+        image = tracker.get_image_frame(plate, aliases=image_aliases)
+        frame, img_plate, camera_name, observed_at = image[:4]
+        debug = image[4] if len(image) > 4 else None
         if frame is None or not plate:
             return False
         if img_plate != plate:
@@ -1888,6 +2397,8 @@ class SessionManager:
             rear_frame = self.session.rear_start_frame
         if rear_frame is not None:
             rear_frame = self._crop_cam2_result_image(rear_frame)
+        if PUSH_IMAGE_DEBUG_OVERLAY and debug:
+            self._draw_lpr_debug_overlay(frame, debug, camera_name)
         front_img, merged_img, rear_img = self._build_publish_images(
             frame, plate, stable_weight, decimal_pos, rear_frame
         )
@@ -1926,9 +2437,26 @@ class SessionManager:
         result["_image_object_keys"] = [item[2] for item in save_items]
         result["_image_paths"] = [item[0] for item in save_items]
         result["_image_save_items"] = save_items
-
         log_fn("TIMING", f"Publish images: build={(time.time() - attach_started_at) * 1000:.0f}ms")
         return True
+
+    @staticmethod
+    def _draw_lpr_debug_overlay(frame, debug, camera_name):
+        h, w = frame.shape[:2]
+        bbox = debug.get("bbox") or []
+        if len(bbox) == 4:
+            x1, y1, x2, y2 = (max(0, int(value)) for value in bbox)
+            cv2.rectangle(frame, (min(x1, w - 1), min(y1, h - 1)), (min(x2, w - 1), min(y2, h - 1)), (0, 255, 0), 3)
+        candidates = debug.get("candidates") or []
+        lines = [
+            f"{camera_name} det={debug.get('det_conf', 0.0):.3f} ocr={debug.get('ocr_confidence', 0.0):.3f}",
+            f"result={debug.get('plate', 'unknown')} raw={debug.get('raw_text', '')}",
+            f"candidates={', '.join(candidates[:5]) or '-'}",
+        ]
+        y = 32
+        for line in lines:
+            cv2.putText(frame, line[:180], (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            y += 32
 
     def _save_undetectable_frame(self, log_fn):
         """Save the first 'unknown' detection frame to /storage/undetectable/."""
