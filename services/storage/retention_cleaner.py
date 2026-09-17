@@ -1,8 +1,10 @@
 """Image retention cleanup for local storage."""
 
 import json
+import hashlib
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import date, datetime
@@ -12,6 +14,7 @@ from config import (
     LOG_DIR,
     LOG_FILE_PREFIX,
     LOG_RETENTION_DAYS,
+    MINIO_BUCKET,
     SCALE_DATA_DIR,
     SCALE_DATA_RETENTION_DAYS,
     MQTT_DEAD_LETTER_RETENTION_DAYS,
@@ -19,6 +22,7 @@ from config import (
 )
 
 CLEANED_SUFFIX = "--Cleaned"
+PRESSURE_CLEANUP_GRACE_SECONDS = 60 * 60
 COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[_-]")
 SEPARATED_DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_](\d{2})[-_](\d{2})(?!\d)")
 
@@ -26,12 +30,16 @@ SEPARATED_DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_](\d{2})[-_](\d{2})(?!\d)")
 class ImageRetentionCleaner:
     """Deletes old image files from configured roots on a low-frequency schedule."""
 
-    def __init__(self, roots, retention_days, check_interval_seconds, extensions, log_fn=None):
+    def __init__(
+        self, roots, retention_days, check_interval_seconds, extensions, log_fn=None,
+        pressure_free_bytes=None,
+    ):
         self.roots = list(roots)
         self.retention_days = retention_days
         self.check_interval_seconds = check_interval_seconds
         self.extensions = {ext.lower() for ext in extensions}
         self.log_fn = log_fn
+        self.pressure_free_bytes = pressure_free_bytes
         self._stop_event = threading.Event()
         self._thread = None
 
@@ -114,23 +122,32 @@ class ImageRetentionCleaner:
             return parsed, "filename_date"
         return datetime.fromtimestamp(stat.st_mtime), "mtime"
 
-    def _pending_upload_paths(self):
-        pending_file = os.path.join(SERVICE_DIR, "storage", "upload_pending.jsonl")
+    def _pending_image_paths(self):
         paths = set()
-        if not os.path.exists(pending_file):
-            return paths
-        try:
-            with open(pending_file, "r") as fp:
-                for line in fp:
-                    try:
-                        task = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    fpath = task.get("fpath")
-                    if fpath:
-                        paths.add(os.path.abspath(fpath))
-        except OSError as exc:
-            self._log("WARNING", f"Image retention pending upload read failed: {exc}")
+        pending_files = (
+            ("upload", os.path.join(SERVICE_DIR, "storage", "upload_pending.jsonl")),
+            ("publish", os.path.join(SERVICE_DIR, "storage", "publish_pending.jsonl")),
+        )
+        for queue_name, pending_file in pending_files:
+            if not os.path.exists(pending_file):
+                continue
+            try:
+                with open(pending_file, "r") as fp:
+                    for line in fp:
+                        try:
+                            task = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        fpath = task.get("fpath")
+                        if fpath:
+                            paths.add(os.path.abspath(fpath))
+                        for path in task.get("image_paths") or []:
+                            paths.add(os.path.abspath(path))
+            except OSError as exc:
+                self._log(
+                    "WARNING",
+                    f"Image retention pending {queue_name} read failed: {exc}",
+                )
         return paths
 
     def _tag_cleaned_directories(self):
@@ -158,6 +175,60 @@ class ImageRetentionCleaner:
                     self._log("WARNING", f"Cleaned tag failed for {dirpath}: {exc}")
         return tagged, tag_failed
 
+    def _pressure_cleanup(self, pending_upload_paths, now_ts):
+        if self.pressure_free_bytes is None:
+            return 0, 0, 0
+        storage_root = next((root for root in self.roots if os.path.isdir(root)), None)
+        if storage_root is None:
+            return 0, 0, 0
+        try:
+            free_bytes = shutil.disk_usage(storage_root).free
+        except OSError as exc:
+            self._log("WARNING", f"Image pressure cleanup free-space check failed: {exc}")
+            return 0, 1, 0
+        required = self.pressure_free_bytes - free_bytes
+        if required <= 0:
+            return 0, 0, 0
+
+        candidates = []
+        for root in self.roots:
+            if not os.path.isdir(root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+                dirnames[:] = [
+                    name for name in dirnames
+                    if not os.path.islink(os.path.join(dirpath, name))
+                ]
+                for filename in filenames:
+                    if os.path.splitext(filename)[1].lower() not in {".jpg", ".jpeg", ".png"}:
+                        continue
+                    fpath = os.path.join(dirpath, filename)
+                    if os.path.islink(fpath) or os.path.abspath(fpath) in pending_upload_paths:
+                        continue
+                    try:
+                        stat = os.stat(fpath, follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.st_mtime >= now_ts - PRESSURE_CLEANUP_GRACE_SECONDS:
+                        continue
+                    age_value, _source = self._image_age_source(fpath, root, filename, stat)
+                    if isinstance(age_value, date) and not isinstance(age_value, datetime):
+                        age_value = datetime.combine(age_value, datetime.min.time())
+                    candidates.append((age_value.timestamp(), fpath, stat.st_size))
+
+        deleted = failed = reclaimed = 0
+        for _age, fpath, size in sorted(candidates):
+            if reclaimed >= required:
+                break
+            try:
+                os.remove(fpath)
+                deleted += 1
+                reclaimed += size
+            except OSError as exc:
+                failed += 1
+                self._log("WARNING", f"Image pressure cleanup delete failed for {fpath}: {exc}")
+        return deleted, failed, reclaimed
+
     def run_once(self, now=None):
         now_ts = time.time() if now is None else now
         cutoff = now_ts - (self.retention_days * 24 * 60 * 60)
@@ -170,7 +241,7 @@ class ImageRetentionCleaner:
         deleted_by_filename_date = 0
         deleted_by_mtime = 0
         skipped_pending_uploads = 0
-        pending_upload_paths = self._pending_upload_paths()
+        pending_image_paths = self._pending_image_paths()
 
         for root in self.roots:
             if not os.path.isdir(root):
@@ -184,7 +255,7 @@ class ImageRetentionCleaner:
                     fpath = os.path.join(dirpath, filename)
                     if os.path.islink(fpath):
                         continue
-                    if os.path.abspath(fpath) in pending_upload_paths:
+                    if os.path.abspath(fpath) in pending_image_paths:
                         skipped_pending_uploads += 1
                         continue
                     scanned += 1
@@ -215,6 +286,9 @@ class ImageRetentionCleaner:
                         failed += 1
                         self._log("WARNING", f"Image retention delete failed for {fpath}: {exc}")
 
+        pressure_deleted, pressure_failed, pressure_reclaimed = self._pressure_cleanup(
+            pending_image_paths, now_ts
+        )
         tagged, tag_failed = self._tag_cleaned_directories()
 
         self._log(
@@ -224,7 +298,9 @@ class ImageRetentionCleaner:
             f"deleted_by_path_date={deleted_by_path_date} "
             f"deleted_by_filename_date={deleted_by_filename_date} deleted_by_mtime={deleted_by_mtime} "
             f"skipped_pending_uploads={skipped_pending_uploads} "
-            f"reclaimed={reclaimed / (1024 * 1024):.1f}MB cutoff_days={self.retention_days}",
+            f"reclaimed={reclaimed / (1024 * 1024):.1f}MB cutoff_days={self.retention_days} "
+            f"pressure_deleted={pressure_deleted} pressure_failed={pressure_failed} "
+            f"pressure_reclaimed={pressure_reclaimed / (1024 * 1024):.1f}MB",
         )
         return {
             "scanned": scanned,
@@ -237,7 +313,123 @@ class ImageRetentionCleaner:
             "deleted_by_filename_date": deleted_by_filename_date,
             "deleted_by_mtime": deleted_by_mtime,
             "skipped_pending_uploads": skipped_pending_uploads,
+            "pressure_deleted": pressure_deleted,
+            "pressure_failed": pressure_failed,
+            "pressure_reclaimed": pressure_reclaimed,
         }
+
+
+class VerifiedMinioCacheCleaner:
+    """Evict published local images only after exact MinIO verification."""
+
+    def __init__(self, root, retention_days, check_interval_seconds, client_factory, log_fn=None):
+        self.root = os.path.abspath(root)
+        self.retention_days = retention_days
+        self.check_interval_seconds = check_interval_seconds
+        self.client_factory = client_factory
+        self.log_fn = log_fn
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _log(self, level, msg):
+        if self.log_fn:
+            self.log_fn(level, msg)
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._log("INFO", "VerifiedMinioCacheCleaner started")
+
+    def stop(self, timeout=3.0):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+        self._log("INFO", "VerifiedMinioCacheCleaner stopped")
+
+    def _run_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception as exc:
+                self._log("ERROR", f"MinIO cache cleanup failed: {exc}")
+            self._stop_event.wait(self.check_interval_seconds)
+
+    @staticmethod
+    def _md5(path):
+        digest = hashlib.md5()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _date_from_relative_path(relative_path):
+        parts = relative_path.split(os.sep)
+        if len(parts) < 4:
+            return None
+        return ImageRetentionCleaner._make_date(*parts[:3])
+
+    @staticmethod
+    def _pending_image_paths():
+        return ImageRetentionCleaner([], 0, 0, set())._pending_image_paths()
+
+    def run_once(self, now=None, client=None):
+        now = time.time() if now is None else now
+        cutoff_date = datetime.fromtimestamp(now - self.retention_days * 86400).date()
+        pending_paths = self._pending_image_paths()
+        remote = client or self.client_factory()
+        scanned = verified = deleted = failed = skipped_pending = remote_mismatch = 0
+        reclaimed = 0
+        if not os.path.isdir(self.root):
+            return {"scanned": 0, "verified": 0, "deleted": 0, "failed": 0,
+                    "skipped_pending": 0, "remote_mismatch": 0,
+                    "reclaimed": 0}
+        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
+            dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+            for filename in filenames:
+                if os.path.splitext(filename)[1].lower() not in {".jpg", ".jpeg", ".png"}:
+                    continue
+                path = os.path.abspath(os.path.join(dirpath, filename))
+                if path in pending_paths or os.path.islink(path):
+                    skipped_pending += 1
+                    continue
+                relative_path = os.path.relpath(path, self.root)
+                image_date = self._date_from_relative_path(relative_path)
+                if image_date is None or image_date >= cutoff_date:
+                    continue
+                scanned += 1
+                object_key = "storage/weighbridge/" + relative_path.replace(os.sep, "/")
+                try:
+                    stat = remote.stat_object(MINIO_BUCKET, object_key)
+                    local_size = os.path.getsize(path)
+                    remote_etag = str(getattr(stat, "etag", "")).strip('"').lower()
+                    if stat.size != local_size or not remote_etag or "-" in remote_etag:
+                        remote_mismatch += 1
+                        continue
+                    if self._md5(path) != remote_etag:
+                        remote_mismatch += 1
+                        continue
+                    verified += 1
+                    os.remove(path)
+                    deleted += 1
+                    reclaimed += local_size
+                except OSError as exc:
+                    failed += 1
+                    self._log("WARNING", f"MinIO cache cleanup failed path={path}: {exc}")
+                except Exception as exc:
+                    failed += 1
+                    self._log("WARNING", f"MinIO cache verification failed key={object_key}: {exc}")
+        self._log(
+            "INFO",
+            f"MinIO cache cleanup complete: scanned={scanned} verified={verified} deleted={deleted} "
+            f"failed={failed} skipped_pending={skipped_pending} "
+            f"remote_mismatch={remote_mismatch} reclaimed={reclaimed / (1024 * 1024):.1f}MB "
+            f"cutoff_days={self.retention_days}",
+        )
+        return {"scanned": scanned, "verified": verified, "deleted": deleted, "failed": failed,
+                "skipped_pending": skipped_pending,
+                "remote_mismatch": remote_mismatch, "reclaimed": reclaimed}
 
 
 class StorageMaintenance:
@@ -303,6 +495,25 @@ class StorageMaintenance:
             return deleted, directories_deleted
         for name in os.listdir(LOG_DIR):
             path = os.path.join(LOG_DIR, name)
+            file_date = None
+            match = re.fullmatch(rf"{re.escape(LOG_FILE_PREFIX)}_(\d{{4}}-\d{{2}}-\d{{2}})\.log", name)
+            if match:
+                file_date = self._dated_name(match.group(1))
+            else:
+                match = re.fullmatch(r"resource-watchdog\.(\d{8})_\d{6}\.jsonl", name)
+                if match:
+                    try:
+                        file_date = datetime.strptime(match.group(1), "%Y%m%d").date()
+                    except ValueError:
+                        file_date = None
+            if file_date is not None:
+                if file_date <= cutoff and os.path.isfile(path) and not os.path.islink(path):
+                    try:
+                        os.remove(path)
+                        deleted += 1
+                    except OSError:
+                        pass
+                continue
             if os.path.islink(path) or not os.path.isdir(path):
                 continue
             date_value = self._dated_name(name)

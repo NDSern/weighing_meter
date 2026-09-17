@@ -52,6 +52,7 @@ from config import (
     IMAGE_RETENTION_DAYS,
     IMAGE_RETENTION_ENABLED,
     IMAGE_RETENTION_EXTENSIONS,
+    IMAGE_STORAGE_TARGET_FREE_BYTES,
     LOG_DIR,
     LOG_FILE_PREFIX,
     LOG_FILE_PATH,
@@ -66,6 +67,7 @@ from config import (
     SERVICE_DIR,
     LPR_CHARSET,
     LPR_DETECTOR_MODEL,
+    LPR_FALLBACK_DETECTOR_MODEL,
     LPR_RECOGNIZER_MODEL,
     LPR_SPOOL_DIR,
     SESSION_FRAME_DISK_CAP_BYTES,
@@ -82,6 +84,7 @@ from services.runtime.lpr_bundle import verify_lpr_bundle
 
 _LPR_BUNDLE_PATHS = {
     "detector": LPR_DETECTOR_MODEL,
+    "fallback_detector": LPR_FALLBACK_DETECTOR_MODEL,
     "recognizer": LPR_RECOGNIZER_MODEL,
     "charset": LPR_CHARSET,
     "decoder": os.path.join(SERVICE_DIR, "services", "pipeline", "detector_obb_decode.py"),
@@ -104,6 +107,7 @@ from d2008_scale_reader import D2008Reader
 from mqtt_service import MqttService
 
 from services.pipeline.license_plate_recognition import (
+    detect_axis_plate_regions,
     detect_plate_regions,
     load_lpr_charset,
     recognize_plate_regions,
@@ -120,7 +124,9 @@ from services.capture.frame_source import set_log_fn as set_frame_source_log
 from services.storage.image_save_worker import ImageSaveWorker
 from services.storage.image_save_worker import set_log_fn as set_image_save_log
 from services.storage.publish_outbox import PublishOutbox
-from services.storage.retention_cleaner import ImageRetentionCleaner, StorageMaintenance
+from services.storage.retention_cleaner import (
+    ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
+)
 from services.runtime import RknnModelSet
 from services.session import SessionManager
 from services.session.session_manager import set_log_fn as set_session_log
@@ -142,7 +148,7 @@ def main():
     }
     models = mqtt_svc = cam1 = cam3 = grabber2 = None
     detect_coord = reader = frame_spool = deferred_lpr = None
-    retention_cleaner = storage_maintenance = session_manager = plate_tracker = None
+    retention_cleaner = minio_cache_cleaner = storage_maintenance = session_manager = plate_tracker = None
     mqtt_started = image_worker_started = outbox_started = False
     detect_stopped = deferred_stopped = True
 
@@ -177,6 +183,7 @@ def main():
             False,
             RKNN,
             log_fn=log,
+            fallback_detector_path=LPR_FALLBACK_DETECTOR_MODEL,
         )
         handles = models.handles
         validate_lpr_runtime(
@@ -185,6 +192,7 @@ def main():
             lpr_charset,
             model_paths=_LPR_BUNDLE_PATHS,
             log_fn=log,
+            fallback_detectors=[("fallback", handles.fallback_detector)],
         )
 
         plate_tracker = PlateTracker()
@@ -198,9 +206,13 @@ def main():
         cam1 = CameraGrabber(
             RTSP_URL, "cam1", handles.cam1_detector, handles.cam1_ocr,
             CAM1_LPR_CROP, expected_resolution=CAM1_EXPECTED_RESOLUTION,
+            fallback_detector=handles.fallback_detector,
         )
         cam1.start()
-        cam3 = CameraGrabber(RTSP_URL_3, "cam3", handles.cam3_detector, handles.cam3_ocr, CAM3_LPR_CROP)
+        cam3 = CameraGrabber(
+            RTSP_URL_3, "cam3", handles.cam3_detector, handles.cam3_ocr,
+            CAM3_LPR_CROP, fallback_detector=handles.fallback_detector,
+        )
         cam3.start()
         grabber2 = FrameGrabber(RTSP_URL_2)
         grabber2.start()
@@ -222,8 +234,17 @@ def main():
                 IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
                 IMAGE_RETENTION_EXTENSIONS,
                 log_fn=log,
+                pressure_free_bytes=IMAGE_STORAGE_TARGET_FREE_BYTES,
             )
             retention_cleaner.start()
+            minio_cache_cleaner = VerifiedMinioCacheCleaner(
+                CAPTURE_DIR,
+                3,
+                IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
+                ImageSaveWorker._get_minio,
+                log_fn=log,
+            )
+            minio_cache_cleaner.start()
 
         session_manager = SessionManager(
             plate_tracker=plate_tracker,
@@ -242,7 +263,12 @@ def main():
             ),
             session_context=session_manager.session_context,
         )
-        detect_coord.configure_split_pipeline(detect_plate_regions, recognize_plate_regions, lpr_charset)
+        detect_coord.configure_split_pipeline(
+            detect_plate_regions,
+            recognize_plate_regions,
+            lpr_charset,
+            fallback_detect_regions_fn=detect_axis_plate_regions,
+        )
         frame_spool = SessionFrameSpool(
             LPR_SPOOL_DIR,
             cam1,
@@ -308,6 +334,8 @@ def main():
                 log("ERROR", f"{name} capture thread did not stop")
         if retention_cleaner:
             cleanup("image_retention", retention_cleaner.stop)
+        if minio_cache_cleaner:
+            cleanup("minio_cache_retention", minio_cache_cleaner.stop)
         if storage_maintenance:
             cleanup("storage_maintenance", storage_maintenance.stop)
         if outbox_started:

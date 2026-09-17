@@ -1,12 +1,15 @@
 import os
+import json
 import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from services.storage.dead_letter import is_expired
-from services.storage.retention_cleaner import ImageRetentionCleaner, StorageMaintenance
+from services.storage.retention_cleaner import (
+    ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
+)
 
 
 class DeadLetterTests(unittest.TestCase):
@@ -19,6 +22,83 @@ class DeadLetterTests(unittest.TestCase):
 
 
 class StorageMaintenanceTests(unittest.TestCase):
+    def test_minio_cache_cleanup_deletes_only_verified_old_image(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_dir = os.path.join(root, "2026", "07", "11")
+            recent_dir = os.path.join(root, "2026", "07", "12")
+            os.makedirs(old_dir)
+            os.makedirs(recent_dir)
+            old_image = os.path.join(old_dir, "old.jpg")
+            recent_image = os.path.join(recent_dir, "recent.jpg")
+            with open(old_image, "wb") as handle:
+                handle.write(b"verified-image")
+            with open(recent_image, "wb") as handle:
+                handle.write(b"recent-image")
+            client = Mock()
+            client.stat_object.return_value = type(
+                "Object", (), {"size": os.path.getsize(old_image),
+                                 "etag": "b97e8006dad65f5e8fd1da4ba4375b05"}
+            )()
+            cleaner = VerifiedMinioCacheCleaner(root, 3, 86400, client)
+
+            result = cleaner.run_once(
+                now=datetime(2026, 7, 15, 12, 0, 0).timestamp(), client=client,
+            )
+
+            self.assertEqual(result["deleted"], 1)
+            self.assertFalse(os.path.exists(old_image))
+            self.assertTrue(os.path.exists(recent_image))
+
+    def test_minio_cache_cleanup_keeps_pending_or_mismatched_image(self):
+        with tempfile.TemporaryDirectory() as service_dir:
+            root = os.path.join(service_dir, "storage", "weighbridge")
+            old_dir = os.path.join(root, "2026", "07", "11")
+            os.makedirs(old_dir)
+            pending = os.path.join(old_dir, "pending.jpg")
+            mismatched = os.path.join(old_dir, "mismatched.jpg")
+            for path in (pending, mismatched):
+                with open(path, "wb") as handle:
+                    handle.write(b"local-image")
+            pending_file = os.path.join(service_dir, "storage", "upload_pending.jsonl")
+            with open(pending_file, "w") as handle:
+                handle.write(json.dumps({"fpath": pending, "object_key": "pending"}) + "\n")
+            client = Mock()
+            client.stat_object.return_value = type(
+                "Object", (), {"size": os.path.getsize(mismatched),
+                                 "etag": "00000000000000000000000000000000"}
+            )()
+            cleaner = VerifiedMinioCacheCleaner(root, 3, 86400, client)
+
+            with patch("services.storage.retention_cleaner.SERVICE_DIR", service_dir):
+                result = cleaner.run_once(
+                    now=datetime(2026, 7, 15, 12, 0, 0).timestamp(), client=client,
+                )
+
+            self.assertEqual(result["deleted"], 0)
+            self.assertEqual(result["skipped_pending"], 1)
+            self.assertEqual(result["remote_mismatch"], 1)
+            self.assertTrue(os.path.exists(pending))
+            self.assertTrue(os.path.exists(mismatched))
+
+    def test_minio_cache_cleanup_keeps_image_when_verification_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_dir = os.path.join(root, "2026", "07", "11")
+            os.makedirs(old_dir)
+            image = os.path.join(old_dir, "remote-missing.jpg")
+            with open(image, "wb") as handle:
+                handle.write(b"local-image")
+            client = Mock()
+            client.stat_object.side_effect = RuntimeError("object not found")
+            cleaner = VerifiedMinioCacheCleaner(root, 3, 86400, client)
+
+            result = cleaner.run_once(
+                now=datetime(2026, 7, 15, 12, 0, 0).timestamp(), client=client,
+            )
+
+            self.assertEqual(result["deleted"], 0)
+            self.assertEqual(result["failed"], 1)
+            self.assertTrue(os.path.exists(image))
+
     def test_removes_only_matching_expired_files(self):
         with tempfile.TemporaryDirectory() as root:
             now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
@@ -38,6 +118,25 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(old_log))
             self.assertTrue(os.path.exists(recent_log))
             self.assertTrue(os.path.exists(unrelated))
+
+    def test_removes_expired_legacy_rotated_logs(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_service = os.path.join(root, "weighing_service_2026-05-13.log")
+            old_watchdog = os.path.join(root, "resource-watchdog.20260513_235959.jsonl")
+            current_watchdog = os.path.join(root, "resource-watchdog.jsonl")
+            recent_service = os.path.join(root, "weighing_service_2026-07-13.log")
+            for path in (old_service, old_watchdog, current_watchdog, recent_service):
+                open(path, "w").close()
+            now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
+
+            with patch("services.storage.retention_cleaner.LOG_DIR", root):
+                result = StorageMaintenance(86400).run_once(now=now)
+
+            self.assertEqual(result["logs_deleted"], 2)
+            self.assertFalse(os.path.exists(old_service))
+            self.assertFalse(os.path.exists(old_watchdog))
+            self.assertTrue(os.path.exists(current_watchdog))
+            self.assertTrue(os.path.exists(recent_service))
 
     def test_scale_retention_keeps_archive_and_removes_sidecars(self):
         with tempfile.TemporaryDirectory() as root:
@@ -93,6 +192,50 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(old_image))
             self.assertFalse(os.path.exists(old_metadata))
             self.assertTrue(os.path.exists(recent_image))
+
+    def test_pressure_cleanup_deletes_oldest_images_but_keeps_pending_images(self):
+        with tempfile.TemporaryDirectory() as service_dir:
+            root = os.path.join(service_dir, "storage", "weighbridge")
+            old_dir = os.path.join(root, "2026", "07", "12")
+            recent_dir = os.path.join(root, "2026", "07", "14")
+            os.makedirs(old_dir)
+            os.makedirs(recent_dir)
+            pending = os.path.join(old_dir, "pending.jpg")
+            pending_publish = os.path.join(old_dir, "pending-publish.jpg")
+            old_image = os.path.join(old_dir, "old.jpg")
+            recent_image = os.path.join(recent_dir, "recent.jpg")
+            fresh_image = os.path.join(recent_dir, "fresh.jpg")
+            for path in (pending, pending_publish, old_image, recent_image):
+                with open(path, "wb") as handle:
+                    handle.write(b"12345")
+                os.utime(path, (1, 1))
+            with open(fresh_image, "wb") as handle:
+                handle.write(b"12345")
+            pending_file = os.path.join(service_dir, "storage", "upload_pending.jsonl")
+            with open(pending_file, "w") as handle:
+                handle.write(json.dumps({"fpath": pending, "object_key": "pending"}) + "\n")
+            publish_file = os.path.join(service_dir, "storage", "publish_pending.jsonl")
+            with open(publish_file, "w") as handle:
+                handle.write(json.dumps({"image_paths": [pending_publish]}) + "\n")
+            cleaner = ImageRetentionCleaner(
+                [root], 30, 3600, {".jpg"}, pressure_free_bytes=110,
+            )
+            usage = type("Usage", (), {"free": 100})()
+
+            with patch("services.storage.retention_cleaner.SERVICE_DIR", service_dir), patch(
+                "services.storage.retention_cleaner.shutil.disk_usage", return_value=usage,
+            ):
+                result = cleaner.run_once(
+                    now=datetime(2026, 7, 15, 12, 0, 0).timestamp()
+                )
+
+            self.assertEqual(result["pressure_deleted"], 2)
+            self.assertEqual(result["pressure_reclaimed"], 10)
+            self.assertTrue(os.path.exists(pending))
+            self.assertTrue(os.path.exists(pending_publish))
+            self.assertTrue(os.path.exists(fresh_image))
+            self.assertFalse(os.path.exists(old_image))
+            self.assertFalse(os.path.exists(recent_image))
 
 
 if __name__ == "__main__":
