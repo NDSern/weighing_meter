@@ -245,6 +245,21 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(result, {"archived": 0, "archive_deleted": 0, "failed": 1})
             self.assertTrue(os.path.exists(day))
 
+    def test_diagnostic_archive_shutdown_keeps_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            day = os.path.join(root, "2026", "07", "11")
+            os.makedirs(day)
+            open(os.path.join(day, "attempt.jpg"), "w").close()
+            cleaner = DiagnosticArchiveCleaner([root], 3, 30, 86400)
+            cleaner._stop_event.set()
+
+            result = cleaner.run_once(now=datetime(2026, 7, 15, 12, 0, 0).timestamp())
+
+            self.assertEqual(result, {"archived": 0, "archive_deleted": 0, "failed": 1})
+            self.assertTrue(os.path.exists(day))
+            self.assertFalse(os.path.exists(day + ".tar.zst"))
+            self.assertFalse(os.path.exists(day + ".tar.zst.tmp"))
+
     def test_pressure_cleanup_deletes_oldest_images_but_keeps_pending_images(self):
         with tempfile.TemporaryDirectory() as service_dir:
             root = os.path.join(service_dir, "storage", "weighbridge")

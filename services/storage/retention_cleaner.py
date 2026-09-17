@@ -490,8 +490,23 @@ class DiagnosticArchiveCleaner:
                         if day is not None:
                             yield day, path, False
 
-    @staticmethod
-    def _archive_day(day_path):
+    def _run_archive_command(self, command):
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        while process.poll() is None:
+            if self._stop_event.wait(0.2):
+                process.terminate()
+                process.communicate()
+                raise subprocess.SubprocessError("Diagnostic archive interrupted by shutdown")
+        _, stderr = process.communicate()
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, command, stderr=stderr)
+
+    def _archive_day(self, day_path):
         parent = os.path.dirname(day_path)
         name = os.path.basename(day_path)
         archive_path = day_path + ".tar.zst"
@@ -499,14 +514,8 @@ class DiagnosticArchiveCleaner:
         if os.path.exists(archive_path):
             raise FileExistsError(f"Diagnostic archive already exists: {archive_path}")
         try:
-            subprocess.run(
-                ["tar", "--zstd", "-cf", temp_path, "-C", parent, name],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            )
-            subprocess.run(
-                ["tar", "--zstd", "-tf", temp_path],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            )
+            self._run_archive_command(["tar", "--zstd", "-cf", temp_path, "-C", parent, name])
+            self._run_archive_command(["tar", "--zstd", "-tf", temp_path])
             os.replace(temp_path, archive_path)
             shutil.rmtree(day_path)
             return archive_path
