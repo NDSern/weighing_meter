@@ -148,11 +148,12 @@ storage/undetectable/                 unknown plate evidence
 
 Weight-backed sessions without a confirmed plate publish one of two explicit values:
 
-- `UNKNOWN_OCR`: detector found a plate, but OCR did not produce a confirmed plate. Published thumbnails use the first detector-hit frame and synchronized camera frames nearest that capture time.
-- `UNKNOWN_DETECTION`: no plate region was detected. Published thumbnails target 2 seconds after session start, preserving early vehicle evidence. A camera is omitted when its nearest frame is more than 1 second from that target or more than 1 second from the synchronized camera group, preventing stale cameras from creating mixed-time photo sets.
+- `UNKNOWN_OCR`: detector found a plate, but OCR did not produce a confirmed plate.
+- `UNKNOWN_DETECTION`: no plate region was detected.
+- Both unknown types publish thumbnails nearest the existing recorded-weight timestamp: stable weight, then filtered peak, then raw peak. A camera is omitted when its nearest frame is more than 1 second from that timestamp or more than 1 second from the synchronized camera group, preventing stale cameras from creating mixed-time photo sets.
 - RTSP sources use a native GStreamer pipeline with a 500ms bounded jitter buffer and `appsink max-buffers=1 drop=true sync=false`. This drops superseded decoded frames instead of allowing decoder queues to drift behind real time. Rockchip hosts decode H.265 through `mppvideodec` and convert its stride-padded NV12 output after the one-frame sink; other hosts use `avdec_h265`.
 
-The 2-second target treats every session as potential no-detection evidence and captures before the vehicle can leave the camera view. Each photo's `captured_at` remains its actual frame acquisition time, not the target time.
+No scale-reading, stability, or peak-selection rule changes. Each photo's `captured_at` remains its actual frame acquisition time, not the target time.
 
 After deploying daily scale storage, stop the service and migrate its legacy root database once:
 

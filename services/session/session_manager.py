@@ -55,8 +55,6 @@ REAR_CAPTURE_FALLBACK_SECONDS = 2.0
 UNKNOWN_PHOTO_MAX_OFFSET_SECONDS = 1.0
 UNKNOWN_THUMBNAIL_OFFSET_SECONDS = 2.0
 UNKNOWN_THUMBNAIL_WEIGHT_KG = 10000.0
-# Capture early evidence before a vehicle can leave the camera view.
-UNKNOWN_DETECTION_THUMBNAIL_OFFSET_SECONDS = 2.0
 UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS = (
     UNKNOWN_THUMBNAIL_OFFSET_SECONDS + UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
 )
@@ -1823,7 +1821,7 @@ class SessionManager:
             target_ts = datetime.fromisoformat(target_at).timestamp()
         except (TypeError, ValueError):
             target_ts = None
-            if unknown_plate == "UNKNOWN":
+            if unknown_plate in ("UNKNOWN", "UNKNOWN_OCR", "UNKNOWN_DETECTION"):
                 log_fn("WARNING", f"Unknown photo timing unavailable id={metadata['session_id']}")
                 return {}, {}
 
@@ -1834,16 +1832,11 @@ class SessionManager:
         session_dir = os.path.abspath(session_dir)
         started_ts = datetime.fromisoformat(started_at).timestamp()
         interval = float(metadata.get("capture_interval_seconds", 0.2))
-        has_snapshot_metadata = "unknown_snapshot_paths" in metadata
         start_target_ts = started_ts + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
-        lpr_target_ts = start_target_ts if has_snapshot_metadata else target_ts
-        lpr_target_source = "start_2s" if has_snapshot_metadata else "legacy_weight"
         deadline_ts = started_ts + UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS
         cameras = ("cam1", "cam2", "cam3")
         timeline = {camera: [] for camera in cameras}
         start_snapshots = {}
-        candidates_by_path = {}
-        tracked_detection_candidates = []
         first_seen_by_frame_id = {camera: {} for camera in cameras}
         rejected = {}
 
@@ -1873,9 +1866,6 @@ class SessionManager:
                 "path": path, "captured_at": observed_iso, "timestamp": observed_ts,
                 "origin": "timeline", "camera": camera,
             }
-            candidates_by_path[relative_path] = candidate
-            if item_metadata.get("tracks"):
-                tracked_detection_candidates.append(candidate)
             frame_id = item_metadata.get("frame_id")
             if frame_id is not None:
                 first_seen = first_seen_by_frame_id[camera]
@@ -1990,55 +1980,13 @@ class SessionManager:
                     "timestamp": rear_ts, "origin": "session_start",
                 })
 
-        if unknown_plate == "UNKNOWN_OCR":
-            diagnostics = metadata.get("lpr_diagnostics") or {}
-            detection_paths = []
-            first_detection_frame = diagnostics.get("first_plate_detected_frame")
-            if first_detection_frame:
-                detection_paths.append(first_detection_frame)
-            for paths in (diagnostics.get("evidence") or {}).values():
-                relative_path = next((
-                    paths.get(key) for key in (
-                        "plate_detected", "valid", "plate_detected_ocr_low_confidence",
-                        "plate_detected_ocr_invalid_format", "plate_detected_ocr_blank",
-                        "crop_failed", "ocr_inference_error",
-                    ) if paths.get(key)
-                ), None)
-                if relative_path:
-                    detection_paths.append(relative_path)
-            detection_candidates = [
-                candidates_by_path[path] for path in dict.fromkeys(detection_paths)
-                if path in candidates_by_path
-            ]
-            detection_candidates.extend(tracked_detection_candidates)
-            source = "plate_detection"
-            if detection_candidates:
-                anchor = min(detection_candidates, key=lambda item: item["timestamp"])
-                target = anchor["timestamp"]
-                candidate_sets = {
-                    camera: [
-                        candidate for candidate in [
-                            *session_start_candidates[camera], *timeline[camera],
-                        ]
-                        if abs(candidate["timestamp"] - target) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
-                    ]
-                    for camera in cameras
-                }
-                candidate_sets[anchor["camera"]] = [anchor]
-            else:
-                target = started_ts
-                candidate_sets = {camera: [] for camera in cameras}
-        elif unknown_plate == "UNKNOWN_DETECTION":
-            source = "session_early"
-            target = started_ts + UNKNOWN_DETECTION_THUMBNAIL_OFFSET_SECONDS
+        if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
+            source = "weight_recorded"
+            target = target_ts
             candidate_sets = {}
             for camera in cameras:
-                candidates = [
-                    *session_start_candidates[camera], *timeline[camera],
-                    *start_candidates[camera], *threshold_candidates[camera],
-                ]
                 nearest = min(
-                    candidates, key=lambda item: abs(item["timestamp"] - target),
+                    timeline[camera], key=lambda item: abs(item["timestamp"] - target),
                     default=None,
                 )
                 if (
@@ -2054,7 +2002,7 @@ class SessionManager:
                             "captured_at": nearest["captured_at"],
                             "offset_ms": round((nearest["timestamp"] - target) * 1000),
                         }
-        elif has_snapshot_metadata or any(session_start_candidates[camera] for camera in cameras):
+        elif "unknown_snapshot_paths" in metadata or any(session_start_candidates[camera] for camera in cameras):
             source = "session_start"
             target = started_ts
             candidate_sets = session_start_candidates
@@ -2070,7 +2018,7 @@ class SessionManager:
             }
 
         available_cameras = [camera for camera in cameras if candidate_sets[camera]]
-        if unknown_plate == "UNKNOWN_DETECTION" and len(available_cameras) > 1:
+        if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION") and len(available_cameras) > 1:
             synchronized_groups = [
                 group
                 for size in range(1, len(available_cameras) + 1)

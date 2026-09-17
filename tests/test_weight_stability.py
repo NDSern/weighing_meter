@@ -448,40 +448,41 @@ class SessionWeightTests(unittest.TestCase):
             item["source"] == "session_start" for item in metric["selected"].values()
         ))
 
-    def test_unknown_ocr_photos_anchor_to_first_plate_detection(self):
+    def test_unknown_ocr_photos_anchor_to_recorded_weight(self):
         metadata = {
             "session_id": "unknown-ocr",
             "started_at": "2026-07-21T00:00:00+00:00",
             "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:05+00:00",
             "session_dir": "/spool/session",
             "session_files": [
-                "cam1-000004-sample.jpg",
-                "cam2-000004-sample.jpg",
-                "cam3-000004-sample.jpg",
+                "cam1-000025-sample.jpg",
+                "cam2-000025-sample.jpg",
+                "cam3-000025-sample.jpg",
             ],
             "lpr_diagnostics": {
                 "detected_regions": 1,
                 "evidence": {
-                    "cam1": {"plate_detected": "cam1-000004-sample.jpg"},
+                    "cam1": {"plate_detected": "cam1-000025-sample.jpg"},
                 },
             },
         }
         frame_metadata = {
-            "cam1-000004-sample.jpg": {
-                "captured_at": "2026-07-21T00:00:00.800+00:00", "frame_id": 4,
+            "cam1-000025-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:04.980+00:00", "frame_id": 25,
                 "tracks": [{"bbox": [1, 2, 3, 4]}],
             },
-            "cam2-000004-sample.jpg": {
-                "captured_at": "2026-07-21T00:00:00.820+00:00", "frame_id": 4,
+            "cam2-000025-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:05.020+00:00", "frame_id": 25,
             },
-            "cam3-000004-sample.jpg": {
-                "captured_at": "2026-07-21T00:00:00.780+00:00", "frame_id": 4,
+            "cam3-000025-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:05.010+00:00", "frame_id": 25,
             },
         }
         frames = {
-            "/spool/session/cam1-000004-sample.jpg": "cam1-detection",
-            "/spool/session/cam2-000004-sample.jpg": "cam2-detection",
-            "/spool/session/cam3-000004-sample.jpg": "cam3-detection",
+            "/spool/session/cam1-000025-sample.jpg": "cam1-weight",
+            "/spool/session/cam2-000025-sample.jpg": "cam2-weight",
+            "/spool/session/cam3-000025-sample.jpg": "cam3-weight",
         }
         log_fn = Mock()
 
@@ -493,23 +494,24 @@ class SessionWeightTests(unittest.TestCase):
             )
 
         self.assertEqual(selected, {
-            "cam1": "cam1-detection", "cam2": "cam2-detection", "cam3": "cam3-detection",
+            "cam1": "cam1-weight", "cam2": "cam2-weight", "cam3": "cam3-weight",
         })
-        self.assertEqual(captured_at["cam1"], "2026-07-21T00:00:00.800+00:00")
+        self.assertEqual(captured_at["cam1"], "2026-07-21T00:00:04.980+00:00")
         metric = next(
             json.loads(call.args[1]) for call in log_fn.call_args_list
             if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
         )
         self.assertEqual(metric["unknown_type"], "UNKNOWN_OCR")
-        self.assertEqual(metric["lpr_target_source"], "plate_detection")
-        self.assertEqual(metric["target_at"], "2026-07-21T00:00:00.800+00:00")
+        self.assertEqual(metric["lpr_target_source"], "weight_recorded")
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:05.000+00:00")
         self.assertEqual(metric["synchronized_gap_ms"], 40)
 
-    def test_unknown_detection_photos_use_early_session_offset(self):
+    def test_unknown_detection_photos_use_recorded_weight(self):
         metadata = {
             "session_id": "unknown-detection",
             "started_at": "2026-07-21T00:00:00+00:00",
             "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:07+00:00",
             "session_dir": "/spool/session",
             "session_files": [
                 "cam1-000013-sample.jpg",
@@ -520,19 +522,19 @@ class SessionWeightTests(unittest.TestCase):
         }
         frame_metadata = {
             "cam1-000013-sample.jpg": {
-                "captured_at": "2026-07-21T00:00:01.990+00:00", "frame_id": 13,
+                "captured_at": "2026-07-21T00:00:06.990+00:00", "frame_id": 13,
             },
             "cam2-000013-sample.jpg": {
-                "captured_at": "2026-07-21T00:00:02.020+00:00", "frame_id": 13,
+                "captured_at": "2026-07-21T00:00:07.020+00:00", "frame_id": 13,
             },
             "cam3-000013-sample.jpg": {
-                "captured_at": "2026-07-21T00:00:02.010+00:00", "frame_id": 13,
+                "captured_at": "2026-07-21T00:00:07.010+00:00", "frame_id": 13,
             },
         }
         frames = {
-            "/spool/session/cam1-000013-sample.jpg": "cam1-early",
-            "/spool/session/cam2-000013-sample.jpg": "cam2-early",
-            "/spool/session/cam3-000013-sample.jpg": "cam3-early",
+            "/spool/session/cam1-000013-sample.jpg": "cam1-weight",
+            "/spool/session/cam2-000013-sample.jpg": "cam2-weight",
+            "/spool/session/cam3-000013-sample.jpg": "cam3-weight",
         }
         log_fn = Mock()
 
@@ -544,15 +546,15 @@ class SessionWeightTests(unittest.TestCase):
             )
 
         self.assertEqual(selected, {
-            "cam1": "cam1-early", "cam2": "cam2-early", "cam3": "cam3-early",
+            "cam1": "cam1-weight", "cam2": "cam2-weight", "cam3": "cam3-weight",
         })
         metric = next(
             json.loads(call.args[1]) for call in log_fn.call_args_list
             if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
         )
         self.assertEqual(metric["unknown_type"], "UNKNOWN_DETECTION")
-        self.assertEqual(metric["lpr_target_source"], "session_early")
-        self.assertEqual(metric["target_at"], "2026-07-21T00:00:02.000+00:00")
+        self.assertEqual(metric["lpr_target_source"], "weight_recorded")
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:07.000+00:00")
         self.assertEqual(metric["synchronized_gap_ms"], 30)
 
     def test_unknown_detection_drops_camera_outside_target_window(self):
@@ -560,6 +562,7 @@ class SessionWeightTests(unittest.TestCase):
             "session_id": "unknown-detection-stale-camera",
             "started_at": "2026-07-21T00:00:00+00:00",
             "ended_at": "2026-07-21T00:00:40+00:00",
+            "weight_observed_at": "2026-07-21T00:00:02+00:00",
             "session_dir": "/spool/session",
             "session_files": ["cam1-000035-sample.jpg", "cam2-000001-sample.jpg"],
             "lpr_diagnostics": {"detector_successes": 2, "detected_regions": 0},
@@ -591,7 +594,7 @@ class SessionWeightTests(unittest.TestCase):
         )
         self.assertEqual(metric["missing_cameras"], ["cam2", "cam3"])
         self.assertEqual(metric["rejected"]["cam2"], {
-            "source": "session_early",
+            "source": "weight_recorded",
             "reason": "outside_target_window",
             "captured_at": "2026-07-21T00:00:37.100+00:00",
             "offset_ms": 35100,
@@ -602,6 +605,7 @@ class SessionWeightTests(unittest.TestCase):
             "session_id": "unknown-detection-skewed-camera",
             "started_at": "2026-07-21T00:00:00+00:00",
             "ended_at": "2026-07-21T00:00:10+00:00",
+            "weight_observed_at": "2026-07-21T00:00:02+00:00",
             "session_dir": "/spool/session",
             "session_files": [
                 "cam1-000031-sample.jpg", "cam2-000039-sample.jpg",
@@ -638,6 +642,60 @@ class SessionWeightTests(unittest.TestCase):
         )
         self.assertEqual(metric["synchronized_gap_ms"], 100)
         self.assertEqual(metric["rejected"]["cam1"]["reason"], "inter_camera_skew")
+
+    def test_unknown_photos_fall_back_to_peak_timestamps(self):
+        metadata = {
+            "session_id": "unknown-peaks",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:10+00:00",
+            "session_dir": "/spool/session",
+            "session_files": ["cam1-000025-sample.jpg", "cam1-000035-sample.jpg"],
+            "filtered_peak_observed_at": "2026-07-21T00:00:05+00:00",
+            "raw_peak_observed_at": "2026-07-21T00:00:07+00:00",
+        }
+        frame_metadata = {
+            "cam1-000025-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:05.000+00:00", "frame_id": 25,
+            },
+            "cam1-000035-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:07.000+00:00", "frame_id": 35,
+            },
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: "filtered" if "000025" in path else "raw",
+            create=True,
+        ):
+            selected, _captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_OCR",
+            )
+
+        self.assertEqual(selected, {"cam1": "filtered"})
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:05.000+00:00")
+
+        metadata.pop("filtered_peak_observed_at")
+        log_fn.reset_mock()
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: "filtered" if "000025" in path else "raw",
+            create=True,
+        ):
+            selected, _captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_DETECTION",
+            )
+
+        self.assertEqual(selected, {"cam1": "raw"})
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:07.000+00:00")
 
     def test_unknown_photos_ignore_late_weight_snapshot_without_start_frame(self):
         metadata = {
