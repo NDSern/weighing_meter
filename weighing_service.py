@@ -125,7 +125,7 @@ from services.storage.image_save_worker import ImageSaveWorker
 from services.storage.image_save_worker import set_log_fn as set_image_save_log
 from services.storage.publish_outbox import PublishOutbox
 from services.storage.retention_cleaner import (
-    DiagnosticArchiveCleaner, ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
+    ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
 )
 from services.runtime import RknnModelSet
 from services.session import SessionManager
@@ -148,7 +148,7 @@ def main():
     }
     models = mqtt_svc = cam1 = cam3 = grabber2 = None
     detect_coord = reader = frame_spool = deferred_lpr = None
-    diagnostic_archive_cleaner = retention_cleaner = minio_cache_cleaner = storage_maintenance = session_manager = plate_tracker = None
+    retention_cleaner = minio_cache_cleaner = storage_maintenance = session_manager = plate_tracker = None
     mqtt_started = image_worker_started = outbox_started = False
     detect_stopped = deferred_stopped = True
 
@@ -245,14 +245,6 @@ def main():
                 log_fn=log,
             )
             minio_cache_cleaner.start()
-            diagnostic_archive_cleaner = DiagnosticArchiveCleaner(
-                [NO_STABLE_DIR, NO_PLATE_DIR],
-                3,
-                30,
-                IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
-                log_fn=log,
-            )
-            diagnostic_archive_cleaner.start()
 
         session_manager = SessionManager(
             plate_tracker=plate_tracker,
@@ -344,8 +336,6 @@ def main():
             cleanup("image_retention", retention_cleaner.stop)
         if minio_cache_cleaner:
             cleanup("minio_cache_retention", minio_cache_cleaner.stop)
-        if diagnostic_archive_cleaner:
-            cleanup("diagnostic_archive_retention", diagnostic_archive_cleaner.stop)
         if storage_maintenance:
             cleanup("storage_maintenance", storage_maintenance.stop)
         if outbox_started:

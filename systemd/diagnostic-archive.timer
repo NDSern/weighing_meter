@@ -1,0 +1,11 @@
+[Unit]
+Description=Run aged diagnostic archive maintenance
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=diagnostic-archive.service
+
+[Install]
+WantedBy=timers.target

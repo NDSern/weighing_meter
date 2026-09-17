@@ -1,0 +1,15 @@
+[Unit]
+Description=Archive aged weighing diagnostics
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/vta-giavu-weightbridge2/apps/weighing_meter
+ExecStart=/usr/bin/python3 /home/vta-giavu-weightbridge2/apps/weighing_meter/scripts/archive_diagnostics.py
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=25%
+MemoryMax=768M
+TimeoutStartSec=30min

@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 import tarfile
+import importlib.util
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
@@ -11,6 +12,14 @@ from services.storage.dead_letter import is_expired
 from services.storage.retention_cleaner import (
     DiagnosticArchiveCleaner, ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
 )
+
+
+def load_archive_script():
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "archive_diagnostics.py")
+    spec = importlib.util.spec_from_file_location("archive_diagnostics", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class DeadLetterTests(unittest.TestCase):
@@ -259,6 +268,16 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(os.path.exists(day))
             self.assertFalse(os.path.exists(day + ".tar.zst"))
             self.assertFalse(os.path.exists(day + ".tar.zst.tmp"))
+
+    def test_diagnostic_archive_runner_skips_busy_spool(self):
+        runner = load_archive_script()
+
+        with patch.object(runner, "spool_is_busy", return_value=True), patch.object(
+            runner, "DiagnosticArchiveCleaner",
+        ) as cleaner:
+            self.assertEqual(runner.main(), 0)
+
+        cleaner.assert_not_called()
 
     def test_pressure_cleanup_deletes_oldest_images_but_keeps_pending_images(self):
         with tempfile.TemporaryDirectory() as service_dir:
