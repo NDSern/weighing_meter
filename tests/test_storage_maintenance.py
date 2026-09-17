@@ -3,12 +3,13 @@ import json
 import tempfile
 import time
 import unittest
+import tarfile
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
 from services.storage.dead_letter import is_expired
 from services.storage.retention_cleaner import (
-    ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
+    DiagnosticArchiveCleaner, ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
 )
 
 
@@ -192,6 +193,57 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(old_image))
             self.assertFalse(os.path.exists(old_metadata))
             self.assertTrue(os.path.exists(recent_image))
+
+    def test_diagnostic_archive_replaces_old_day_and_expires_old_archive(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive_dir = os.path.join(root, "2026", "07")
+            source_day = os.path.join(archive_dir, "11")
+            expired_archive = os.path.join(root, "2026", "06", "14.tar.zst")
+            os.makedirs(source_day)
+            os.makedirs(os.path.dirname(expired_archive))
+            source_file = os.path.join(source_day, "attempt_cam1.jpg")
+            with open(source_file, "wb") as handle:
+                handle.write(b"diagnostic-image")
+            with tarfile.open(expired_archive, "w") as archive:
+                archive.add(source_file, arcname="old.jpg")
+            cleaner = DiagnosticArchiveCleaner([root], 3, 30, 86400)
+
+            result = cleaner.run_once(now=datetime(2026, 7, 15, 12, 0, 0).timestamp())
+
+            self.assertEqual(result["archived"], 1)
+            self.assertEqual(result["archive_deleted"], 1)
+            self.assertFalse(os.path.exists(source_day))
+            self.assertTrue(os.path.exists(source_day + ".tar.zst"))
+            self.assertFalse(os.path.exists(expired_archive))
+
+    def test_diagnostic_archive_keeps_recent_day_and_archive(self):
+        with tempfile.TemporaryDirectory() as root:
+            month = os.path.join(root, "2026", "07")
+            recent_day = os.path.join(month, "13")
+            retained_archive = os.path.join(month, "02.tar.zst")
+            os.makedirs(recent_day)
+            open(os.path.join(recent_day, "attempt.jpg"), "w").close()
+            open(retained_archive, "w").close()
+            cleaner = DiagnosticArchiveCleaner([root], 3, 30, 86400)
+
+            result = cleaner.run_once(now=datetime(2026, 7, 15, 12, 0, 0).timestamp())
+
+            self.assertEqual(result, {"archived": 0, "archive_deleted": 0, "failed": 0})
+            self.assertTrue(os.path.exists(recent_day))
+            self.assertTrue(os.path.exists(retained_archive))
+
+    def test_diagnostic_archive_keeps_source_when_archive_already_exists(self):
+        with tempfile.TemporaryDirectory() as root:
+            day = os.path.join(root, "2026", "07", "11")
+            os.makedirs(day)
+            open(os.path.join(day, "attempt.jpg"), "w").close()
+            open(day + ".tar.zst", "w").close()
+            cleaner = DiagnosticArchiveCleaner([root], 3, 30, 86400)
+
+            result = cleaner.run_once(now=datetime(2026, 7, 15, 12, 0, 0).timestamp())
+
+            self.assertEqual(result, {"archived": 0, "archive_deleted": 0, "failed": 1})
+            self.assertTrue(os.path.exists(day))
 
     def test_pressure_cleanup_deletes_oldest_images_but_keeps_pending_images(self):
         with tempfile.TemporaryDirectory() as service_dir:

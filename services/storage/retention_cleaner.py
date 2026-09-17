@@ -5,9 +5,10 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from config import (
     IMAGE_DEAD_LETTER_RETENTION_DAYS,
@@ -430,6 +431,117 @@ class VerifiedMinioCacheCleaner:
         return {"scanned": scanned, "verified": verified, "deleted": deleted, "failed": failed,
                 "skipped_pending": skipped_pending,
                 "remote_mismatch": remote_mismatch, "reclaimed": reclaimed}
+
+
+class DiagnosticArchiveCleaner:
+    """Archive completed diagnostic days, then expire their archives."""
+
+    def __init__(self, roots, archive_after_days, retention_days, check_interval_seconds, log_fn=None):
+        self.roots = list(roots)
+        self.archive_after_days = archive_after_days
+        self.retention_days = retention_days
+        self.check_interval_seconds = check_interval_seconds
+        self.log_fn = log_fn
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _log(self, level, msg):
+        if self.log_fn:
+            self.log_fn(level, msg)
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._log("INFO", "DiagnosticArchiveCleaner started")
+
+    def stop(self, timeout=3.0):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+        self._log("INFO", "DiagnosticArchiveCleaner stopped")
+
+    def _run_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception as exc:
+                self._log("ERROR", f"Diagnostic archive cleanup failed: {exc}")
+            self._stop_event.wait(self.check_interval_seconds)
+
+    @staticmethod
+    def _day_paths(root):
+        for year in os.listdir(root):
+            year_path = os.path.join(root, year)
+            if not year.isdigit() or not os.path.isdir(year_path) or os.path.islink(year_path):
+                continue
+            for month in os.listdir(year_path):
+                month_path = os.path.join(year_path, month)
+                if not month.isdigit() or not os.path.isdir(month_path) or os.path.islink(month_path):
+                    continue
+                for name in os.listdir(month_path):
+                    path = os.path.join(month_path, name)
+                    if name.endswith(".tar.zst"):
+                        day = ImageRetentionCleaner._make_date(year, month, name[:-8])
+                        if day is not None and os.path.isfile(path) and not os.path.islink(path):
+                            yield day, path, True
+                    elif os.path.isdir(path) and not os.path.islink(path):
+                        day = ImageRetentionCleaner._make_date(year, month, name)
+                        if day is not None:
+                            yield day, path, False
+
+    @staticmethod
+    def _archive_day(day_path):
+        parent = os.path.dirname(day_path)
+        name = os.path.basename(day_path)
+        archive_path = day_path + ".tar.zst"
+        temp_path = archive_path + ".tmp"
+        if os.path.exists(archive_path):
+            raise FileExistsError(f"Diagnostic archive already exists: {archive_path}")
+        try:
+            subprocess.run(
+                ["tar", "--zstd", "-cf", temp_path, "-C", parent, name],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+            subprocess.run(
+                ["tar", "--zstd", "-tf", temp_path],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+            os.replace(temp_path, archive_path)
+            shutil.rmtree(day_path)
+            return archive_path
+        finally:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+
+    def run_once(self, now=None):
+        today = datetime.fromtimestamp(time.time() if now is None else now).date()
+        archive_cutoff = today - timedelta(days=self.archive_after_days)
+        delete_cutoff = today - timedelta(days=self.retention_days)
+        archived = archive_deleted = failed = 0
+        for root in self.roots:
+            if not os.path.isdir(root):
+                continue
+            for day, path, is_archive in self._day_paths(root):
+                try:
+                    if is_archive:
+                        if day <= delete_cutoff:
+                            os.remove(path)
+                            archive_deleted += 1
+                    elif day <= archive_cutoff:
+                        self._archive_day(path)
+                        archived += 1
+                except (OSError, subprocess.SubprocessError) as exc:
+                    failed += 1
+                    self._log("WARNING", f"Diagnostic archive cleanup failed path={path}: {exc}")
+        self._log(
+            "INFO",
+            f"Diagnostic archive cleanup complete: archived={archived} archive_deleted={archive_deleted} "
+            f"failed={failed} archive_after_days={self.archive_after_days} retention_days={self.retention_days}",
+        )
+        return {"archived": archived, "archive_deleted": archive_deleted, "failed": failed}
 
 
 class StorageMaintenance:
