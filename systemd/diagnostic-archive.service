@@ -6,8 +6,8 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/home/vta-giavu-weightbridge2/apps/weighing_meter
-ExecStart=/usr/bin/python3 /home/vta-giavu-weightbridge2/apps/weighing_meter/scripts/archive_diagnostics.py
+EnvironmentFile=/etc/weighing-meter/diagnostic-archive.env
+ExecStart=/usr/bin/python3 ${WEIGHING_METER_DIR}/scripts/archive_diagnostics.py
 Nice=19
 IOSchedulingClass=idle
 CPUQuota=25%
