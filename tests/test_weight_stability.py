@@ -506,6 +506,49 @@ class SessionWeightTests(unittest.TestCase):
         self.assertEqual(metric["target_at"], "2026-07-21T00:00:05.000+00:00")
         self.assertEqual(metric["synchronized_gap_ms"], 40)
 
+    def test_unknown_ocr_photos_prefer_sustained_local_peak(self):
+        metadata = {
+            "session_id": "unknown-ocr-local-peak",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:20+00:00",
+            "weight_observed_at": "2026-07-21T00:00:15+00:00",
+            "local_peak_observed_at": "2026-07-21T00:00:05+00:00",
+            "filtered_peak_observed_at": "2026-07-21T00:00:05.100+00:00",
+            "raw_peak_observed_at": "2026-07-21T00:00:05.050+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000025-sample.jpg",
+                "cam1-000075-sample.jpg",
+            ],
+        }
+        frame_metadata = {
+            "cam1-000025-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:05.020+00:00", "frame_id": 25,
+            },
+            "cam1-000075-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:14.980+00:00", "frame_id": 75,
+            },
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: "peak" if "000025" in path else "late",
+            create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_OCR",
+            )
+
+        self.assertEqual(selected, {"cam1": "peak"})
+        self.assertEqual(captured_at, {"cam1": "2026-07-21T00:00:05.020+00:00"})
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["lpr_target_source"], "local_peak")
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:05.000+00:00")
+
     def test_unknown_detection_photos_use_recorded_weight(self):
         metadata = {
             "session_id": "unknown-detection",
@@ -556,6 +599,50 @@ class SessionWeightTests(unittest.TestCase):
         self.assertEqual(metric["lpr_target_source"], "weight_recorded")
         self.assertEqual(metric["target_at"], "2026-07-21T00:00:07.000+00:00")
         self.assertEqual(metric["synchronized_gap_ms"], 30)
+
+    def test_unknown_detection_photos_prefer_sustained_local_peak(self):
+        metadata = {
+            "session_id": "unknown-detection-local-peak",
+            "started_at": "2026-07-21T00:00:00+00:00",
+            "ended_at": "2026-07-21T00:00:20+00:00",
+            "weight_observed_at": "2026-07-21T00:00:15+00:00",
+            "local_peak_observed_at": "2026-07-21T00:00:05+00:00",
+            "filtered_peak_observed_at": "2026-07-21T00:00:05.100+00:00",
+            "raw_peak_observed_at": "2026-07-21T00:00:05.050+00:00",
+            "session_dir": "/spool/session",
+            "session_files": [
+                "cam1-000025-sample.jpg",
+                "cam1-000075-sample.jpg",
+            ],
+            "lpr_diagnostics": {"detector_successes": 2, "detected_regions": 0},
+        }
+        frame_metadata = {
+            "cam1-000025-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:05.020+00:00", "frame_id": 25,
+            },
+            "cam1-000075-sample.jpg": {
+                "captured_at": "2026-07-21T00:00:14.980+00:00", "frame_id": 75,
+            },
+        }
+        log_fn = Mock()
+
+        with unittest.mock.patch(
+            "services.session.session_manager.cv2.imread",
+            side_effect=lambda path: "peak" if "000025" in path else "late",
+            create=True,
+        ):
+            selected, captured_at = self.manager._load_unknown_publish_frames(
+                metadata, frame_metadata, log_fn, unknown_plate="UNKNOWN_DETECTION",
+            )
+
+        self.assertEqual(selected, {"cam1": "peak"})
+        self.assertEqual(captured_at, {"cam1": "2026-07-21T00:00:05.020+00:00"})
+        metric = next(
+            json.loads(call.args[1]) for call in log_fn.call_args_list
+            if call.args[0] == "METRIC" and "unknown_photo_selection" in call.args[1]
+        )
+        self.assertEqual(metric["lpr_target_source"], "local_peak")
+        self.assertEqual(metric["target_at"], "2026-07-21T00:00:05.000+00:00")
 
     def test_unknown_detection_drops_camera_outside_target_window(self):
         metadata = {

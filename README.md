@@ -150,7 +150,7 @@ Weight-backed sessions without a confirmed plate publish one of two explicit val
 
 - `UNKNOWN_OCR`: detector found a plate, but OCR did not produce a confirmed plate.
 - `UNKNOWN_DETECTION`: no plate region was detected.
-- Both unknown types publish thumbnails nearest the existing recorded-weight timestamp: stable weight, then filtered peak, then raw peak. A camera is omitted when its nearest frame is more than 1 second from that timestamp or more than 1 second from the synchronized camera group, preventing stale cameras from creating mixed-time photo sets.
+- `UNKNOWN_OCR` and `UNKNOWN_DETECTION` publish thumbnails nearest the first sustained local peak. They fall back to filtered peak, raw peak, then recorded weight when local peak timing is unavailable. A camera is omitted when its nearest frame is more than 1 second from that timestamp or more than 1 second from the synchronized camera group, preventing stale cameras from creating mixed-time photo sets.
 - RTSP sources use a native GStreamer pipeline with a 500ms bounded jitter buffer and `appsink max-buffers=1 drop=true sync=false`. This drops superseded decoded frames instead of allowing decoder queues to drift behind real time. Rockchip hosts decode H.265 through `mppvideodec` and convert its stride-padded NV12 output after the one-frame sink; other hosts use `avdec_h265`.
 
 No scale-reading, stability, or peak-selection rule changes. Each photo's `captured_at` remains its actual frame acquisition time, not the target time.

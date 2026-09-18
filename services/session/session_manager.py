@@ -1811,12 +1811,21 @@ class SessionManager:
         self, metadata, frame_metadata, log_fn, spool_started_at=None,
         unknown_plate="UNKNOWN",
     ):
-        target_at = (
-            metadata.get("weight_observed_at")
-            or metadata.get("filtered_peak_observed_at")
-            or metadata.get("raw_peak_observed_at")
-            or metadata.get("ended_at")
-        )
+        if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
+            target_at = (
+                metadata.get("local_peak_observed_at")
+                or metadata.get("filtered_peak_observed_at")
+                or metadata.get("raw_peak_observed_at")
+                or metadata.get("weight_observed_at")
+                or metadata.get("ended_at")
+            )
+        else:
+            target_at = (
+                metadata.get("weight_observed_at")
+                or metadata.get("filtered_peak_observed_at")
+                or metadata.get("raw_peak_observed_at")
+                or metadata.get("ended_at")
+            )
         try:
             target_ts = datetime.fromisoformat(target_at).timestamp()
         except (TypeError, ValueError):
@@ -1981,7 +1990,11 @@ class SessionManager:
                 })
 
         if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
-            source = "weight_recorded"
+            source = (
+                "local_peak"
+                if metadata.get("local_peak_observed_at")
+                else "weight_recorded"
+            )
             target = target_ts
             candidate_sets = {}
             for camera in cameras:
