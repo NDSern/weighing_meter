@@ -53,6 +53,19 @@ class PlateCandidateLifecycleTests(unittest.TestCase):
 
         manager._end_session.assert_called_once_with("scale_empty", log)
 
+    def test_scale_owned_session_ignores_falling_weight_trend(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.scale_owned = True
+        manager.session.weight_trend_window.clear()
+        manager._end_session = Mock()
+
+        for weight in range(40000, 38000, -100):
+            manager.on_frame(frame(weight), Mock())
+
+        manager._end_session.assert_not_called()
+        self.assertTrue(manager.session.session_active)
+
     def test_timeout_blocks_persistent_plate_until_track_loss(self):
         manager = SessionManager(Mock())
         log = Mock()

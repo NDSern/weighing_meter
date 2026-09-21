@@ -981,7 +981,7 @@ class SessionManager:
                 )
                 return True
             return False
-        if self._plate_owned:
+        if self._plate_owned or self.session.scale_owned:
             return False
         if direction == "falling":
             self._end_session("weight_trend_falling", log_fn)
