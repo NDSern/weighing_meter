@@ -67,6 +67,7 @@ from config import (
     SERVICE_DIR,
     LPR_CHARSET,
     LPR_DETECTOR_MODEL,
+    LPR_DEFERRED_MAX_FRAMES_PER_CAMERA,
     LPR_FALLBACK_DETECTOR_MODEL,
     LPR_RECOGNIZER_MODEL,
     LPR_SPOOL_DIR,
@@ -280,6 +281,7 @@ def main():
             disk_cap_bytes=SESSION_FRAME_DISK_CAP_BYTES,
             min_free_bytes=SESSION_FRAME_MIN_FREE_BYTES,
             metadata_provider=detect_coord.get_frame_metadata,
+            max_frames_per_camera=LPR_DEFERRED_MAX_FRAMES_PER_CAMERA,
         )
         session_manager.frame_spool = frame_spool
         deferred_lpr = DeferredLprWorker(

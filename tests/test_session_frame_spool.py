@@ -190,6 +190,19 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertEqual(manifest["files"], [])
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(root)))
 
+    def test_limits_persisted_frames_per_camera(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, max_frames_per_camera=2)
+            spool.start()
+            spool.begin_session("bounded")
+            time.sleep(0.15)
+            job = spool.end_session("bounded", {})
+            self.assertTrue(spool.stop(1))
+
+            with open(job, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            self.assertEqual(manifest["frame_counts"], {"cam1": 2, "cam3": 2})
+
     @unittest.skipUnless(hasattr(os, "posix_fadvise"), "requires posix_fadvise")
     def test_drops_durable_frame_write_cache(self):
         with tempfile.TemporaryDirectory() as root:
