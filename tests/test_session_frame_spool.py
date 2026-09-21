@@ -190,6 +190,20 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertEqual(manifest["files"], [])
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(root)))
 
+    @unittest.skipUnless(hasattr(os, "posix_fadvise"), "requires posix_fadvise")
+    def test_drops_durable_frame_write_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("cache", {"cam1": Frame(1)})
+
+            with mock.patch("services.capture.session_frame_spool.os.posix_fadvise") as advise:
+                spool.save_session_frame("cache", "rear.jpg", Frame(2))
+
+            self.assertGreaterEqual(advise.call_count, 1)
+            for call in advise.call_args_list:
+                _fd, offset, length, advice = call.args
+                self.assertEqual((offset, length, advice), (0, 0, os.POSIX_FADV_DONTNEED))
+
     def test_rejects_overlapping_or_unsafe_sessions(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root)

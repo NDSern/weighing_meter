@@ -31,6 +31,7 @@ from config import (
     SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT,
     SESSION_FINALIZATION_DB,
     SESSION_END_EMPTY_DWELL_SECONDS,
+    SESSION_PLATE_ONLY_TIMEOUT_SECONDS,
     SESSION_STABLE_WEIGHT_WINDOW,
     SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS,
     SESSION_WEIGHT_DEPARTURE_KG,
@@ -314,6 +315,7 @@ class WeighingSessionState:
         self.started_at_iso = None
         self.session_id = None
         self.spool_active = False
+        self.scale_owned = False
         self.stability_rule = None
 
     def record_stable_weight(self, weight, decimal_pos, observed_at=None):
@@ -435,6 +437,7 @@ class SessionManager:
         self._lifecycle_lock = threading.RLock()
         self._generation = 0
         self._plate_owned = False
+        self._plate_rearm_blocked = False
         self._plate_absent_since = None
         self._plate_presence_revision = 0
         self._session_raw_peak = None
@@ -470,12 +473,17 @@ class SessionManager:
             if any_valid:
                 self._plate_absent_since = None
                 if not self.session.session_active:
+                    if self._plate_rearm_blocked:
+                        return
                     self._clear_attempt()
                     self._start_session(0, log_fn, trigger="plate_detected")
-                elif not self._plate_owned:
+                elif not self._plate_owned and not self.session.scale_owned:
                     self._plate_owned = True
                     log_fn("EVENT", f"Session upgrade id={self.session.session_id} trigger=plate_detected")
                 return
+            if self._plate_rearm_blocked:
+                self._plate_rearm_blocked = False
+                log_fn("EVENT", "Plate trigger rearmed after track loss")
             if not self.session.session_active or not self._plate_owned:
                 return
             if self._plate_absent_since is None:
@@ -585,9 +593,18 @@ class SessionManager:
             and time.monotonic() - self._plate_absent_since >= 1.0
         ):
             self._complete_plate_loss(log_fn, frame.weight)
+        if (
+            self.session.session_active
+            and not self.session.scale_owned
+            and frame.weight > WEIGHT_THRESHOLD
+        ):
+            if self._promote_plate_candidate(frame, log_fn) is False:
+                return
         self._capture_rear_fallback_if_due(log_fn)
         self._capture_unknown_snapshots_if_due(log_fn)
         self._capture_unknown_weight_snapshots_if_due(frame.weight, log_fn)
+        if self._check_plate_only_timeout(log_fn):
+            return
         self._update_peak_candidate(frame, log_fn)
         if self.session.session_active and frame.weight > 0:
             observed_at = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
@@ -973,7 +990,7 @@ class SessionManager:
     def _check_scale_empty(self, frame, log_fn):
         if not self.session.session_active:
             return False
-        if self._plate_owned or frame.weight > WEIGHT_THRESHOLD:
+        if not self.session.scale_owned or frame.weight > WEIGHT_THRESHOLD:
             self.session.empty_since = None
             return False
         if self.session.empty_since is None:
@@ -1081,49 +1098,9 @@ class SessionManager:
         self.session.stable_decimal_pos = decimal_pos
         self.session.last_publish_weight = self.session.stable_weight
         self.session.last_publish_decimal_pos = decimal_pos
-        if self.frame_spool:
-            try:
-                session_dir = self.frame_spool.begin_session(
-                    self.session.session_id,
-                    self.session.lpr_start_frames,
-                    metadata={
-                        "session_id": self.session.session_id,
-                        "started_at": self.session.started_at_iso,
-                        "stable_weight": self.session.last_publish_weight,
-                        "decimal_pos": self.session.last_publish_decimal_pos,
-                        "stability_rule": self.session.stability_rule,
-                        "weight_observed_at": self.session.stable_weight_observed_at,
-                        "raw_peak_weight": self._session_raw_peak,
-                        "raw_peak_observed_at": self._session_raw_peak_observed_at,
-                        "filtered_peak_weight": self._session_filtered_peak,
-                        "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
-                        "local_peak_weight": self._session_local_peak,
-                        "local_peak_observed_at": self._session_local_peak_observed_at,
-                        "vehicle_type": self.session.vehicle_type,
-                        "rear_start_path": None,
-                        "start_frame_paths": {},
-                    },
-                )
-                self.session.spool_active = True
-                self.session.start_frame_paths = {
-                    camera: os.path.join(session_dir, f"{camera}-000000-start.jpg")
-                    for camera in self.session.lpr_start_frames
-                    if os.path.exists(os.path.join(session_dir, f"{camera}-000000-start.jpg"))
-                }
-            except Exception as exc:
-                try:
-                    self.frame_spool.abort_session(self.session.session_id)
-                except Exception as abort_exc:
-                    log_fn("ERROR", f"Session frame spool abort failed: {abort_exc}")
-                self.session.spool_active = False
-                self.fatal_error = "Session frame spool admission failed: %s" % exc
-                log_fn("FATAL", self.fatal_error)
-                log_metric(
-                    log_fn, "session_spool_admission_failed",
-                    id=self.session.session_id, started_at=self.session.started_at_iso,
-                    trigger=trigger, error=str(exc),
-                )
-                return False
+        self.session.scale_owned = trigger == "scale_rising"
+        if self.session.scale_owned and self._start_session_spool(log_fn, trigger) is False:
+            return False
         self.session.session_active = True
         self.session.unknown_snapshot_deadline = (
             self.session.started_at + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
@@ -1155,6 +1132,86 @@ class SessionManager:
             stable_weight_kg=self.session.stable_weight,
             stability_rule=self.session.stability_rule,
         )
+        return True
+
+    def _start_session_spool(self, log_fn, trigger):
+        if not self.frame_spool or self.session.spool_active:
+            return True
+        try:
+            session_dir = self.frame_spool.begin_session(
+                self.session.session_id,
+                self.session.lpr_start_frames,
+                metadata={
+                    "session_id": self.session.session_id,
+                    "started_at": self.session.started_at_iso,
+                    "stable_weight": self.session.last_publish_weight,
+                    "decimal_pos": self.session.last_publish_decimal_pos,
+                    "stability_rule": self.session.stability_rule,
+                    "weight_observed_at": self.session.stable_weight_observed_at,
+                    "raw_peak_weight": self._session_raw_peak,
+                    "raw_peak_observed_at": self._session_raw_peak_observed_at,
+                    "filtered_peak_weight": self._session_filtered_peak,
+                    "filtered_peak_observed_at": self._session_filtered_peak_observed_at,
+                    "local_peak_weight": self._session_local_peak,
+                    "local_peak_observed_at": self._session_local_peak_observed_at,
+                    "vehicle_type": self.session.vehicle_type,
+                    "rear_start_path": None,
+                    "start_frame_paths": {},
+                },
+            )
+            self.session.spool_active = True
+            self.session.start_frame_paths = {
+                camera: os.path.join(session_dir, f"{camera}-000000-start.jpg")
+                for camera in self.session.lpr_start_frames
+                if os.path.exists(os.path.join(session_dir, f"{camera}-000000-start.jpg"))
+            }
+            if self.session.rear_start_frame is not None:
+                self.session.rear_start_path = self.frame_spool.save_session_frame(
+                    self.session.session_id, "cam2-start.jpg", self.session.rear_start_frame,
+                )
+            return True
+        except Exception as exc:
+            try:
+                self.frame_spool.abort_session(self.session.session_id)
+            except Exception as abort_exc:
+                log_fn("ERROR", f"Session frame spool abort failed: {abort_exc}")
+            self.session.spool_active = False
+            self.fatal_error = "Session frame spool admission failed: %s" % exc
+            log_fn("FATAL", self.fatal_error)
+            log_metric(
+                log_fn, "session_spool_admission_failed",
+                id=self.session.session_id, started_at=self.session.started_at_iso,
+                trigger=trigger, error=str(exc),
+            )
+            return False
+
+    def _promote_plate_candidate(self, frame, log_fn):
+        if self._start_session_spool(log_fn, "plate_detected") is False:
+            return False
+        self.session.scale_owned = True
+        self._plate_owned = False
+        self._plate_absent_since = None
+        log_metric(
+            log_fn, "session_scale_ownership_acquired", id=self.session.session_id,
+            weight_kg=frame.weight,
+            observed_at=frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
+        )
+        log_fn(
+            "EVENT",
+            f"Session promoted to scale lifecycle id={self.session.session_id} weight={frame.weight:g}kg",
+        )
+        return True
+
+    def _check_plate_only_timeout(self, log_fn):
+        if (
+            not self.session.session_active
+            or self.session.scale_owned
+            or self.session.started_at is None
+            or time.time() - self.session.started_at < SESSION_PLATE_ONLY_TIMEOUT_SECONDS
+        ):
+            return False
+        self._plate_rearm_blocked = True
+        self._end_session("plate_without_weight_timeout", log_fn)
         return True
 
     def _capture_lpr_start_frames(self, log_fn):
@@ -1421,7 +1478,12 @@ class SessionManager:
                     )
                     self._spool_failure_logged_for = metadata["session_id"]
                 return False
-        if not queued:
+        if not queued and end_reason == "plate_without_weight_timeout":
+            self._save_diagnostic_frames(
+                NO_STABLE_DIR, self.session.session_id, self.session.lpr_start_frames,
+                {"reason": end_reason, **metadata}, log_fn,
+            )
+        elif not queued:
             self._save_diagnostic_frames(
                 NO_PLATE_DIR, self.session.session_id, self.session.lpr_start_frames,
                 {"reason": "lpr_spool_unavailable", **metadata}, log_fn,
@@ -1487,6 +1549,7 @@ class SessionManager:
         self.session.session_id = None
         self.session.rear_start_path = None
         self.session.spool_active = False
+        self.session.scale_owned = False
         self.session.stability_rule = None
         self.session.stable_weight_observed_at = None
         self._pending_terminal_snapshot = None

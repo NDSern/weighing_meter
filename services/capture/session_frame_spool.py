@@ -632,6 +632,15 @@ class SessionFrameSpool:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
+                # Durable session JPEGs can grow for long weighings. Drop this
+                # cgroup's write cache; deferred LPR will fault frames back in.
+                if hasattr(os, "posix_fadvise"):
+                    try:
+                        os.posix_fadvise(
+                            handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED,
+                        )
+                    except OSError:
+                        pass
             os.replace(temp, path)
             SessionFrameSpool._fsync_dir(os.path.dirname(path))
         finally:
