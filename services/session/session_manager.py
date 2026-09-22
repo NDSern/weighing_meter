@@ -1696,6 +1696,7 @@ class SessionManager:
             )
             self._attach_unknown_publish_images(
                 publish_result, publish_frames, captured_at, session_id, unknown_plate,
+                metadata["stable_weight"], metadata["decimal_pos"],
             )
             image_object_keys = publish_result.pop("_image_object_keys", [])
             image_paths = publish_result.pop("_image_paths", [])
@@ -2335,6 +2336,7 @@ class SessionManager:
 
     def _attach_unknown_publish_images(
         self, result, frames, captured_at, session_id, unknown_plate="UNKNOWN",
+        stable_weight=None, decimal_pos=0,
     ):
         available = [
             camera for camera in ("cam1", "cam2", "cam3")
@@ -2352,6 +2354,10 @@ class SessionManager:
             frame = frames[camera]
             if camera == "cam2":
                 frame = self._crop_cam2_result_image(frame)
+            if unknown_plate == "UNKNOWN_OCR":
+                frame, _, _ = self._build_publish_images(
+                    frame, unknown_plate, stable_weight, decimal_pos, None,
+                )
             fpath, object_key, url = paths[camera]
             result["photos"].append({
                 "url": url, "type": camera, "captured_at": captured_at.get(camera),
