@@ -2204,9 +2204,26 @@ class SessionManager:
             synchronized_gap_ms = round((max(timestamps) - min(timestamps)) * 1000)
             for camera, item, frame in zip(available_cameras, combination, frames):
                 if unknown_plate == "UNKNOWN_OCR":
+                    tracks = (frame_metadata.get(item.get("relative_path")) or {}).get("tracks") or []
+                    if not tracks:
+                        detected_boxes = (metadata.get("lpr_diagnostics") or {}).get(
+                            "detected_boxes", {}
+                        )
+                        tracks = detected_boxes.get(item.get("relative_path"), [])
+                        if not tracks:
+                            tracks = max(
+                                (
+                                    boxes for path, boxes in detected_boxes.items()
+                                    if path.startswith(camera + "-") and boxes
+                                ),
+                                key=lambda boxes: max(
+                                    box.get("confidence", 0.0) for box in boxes
+                                ),
+                                default=[],
+                            )
                     self._draw_unknown_ocr_bbox(
                         frame,
-                        (frame_metadata.get(item.get("relative_path")) or {}).get("tracks") or [],
+                        tracks,
                     )
                 selected[camera] = frame
                 captured_at[camera] = item["captured_at"]
