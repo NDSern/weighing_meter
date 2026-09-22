@@ -29,9 +29,12 @@ class SessionFrameSpool:
         cv2_module=cv2,
         metadata_provider=None,
         quarantine_retention_days=30,
+        max_frames_per_camera=None,
     ):
         if interval <= 0:
             raise ValueError("interval must be positive")
+        if max_frames_per_camera is not None and max_frames_per_camera <= 0:
+            raise ValueError("max_frames_per_camera must be positive when set")
         self.root_dir = os.path.abspath(root_dir)
         self.sessions_dir = os.path.join(self.root_dir, "sessions")
         self.active_dir = os.path.join(self.root_dir, "active")
@@ -50,6 +53,7 @@ class SessionFrameSpool:
         self._cv2 = cv2_module
         self._metadata_provider = metadata_provider
         self._quarantine_retention_seconds = quarantine_retention_days * 86400
+        self._max_frames_per_camera = max_frames_per_camera
         self._notifications = queue.Queue(maxsize=notification_queue_size)
         self._notification_lock = threading.Lock()
         self._lock = threading.Lock()
@@ -228,7 +232,7 @@ class SessionFrameSpool:
             self._known_notifications.discard(path)
         return target
 
-    def save_session_frame(self, session_id, name, frame):
+    def save_session_frame(self, session_id, name, frame, frame_id=None, captured_at=None):
         """Persist an auxiliary frame inside the active session directory."""
         with self._lock:
             if self._active is None or self._active["session_id"] != str(session_id):
@@ -254,6 +258,9 @@ class SessionFrameSpool:
             relative_path = os.path.relpath(path, self._active["session_dir"])
             if relative_path not in self._active["files"]:
                 self._active["files"].append(relative_path)
+            self._active["frame_metadata"][relative_path] = self._frame_metadata(
+                name.split("-", 1)[0], frame_id, captured_at,
+            )
             self._write_active_locked()
             return path
 
@@ -391,6 +398,11 @@ class SessionFrameSpool:
         self, camera, frame, kind, frame_id=None, captured_at=None,
     ):
         active = self._active
+        if (
+            self._max_frames_per_camera is not None
+            and active["counts"][camera] >= self._max_frames_per_camera
+        ):
+            return False
         index = active["counts"][camera]
         name = "%s-%06d-%s.jpg" % (camera, index, kind)
         path = os.path.join(active["session_dir"], name)

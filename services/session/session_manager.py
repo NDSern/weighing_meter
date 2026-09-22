@@ -1384,10 +1384,11 @@ class SessionManager:
         for camera, grabber in grabbers.items():
             if source == "weight-10000" and camera in self.session.unknown_weight_snapshot_paths:
                 continue
+            frame_id = None
             try:
                 snapshot = getattr(grabber, "peek_latest_frame_snapshot", None)
                 if snapshot:
-                    frame, _frame_id, captured_at = snapshot(copy_frame=True)
+                    frame, frame_id, captured_at = snapshot(copy_frame=True)
                 else:
                     frame = grabber.peek_latest_frame(copy_frame=True)
                     captured_at = None
@@ -1408,9 +1409,13 @@ class SessionManager:
             path = None
             if self.frame_spool and self.session.spool_active:
                 try:
-                    path = self.frame_spool.save_session_frame(
-                        self.session.session_id, f"{camera}-unknown-{source}.jpg", frame,
-                    )
+                    args = (self.session.session_id, f"{camera}-unknown-{source}.jpg", frame)
+                    if source.startswith("local-peak-"):
+                        path = self.frame_spool.save_session_frame(
+                            *args, frame_id=frame_id, captured_at=captured_at,
+                        )
+                    else:
+                        path = self.frame_spool.save_session_frame(*args)
                 except Exception as exc:
                     log_fn("ERROR", f"UNKNOWN {source} snapshot save failed camera={camera}: {exc}")
             if path:
@@ -1999,6 +2004,7 @@ class SessionManager:
                 candidates[camera].append({
                     "path": os.path.abspath(path), "captured_at": observed_iso,
                     "timestamp": observed_ts, "origin": "dedicated", "camera": camera,
+                    "relative_path": os.path.basename(path),
                 })
             return candidates
 
