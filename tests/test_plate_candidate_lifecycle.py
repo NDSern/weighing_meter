@@ -66,6 +66,41 @@ class PlateCandidateLifecycleTests(unittest.TestCase):
         manager._end_session.assert_not_called()
         self.assertTrue(manager.session.session_active)
 
+    def test_loaded_plate_session_promotes_before_expired_track_loss(self):
+        spool = Mock()
+        spool.begin_session.return_value = "/spool/session"
+        manager = SessionManager(Mock(), frame_spool=spool)
+        log = Mock()
+
+        manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, log)
+        with patch("services.session.session_manager.time.monotonic", return_value=0.0):
+            manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, log)
+        manager._end_session = Mock()
+
+        with patch("services.session.session_manager.time.monotonic", return_value=1.1):
+            manager.on_frame(frame(5000), log)
+
+        self.assertTrue(manager.session.session_active)
+        self.assertTrue(manager.session.scale_owned)
+        self.assertFalse(manager._plate_owned)
+        manager._end_session.assert_not_called()
+
+    def test_lpr_session_controls_camera_lights(self):
+        lights = Mock()
+        manager = SessionManager(Mock(), lpr_light_controller=lights)
+        log = Mock()
+
+        manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, log)
+        manager._end_session("both_plate_tracks_lost", log)
+
+        self.assertEqual(
+            lights.set_lpr_active.call_args_list,
+            [
+                unittest.mock.call(True, log),
+                unittest.mock.call(False, log),
+            ],
+        )
+
     def test_timeout_blocks_persistent_plate_until_track_loss(self):
         manager = SessionManager(Mock())
         log = Mock()

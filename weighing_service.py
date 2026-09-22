@@ -15,6 +15,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "4")
 os.environ.setdefault("OPENCV_FFMPEG_THREADS", "2")
@@ -118,6 +119,7 @@ from services.pipeline import detector_obb_decode
 
 from services.tracking import PlateTracker
 from services.capture import FrameGrabber, CameraGrabber, DetectCoordinator
+from services.capture.camera_light_controller import CameraLightController
 from services.capture.detect_coordinator import set_log_fn as set_detect_coordinator_log
 from services.capture.session_frame_spool import SessionFrameSpool
 from services.pipeline.deferred_lpr_worker import DeferredLprWorker
@@ -256,6 +258,9 @@ def main():
             save_images_fn=ImageSaveWorker.save_and_upload_now,
             undetectable_dir=UNDETECTABLE_DIR,
             cam2_result_crop=CAM2_RESULT_CROP,
+            lpr_light_controller=CameraLightController(
+                [RTSP_URL, RTSP_URL_2, RTSP_URL_3], datetime.now,
+            ),
         )
         detect_coord = DetectCoordinator(
             [cam1, cam3], plate_tracker,

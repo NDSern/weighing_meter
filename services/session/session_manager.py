@@ -405,6 +405,7 @@ class SessionManager:
         undetectable_dir=None,
         cam2_result_crop="left",
         frame_spool=None,
+        lpr_light_controller=None,
     ):
         if cam2_result_crop not in ("left", "right", "full"):
             raise ValueError(f"Invalid cam2 result crop mode: {cam2_result_crop!r}")
@@ -417,6 +418,7 @@ class SessionManager:
         self.undetectable_dir = undetectable_dir
         self.cam2_result_crop = cam2_result_crop
         self.frame_spool = frame_spool
+        self.lpr_light_controller = lpr_light_controller
 
         self.session = WeighingSessionState()
         self._last_publish_plate = None
@@ -592,17 +594,18 @@ class SessionManager:
         if (
             self.session.session_active
             and self._plate_owned
-            and self._plate_absent_since is not None
-            and time.monotonic() - self._plate_absent_since >= 1.0
-        ):
-            self._complete_plate_loss(log_fn, frame.weight)
-        if (
-            self.session.session_active
             and not self.session.scale_owned
             and frame.weight > WEIGHT_THRESHOLD
         ):
             if self._promote_plate_candidate(frame, log_fn) is False:
                 return
+        if (
+            self.session.session_active
+            and self._plate_owned
+            and self._plate_absent_since is not None
+            and time.monotonic() - self._plate_absent_since >= 1.0
+        ):
+            self._complete_plate_loss(log_fn, frame.weight)
         self._capture_rear_fallback_if_due(log_fn)
         self._capture_unknown_snapshots_if_due(log_fn)
         self._capture_unknown_weight_snapshots_if_due(frame.weight, log_fn)
@@ -1114,6 +1117,8 @@ class SessionManager:
         if self.session.scale_owned and self._start_session_spool(log_fn, trigger) is False:
             return False
         self.session.session_active = True
+        if self.lpr_light_controller:
+            self.lpr_light_controller.set_lpr_active(True, log_fn)
         self.session.unknown_snapshot_deadline = (
             self.session.started_at + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
         )
@@ -1537,6 +1542,8 @@ class SessionManager:
         self._attempt_wait_reference = None
         self._post_session_low = None
 
+        if self.lpr_light_controller:
+            self.lpr_light_controller.set_lpr_active(False, log_fn)
         self.session.session_active = False
         self._generation += 1
         self._plate_owned = False

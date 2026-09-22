@@ -167,7 +167,8 @@ class SessionStrategyTests(unittest.TestCase):
         session_id = self.manager.session.session_id
         self.manager.on_plate_presence("cam3", {"cam1": False, "cam3": True}, self.log)
         self.assertEqual(self.manager.session.session_id, session_id)
-        self.assertTrue(self.manager._plate_owned)
+        self.assertFalse(self.manager._plate_owned)
+        self.assertTrue(self.manager.session.scale_owned)
 
     def test_one_camera_presence_cancels_loss(self):
         self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
@@ -213,9 +214,10 @@ class SessionStrategyTests(unittest.TestCase):
         self.assertEqual(self.manager._generation, generation)
 
         self.feed(self.manager, [6300, 6000, 5700, 5800, 5300, 4800], self.log)
-        self.assertFalse(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.scale_owned)
 
-    def test_plate_loss_can_end_weighted_session_by_host_policy(self):
+    def test_plate_loss_policy_does_not_end_weighted_session_before_promotion(self):
         with patch("services.session.session_manager.time.monotonic", return_value=0.0):
             self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
@@ -228,7 +230,8 @@ class SessionStrategyTests(unittest.TestCase):
         ), patch("services.session.session_manager.time.monotonic", return_value=1.1):
             self.manager.on_frame(frame, self.log)
 
-        self.assertFalse(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.scale_owned)
 
 
 if __name__ == "__main__":
