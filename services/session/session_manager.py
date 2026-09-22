@@ -310,6 +310,10 @@ class WeighingSessionState:
         self.unknown_weight_snapshot_captured_at = {}
         self.unknown_weight_snapshot_triggered_at = None
         self.unknown_weight_snapshot_attempted = False
+        self.local_peak_dwell_snapshot_paths = {}
+        self.local_peak_dwell_snapshot_captured_at = {}
+        self.local_peak_drop_snapshot_paths = {}
+        self.local_peak_drop_snapshot_captured_at = {}
         self.started_at = None
         self.started_at_iso = None
         self.session_id = None
@@ -616,7 +620,7 @@ class SessionManager:
                 if self._session_filtered_peak is None or filtered > self._session_filtered_peak:
                     self._session_filtered_peak = filtered
                     self._session_filtered_peak_observed_at = observed_at
-            self._update_local_peak(frame.weight, observed_at, frame.timestamp)
+            self._update_local_peak(frame.weight, observed_at, frame.timestamp, log_fn)
             if time.monotonic() - self._last_spool_weight_checkpoint >= 1.0:
                 self._update_spool_metadata(log_fn)
                 self._last_spool_weight_checkpoint = time.monotonic()
@@ -660,7 +664,7 @@ class SessionManager:
             return
         self._update_vehicle_type(log_fn)
 
-    def _update_local_peak(self, weight, observed_iso, observed_ts):
+    def _update_local_peak(self, weight, observed_iso, observed_ts, log_fn):
         """Track first sustained local weight maximum for UNKNOWN evidence timing."""
         if weight <= WEIGHT_THRESHOLD:
             return
@@ -677,8 +681,17 @@ class SessionManager:
             return
         held = timestamp - self._session_local_peak_ts >= UNKNOWN_PHOTO_LOCAL_PEAK_DWELL_SECONDS
         dropped = self._session_local_peak - weight >= UNKNOWN_PHOTO_LOCAL_PEAK_DROP_KG
-        if held or dropped:
-            self._session_local_peak_confirmed = True
+        if not held and not dropped:
+            return
+        self._session_local_peak_confirmed = True
+        source = "local-peak-dwell" if held else "local-peak-drop"
+        captured = self._capture_unknown_snapshot_set(source, log_fn)
+        self._update_spool_metadata(log_fn)
+        log_metric(
+            log_fn, "local_peak_snapshot_captured", id=self.session.session_id,
+            source=source, peak_weight_kg=self._session_local_peak,
+            peak_observed_at=self._session_local_peak_observed_at, captured_at=captured,
+        )
 
     def _update_peak_candidate(self, frame, log_fn):
         """Record shadow peak evidence without changing session behavior."""
@@ -1404,6 +1417,12 @@ class SessionManager:
                 if source == "weight-10000":
                     self.session.unknown_weight_snapshot_paths[camera] = path
                     self.session.unknown_weight_snapshot_captured_at[camera] = captured_at
+                elif source == "local-peak-dwell":
+                    self.session.local_peak_dwell_snapshot_paths[camera] = path
+                    self.session.local_peak_dwell_snapshot_captured_at[camera] = captured_at
+                elif source == "local-peak-drop":
+                    self.session.local_peak_drop_snapshot_paths[camera] = path
+                    self.session.local_peak_drop_snapshot_captured_at[camera] = captured_at
                 else:
                     self.session.unknown_snapshot_paths[camera] = path
                     self.session.unknown_snapshot_captured_at[camera] = captured_at
@@ -1439,6 +1458,10 @@ class SessionManager:
                     "unknown_weight_snapshot_paths": dict(self.session.unknown_weight_snapshot_paths),
                     "unknown_weight_snapshot_captured_at": dict(self.session.unknown_weight_snapshot_captured_at),
                     "unknown_weight_snapshot_triggered_at": self.session.unknown_weight_snapshot_triggered_at,
+                    "local_peak_dwell_snapshot_paths": dict(self.session.local_peak_dwell_snapshot_paths),
+                    "local_peak_dwell_snapshot_captured_at": dict(self.session.local_peak_dwell_snapshot_captured_at),
+                    "local_peak_drop_snapshot_paths": dict(self.session.local_peak_drop_snapshot_paths),
+                    "local_peak_drop_snapshot_captured_at": dict(self.session.local_peak_drop_snapshot_captured_at),
                 },
             )
         except Exception as exc:
@@ -1543,6 +1566,10 @@ class SessionManager:
         self.session.unknown_weight_snapshot_captured_at = {}
         self.session.unknown_weight_snapshot_triggered_at = None
         self.session.unknown_weight_snapshot_attempted = False
+        self.session.local_peak_dwell_snapshot_paths = {}
+        self.session.local_peak_dwell_snapshot_captured_at = {}
+        self.session.local_peak_drop_snapshot_paths = {}
+        self.session.local_peak_drop_snapshot_captured_at = {}
         self.session.started_at = None
         self.session.started_at_iso = None
         self.session.session_id = None
@@ -1592,6 +1619,10 @@ class SessionManager:
             "unknown_weight_snapshot_paths": dict(self.session.unknown_weight_snapshot_paths),
             "unknown_weight_snapshot_captured_at": dict(self.session.unknown_weight_snapshot_captured_at),
             "unknown_weight_snapshot_triggered_at": self.session.unknown_weight_snapshot_triggered_at,
+            "local_peak_dwell_snapshot_paths": dict(self.session.local_peak_dwell_snapshot_paths),
+            "local_peak_dwell_snapshot_captured_at": dict(self.session.local_peak_dwell_snapshot_captured_at),
+            "local_peak_drop_snapshot_paths": dict(self.session.local_peak_drop_snapshot_paths),
+            "local_peak_drop_snapshot_captured_at": dict(self.session.local_peak_drop_snapshot_captured_at),
         }
 
     def _should_skip_duplicate_publish(self, plate, stable_weight, session_started_at=None):
@@ -2053,14 +2084,24 @@ class SessionManager:
                 })
 
         if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
-            source = (
-                "local_peak"
-                if metadata.get("local_peak_observed_at")
-                else "weight_recorded"
+            dwell_candidates = dedicated_candidates(
+                "local_peak_dwell_snapshot_paths",
+                "local_peak_dwell_snapshot_captured_at", "local_peak_dwell",
             )
+            drop_candidates = dedicated_candidates(
+                "local_peak_drop_snapshot_paths",
+                "local_peak_drop_snapshot_captured_at", "local_peak_drop",
+            )
+            source = "local_peak" if metadata.get("local_peak_observed_at") else "weight_recorded"
             target = target_ts
             candidate_sets = {}
             for camera in cameras:
+                if dwell_candidates[camera]:
+                    candidate_sets[camera] = dwell_candidates[camera]
+                    continue
+                if drop_candidates[camera]:
+                    candidate_sets[camera] = drop_candidates[camera]
+                    continue
                 nearest = min(
                     timeline[camera], key=lambda item: abs(item["timestamp"] - target),
                     default=None,
