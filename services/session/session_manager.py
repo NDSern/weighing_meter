@@ -1936,7 +1936,7 @@ class SessionManager:
                 continue
             candidate = {
                 "path": path, "captured_at": observed_iso, "timestamp": observed_ts,
-                "origin": "timeline", "camera": camera,
+                "origin": "timeline", "camera": camera, "relative_path": relative_path,
             }
             frame_id = item_metadata.get("frame_id")
             if frame_id is not None:
@@ -2156,6 +2156,11 @@ class SessionManager:
             timestamps = [item["timestamp"] for item in combination]
             synchronized_gap_ms = round((max(timestamps) - min(timestamps)) * 1000)
             for camera, item, frame in zip(available_cameras, combination, frames):
+                if unknown_plate == "UNKNOWN_OCR":
+                    self._draw_unknown_ocr_bbox(
+                        frame,
+                        (frame_metadata.get(item.get("relative_path")) or {}).get("tracks") or [],
+                    )
                 selected[camera] = frame
                 captured_at[camera] = item["captured_at"]
                 selection[camera] = {
@@ -2181,6 +2186,26 @@ class SessionManager:
             selected=selection, rejected=rejected, missing_cameras=missing,
         )
         return selected, captured_at
+
+    @staticmethod
+    def _draw_unknown_ocr_bbox(frame, tracks):
+        if not tracks:
+            return
+        if not hasattr(frame, "shape"):
+            return
+        bbox = max(tracks, key=lambda track: track.get("confidence", 0.0)).get("bbox") or []
+        if len(bbox) != 4:
+            return
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = (int(value) for value in bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(width - 1, x2), min(height - 1, y2)
+        if x2 <= x1 or y2 <= y1:
+            return
+        cv2.rectangle(
+            frame, (x1, y1), (x2, y2), (0, 255, 0),
+            max(2, round(height / 1080 * 3)), cv2.LINE_AA,
+        )
 
     @staticmethod
     def _load_lpr_diagnostic_frames(metadata, classification):
