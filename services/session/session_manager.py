@@ -25,7 +25,6 @@ from config import (
     PEAK_FILTER_FRAMES,
     PEAK_MOVEMENT_CANCEL_KG,
     PEAK_MOVEMENT_CONFIRM_FRAMES,
-    PUSH_IMAGE_DEBUG_OVERLAY,
     SAME_PLATE_DUPLICATE_SECONDS,
     SESSION_DEDUP_STATE_FILE,
     SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT,
@@ -2374,14 +2373,16 @@ class SessionManager:
 
     def _build_publish_images(self, frame, plate, stable_weight, decimal_pos, rear_frame):
         frame_h = frame.shape[0]
+        font_scale = max(0.9, frame_h / 1080)
+        thickness = max(2, round(font_scale * 3))
         cv2.putText(
             frame,
             f"Bien so: {plate}    Tai trong xe: {stable_weight:.{decimal_pos}f} kg",
             (10, frame_h - 20),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8680625,
+            font_scale,
             (0, 255, 0),
-            3,
+            thickness,
             cv2.LINE_AA,
         )
         front_img = frame
@@ -2407,7 +2408,6 @@ class SessionManager:
         tracker = tracker or self.plate_tracker
         image = tracker.get_image_frame(plate, aliases=image_aliases)
         frame, img_plate, camera_name, observed_at = image[:4]
-        debug = image[4] if len(image) > 4 else None
         if frame is None or not plate:
             return False
         if img_plate != plate:
@@ -2421,8 +2421,6 @@ class SessionManager:
             rear_frame = self.session.rear_start_frame
         if rear_frame is not None:
             rear_frame = self._crop_cam2_result_image(rear_frame)
-        if PUSH_IMAGE_DEBUG_OVERLAY and debug:
-            self._draw_lpr_debug_overlay(frame, debug, camera_name)
         front_img, merged_img, rear_img = self._build_publish_images(
             frame, plate, stable_weight, decimal_pos, rear_frame
         )
@@ -2463,24 +2461,6 @@ class SessionManager:
         result["_image_save_items"] = save_items
         log_fn("TIMING", f"Publish images: build={(time.time() - attach_started_at) * 1000:.0f}ms")
         return True
-
-    @staticmethod
-    def _draw_lpr_debug_overlay(frame, debug, camera_name):
-        h, w = frame.shape[:2]
-        bbox = debug.get("bbox") or []
-        if len(bbox) == 4:
-            x1, y1, x2, y2 = (max(0, int(value)) for value in bbox)
-            cv2.rectangle(frame, (min(x1, w - 1), min(y1, h - 1)), (min(x2, w - 1), min(y2, h - 1)), (0, 255, 0), 3)
-        candidates = debug.get("candidates") or []
-        lines = [
-            f"{camera_name} det={debug.get('det_conf', 0.0):.3f} ocr={debug.get('ocr_confidence', 0.0):.3f}",
-            f"result={debug.get('plate', 'unknown')} raw={debug.get('raw_text', '')}",
-            f"candidates={', '.join(candidates[:5]) or '-'}",
-        ]
-        y = 32
-        for line in lines:
-            cv2.putText(frame, line[:180], (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-            y += 32
 
     def _save_undetectable_frame(self, log_fn):
         """Save the first 'unknown' detection frame to /storage/undetectable/."""
