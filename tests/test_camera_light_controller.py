@@ -3,6 +3,7 @@ import sys
 import unittest
 from datetime import datetime
 from unittest.mock import Mock
+from urllib.error import HTTPError
 from urllib.request import Request
 from xml.etree import ElementTree
 
@@ -36,6 +37,7 @@ class CameraLightControllerTests(unittest.TestCase):
             ["rtsp://admin:secret@192.168.1.181:554/ch01/0"],
             lambda: now,
             open_fn,
+            api_password="camera-api-secret",
         )
 
     def put_body(self):
@@ -61,7 +63,10 @@ class CameraLightControllerTests(unittest.TestCase):
         self.assertEqual(values["VarWhiteBrightness"], "100")
         self.assertEqual(values["Unchanged"], "preserve-me")
         authorization = self.requests[0].get_header("Authorization")
-        self.assertEqual(authorization, "Basic " + base64.b64encode(b"admin:secret").decode())
+        self.assertEqual(
+            authorization,
+            "Basic " + base64.b64encode(b"admin:camera-api-secret").decode(),
+        )
 
     def test_day_start_does_not_change_light(self):
         controller = self.make_controller(datetime(2026, 9, 22, 12, 0))
@@ -96,6 +101,25 @@ class CameraLightControllerTests(unittest.TestCase):
 
         self.assertEqual(controller._on_targets, set())
         log.assert_called_once()
+
+    def test_unsupported_camera_is_logged_once_and_skipped(self):
+        request = Request("http://192.168.1.179/Images/1/IrCutFilter")
+
+        def open_fn(_request, timeout):
+            raise HTTPError(request.full_url, 500, "unsupported", None, None)
+
+        controller = CameraLightController(
+            ["rtsp://admin:secret@192.168.1.179:554/ch01/0"],
+            lambda: datetime(2026, 9, 22, 20, 0),
+            open_fn,
+        )
+        log = Mock()
+
+        controller.set_lpr_active(True, log)
+        controller.set_lpr_active(True, log)
+
+        self.assertEqual(len(log.call_args_list), 1)
+        self.assertIn("unsupported", log.call_args.args[1])
 
 
 if __name__ == "__main__":

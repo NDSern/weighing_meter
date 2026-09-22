@@ -2,6 +2,7 @@
 
 import base64
 from datetime import time as clock_time
+from urllib.error import HTTPError
 from urllib.parse import unquote, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 from xml.etree import ElementTree
@@ -10,18 +11,19 @@ from xml.etree import ElementTree
 class CameraLightController:
     """Use each camera's vendor XML API without changing unrelated settings."""
 
-    def __init__(self, rtsp_urls, now_fn, open_fn=None):
-        self._targets = [self._parse_target(url) for url in rtsp_urls]
+    def __init__(self, rtsp_urls, now_fn, open_fn=None, api_password=""):
+        self._targets = [self._parse_target(url, api_password) for url in rtsp_urls]
         self._now_fn = now_fn
         self._open = open_fn or build_opener(ProxyHandler({})).open
         self._on_targets = set()
+        self._unsupported_targets = set()
 
     @staticmethod
-    def _parse_target(rtsp_url):
+    def _parse_target(rtsp_url, api_password):
         parsed = urlsplit(rtsp_url)
         if not parsed.hostname:
             raise ValueError("Camera RTSP URL must include a host")
-        return parsed.hostname, unquote(parsed.username or ""), unquote(parsed.password or "")
+        return parsed.hostname, unquote(parsed.username or ""), api_password
 
     @staticmethod
     def _is_night(now):
@@ -48,7 +50,7 @@ class CameraLightController:
                 "Content-Type": "application/xml",
             },
         )
-        response = self._open(request, timeout=3.0)
+        response = self._open(request, timeout=1.0)
         return response.read()
 
     def _set_brightness(self, target, brightness):
@@ -79,11 +81,22 @@ class CameraLightController:
         ]
         brightness = 100 if active else 0
         for target in targets:
-            if active and target in self._on_targets:
+            if target in self._unsupported_targets or (active and target in self._on_targets):
                 continue
             host = target[0]
             try:
                 self._set_brightness(target, brightness)
+            except HTTPError as exc:
+                exc.close()
+                if exc.code in (404, 500):
+                    self._unsupported_targets.add(target)
+                    log_fn(
+                        "WARNING",
+                        f"LPR light control unsupported host={host} status={exc.code}",
+                    )
+                    continue
+                log_fn("ERROR", f"LPR light control failed host={host}: {exc}")
+                continue
             except Exception as exc:
                 log_fn("ERROR", f"LPR light control failed host={host}: {exc}")
                 continue
