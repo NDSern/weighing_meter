@@ -406,6 +406,7 @@ class SessionManager:
         cam2_result_crop="left",
         frame_spool=None,
         lpr_light_controller=None,
+        duplicate_reviewer=None,
     ):
         if cam2_result_crop not in ("left", "right", "full"):
             raise ValueError(f"Invalid cam2 result crop mode: {cam2_result_crop!r}")
@@ -419,6 +420,7 @@ class SessionManager:
         self.cam2_result_crop = cam2_result_crop
         self.frame_spool = frame_spool
         self.lpr_light_controller = lpr_light_controller
+        self.duplicate_reviewer = duplicate_reviewer
 
         self.session = WeighingSessionState()
         self._last_publish_plate = None
@@ -1792,6 +1794,10 @@ class SessionManager:
                     f"outbox_id={outbox_event_id}",
                 )
                 return False
+            self._review_session_record(
+                session_id, unknown_plate, "unreadable", True,
+                outbox_event_id, image_object_keys, metadata, log_fn,
+            )
             log_metric(
                 log_fn, "session_no_plate", id=metadata["session_id"],
                 started_at=metadata["started_at"], ended_at=metadata["ended_at"],
@@ -1850,6 +1856,10 @@ class SessionManager:
                     f"Session publication evidence missing id={session_id} outbox_id={outbox_event_id}",
                 )
                 return False
+        self._review_session_record(
+            session_id, plate, "confirmed", not duplicate,
+            outbox_event_id, result.get("image_object_keys"), metadata, log_fn,
+        )
         log_metric(
             log_fn, event, id=metadata["session_id"], plate=plate,
             started_at=metadata["started_at"], ended_at=metadata["ended_at"],
@@ -1868,6 +1878,26 @@ class SessionManager:
             ),
         )
         return True
+
+    def _review_session_record(self, session_id, plate, plate_status, published,
+                               outbox_event_id, image_object_keys, metadata, log_fn):
+        if not self.duplicate_reviewer:
+            return
+        try:
+            self.duplicate_reviewer.register_session({
+                "session_id": session_id,
+                "started_at": metadata.get("started_at"),
+                "ended_at": metadata.get("ended_at"),
+                "plate": plate,
+                "plate_status": plate_status,
+                "stable_weight_kg": metadata.get("stable_weight"),
+                "weight_source": metadata.get("weight_source"),
+                "published": bool(published),
+                "outbox_event_id": outbox_event_id,
+                "image_object_keys": list(image_object_keys or []),
+            }, log_fn)
+        except Exception as exc:
+            log_fn("ERROR", f"Duplicate review registration failed id={session_id}: {exc}")
 
     @staticmethod
     def _load_start_frames(metadata):
@@ -2327,7 +2357,7 @@ class SessionManager:
             log_fn("REGISTRY", f"Corrected plate {plate} -> {registered_plate} reason={registry_reason}")
             plate = registered_plate
         if self._should_skip_duplicate_publish(plate, stable_weight, metadata.get("started_at")):
-            return {"status": "duplicate", "plate": plate}
+            return {"status": "duplicate", "plate": plate, "image_object_keys": []}
 
         result = self._build_publish_result(stable_weight, plate, count, all_plates, metadata)
         if metadata.get("session_id"):
@@ -2374,7 +2404,10 @@ class SessionManager:
                 self._save_dedup_state()
             except OSError as exc:
                 log_fn("ERROR", f"Session dedup state save failed: {exc}")
-        return {"status": "published", "plate": plate, "outbox_event_id": outbox_event_id}
+        return {
+            "status": "published", "plate": plate, "outbox_event_id": outbox_event_id,
+            "image_object_keys": image_object_keys,
+        }
 
     def _build_publish_result(self, stable_weight, plate, count, all_plates, metadata=None):
         metadata = metadata or {}
