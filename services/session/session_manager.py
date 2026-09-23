@@ -2419,8 +2419,6 @@ class SessionManager:
             "cam1": _make("photo-cam1"),
             "cam2": _make("photo-cam2"),
             "cam3": _make("photo-cam3"),
-            "unchosen_cam1": _make("photo-unchosen-cam1"),
-            "unchosen_cam3": _make("photo-unchosen-cam3"),
         }
 
     def _attach_unknown_publish_images(
@@ -2502,7 +2500,7 @@ class SessionManager:
 
         tracker = tracker or self.plate_tracker
         image = tracker.get_image_frame(plate, aliases=image_aliases)
-        frame, img_plate, camera_name, observed_at = image[:4]
+        frame, img_plate, _camera_name, observed_at = image[:4]
         if frame is None or not plate:
             return False
         if img_plate != plate:
@@ -2531,24 +2529,6 @@ class SessionManager:
         if rear_img is not None:
             photos.append({"url": paths["rear"][2], "type": "rear", "captured_at": captured_at})
             save_items.append([paths["rear"][0], rear_img, paths["rear"][1]])
-
-        unchosen_camera = None
-        if camera_name == "cam1":
-            unchosen_camera = "cam3"
-        elif camera_name == "cam3":
-            unchosen_camera = "cam1"
-        if unchosen_camera:
-            unchosen_frame = None
-            if start_frame_paths and start_frame_paths.get(unchosen_camera):
-                unchosen_frame = cv2.imread(start_frame_paths[unchosen_camera])
-            elif not start_frame_paths:
-                unchosen_frame = self.session.lpr_start_frames.get(unchosen_camera)
-            unchosen_key = f"unchosen_{unchosen_camera}"
-            if unchosen_frame is not None and unchosen_key in paths:
-                if ImageSaveWorker.save_local_only(paths[unchosen_key][0], unchosen_frame):
-                    log_fn("SAVE", f"Saved local-only unchosen LPR start image camera={unchosen_camera} plate={plate}")
-                else:
-                    log_fn("WARNING", f"Failed local-only unchosen LPR start image camera={unchosen_camera} plate={plate}")
 
         result["photos"] = photos
         result["_image_object_keys"] = [item[2] for item in save_items]
