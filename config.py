@@ -86,6 +86,13 @@ UNKNOWN_PHOTO_LOCAL_PEAK_DWELL_SECONDS = 1.0
 UNKNOWN_PHOTO_LOCAL_PEAK_DROP_KG = 300.0
 SAME_PLATE_DUPLICATE_SECONDS = 10.0
 
+# Duplicate session review (mock-only; enable per host via config.local.py)
+DUPLICATE_REVIEW_ENABLED = False
+DUPLICATE_REVIEW_DB = os.path.join(SERVICE_DIR, "storage", "duplicate-review.db")
+DUPLICATE_REVIEW_MOCK_DIR = os.path.join(SERVICE_DIR, "storage", "review-mock")
+DUPLICATE_REVIEW_MAX_GAP_SECONDS = 15.0
+DUPLICATE_REVIEW_RECONCILE_HOURS = 48.0
+
 LP_DETECTOR_RKNN = os.path.join(LPR_DIR, "model", "LP_detector.rknn")
 LP_OCR_RKNN = os.path.join(LPR_DIR, "model", "LP_ocr.rknn")
 LPR_DETECTOR_MODEL = os.path.join(SERVICE_DIR, "models", "lpr", "license_plate_detector.rknn")

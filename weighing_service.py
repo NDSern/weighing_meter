@@ -48,6 +48,7 @@ from config import (
     CAM2_RESULT_CROP,
     CAM3_LPR_CROP,
     CAPTURE_DIR,
+    DUPLICATE_REVIEW_ENABLED,
     IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
     IMAGE_RETENTION_DAYS,
     IMAGE_RETENTION_ENABLED,
@@ -128,6 +129,7 @@ from services.storage.publish_outbox import PublishOutbox
 from services.storage.retention_cleaner import (
     ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
 )
+from services.review.duplicate_review import DuplicateReviewer
 from services.runtime import RknnModelSet
 from services.session import SessionManager
 from services.session.session_manager import set_log_fn as set_session_log
@@ -150,6 +152,7 @@ def main():
     models = mqtt_svc = cam1 = cam3 = grabber2 = None
     detect_coord = reader = frame_spool = deferred_lpr = None
     retention_cleaner = minio_cache_cleaner = storage_maintenance = session_manager = plate_tracker = None
+    duplicate_reviewer = None
     mqtt_started = image_worker_started = outbox_started = False
     detect_stopped = deferred_stopped = True
 
@@ -247,6 +250,9 @@ def main():
             )
             minio_cache_cleaner.start()
 
+        if DUPLICATE_REVIEW_ENABLED:
+            duplicate_reviewer = DuplicateReviewer(log_fn=log)
+            duplicate_reviewer.reconcile(log)
         session_manager = SessionManager(
             plate_tracker=plate_tracker,
             mqtt_svc=mqtt_svc,
@@ -256,6 +262,7 @@ def main():
             save_images_fn=ImageSaveWorker.save_and_upload_now,
             undetectable_dir=UNDETECTABLE_DIR,
             cam2_result_crop=CAM2_RESULT_CROP,
+            duplicate_reviewer=duplicate_reviewer,
         )
         detect_coord = DetectCoordinator(
             [cam1, cam3], plate_tracker,
