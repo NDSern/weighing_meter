@@ -9,7 +9,6 @@ from collections import deque
 from datetime import datetime, timezone
 
 import cv2
-import numpy as np
 
 from services.storage.image_save_worker import ImageSaveWorker
 from services.storage.publish_outbox import PublishOutbox, set_log_fn as set_publish_outbox_log
@@ -21,6 +20,12 @@ from services.session.plate_registry import (
     set_log_fn as set_plate_registry_log,
 )
 from services.session.weight_state import WeighingSessionState
+from services.session.result_builder import (
+    build_publish_images,
+    build_publish_result,
+    crop_cam2_result_image,
+    prepare_capture_paths,
+)
 from services.session.evidence_selection import (
     CAMERAS,
     UNKNOWN_PHOTO_MAX_OFFSET_SECONDS,
@@ -1902,26 +1907,7 @@ class SessionManager:
                 "image_object_keys": image_object_keys}
 
     def _build_publish_result(self, stable_weight, plate, count, all_plates, metadata=None):
-        metadata = metadata or {}
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        start = metadata.get("started_at")
-        end = metadata.get("ended_at")
-        event_timestamp = end or datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-        if start:
-            start = datetime.fromisoformat(start).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        if end:
-            end = datetime.fromisoformat(end).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        return {
-            "start": start or timestamp,
-            "end": end or timestamp,
-            "timestamp": event_timestamp,
-            "duration_s": metadata.get("duration_s", 0),
-            "stable_weight": stable_weight,
-            "official_plate": plate or "none",
-            "official_plate_count": count,
-            "all_plates": all_plates,
-            "image_path": None,
-        }
+        return build_publish_result(stable_weight, plate, count, all_plates, metadata)
 
     def _log_publish_summary(self, stable_weight, decimal_pos, plate, score, count, all_plates, log_fn):
         plate_text = plate or "none"
@@ -1932,26 +1918,7 @@ class SessionManager:
         )
 
     def _prepare_capture_paths(self, now, plate, session_id=None):
-        date_path = now.strftime("%Y/%m/%d")
-        day_dir = os.path.join(CAPTURE_DIR, now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
-        os.makedirs(day_dir, exist_ok=True)
-        ts = session_id or now.strftime("%Y%m%d_%H%M%S_%f")
-
-        def _make(suffix):
-            fname = f"{ts}_{plate}_{suffix}.jpg"
-            fpath = os.path.join(day_dir, fname)
-            key = f"storage/weighbridge/{date_path}/{fname}"
-            url = f"/storage/weighbridge/{date_path}/{fname}"
-            return fpath, key, url
-
-        return {
-            "front": _make("photo-front"),
-            "rear": _make("photo-rear"),
-            "merged": _make("photo-merged"),
-            "cam1": _make("photo-cam1"),
-            "cam2": _make("photo-cam2"),
-            "cam3": _make("photo-cam3"),
-        }
+        return prepare_capture_paths(now, plate, session_id)
 
     def _attach_unknown_publish_images(
         self, result, frames, captured_at, session_id, unknown_plate="UNKNOWN",
@@ -1986,39 +1953,10 @@ class SessionManager:
             result["_image_save_items"].append([fpath, frame, object_key])
 
     def _crop_cam2_result_image(self, frame):
-        h, w = frame.shape[:2]
-        crop_mode = self.cam2_result_crop
-        if crop_mode == "left":
-            return frame[:, : w // 2]
-        if crop_mode == "right":
-            return frame[:, w // 2 :]
-        if crop_mode == "full":
-            return frame
-        raise ValueError(f"Invalid cam2 result crop mode: {crop_mode!r}")
+        return crop_cam2_result_image(frame, self.cam2_result_crop)
 
     def _build_publish_images(self, frame, plate, stable_weight, decimal_pos, rear_frame):
-        frame_h = frame.shape[0]
-        font_scale = max(0.9, frame_h / 1080)
-        thickness = max(2, round(font_scale * 3))
-        cv2.putText(
-            frame,
-            f"Bien so: {plate}    Tai trong xe: {stable_weight:.{decimal_pos}f} kg",
-            (10, frame_h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (0, 255, 0),
-            thickness,
-            cv2.LINE_AA,
-        )
-        front_img = frame
-        if rear_frame is None:
-            return front_img, front_img, None
-
-        rear_h = rear_frame.shape[0]
-        rear_width = rear_frame.shape[1] * frame_h // rear_h
-        rear_resized = cv2.resize(rear_frame, (rear_width, frame_h))
-        merged_img = np.hstack([front_img, rear_resized])
-        return front_img, merged_img, rear_resized
+        return build_publish_images(frame, plate, stable_weight, decimal_pos, rear_frame)
 
     def _attach_publish_images(
         self, result, stable_weight, decimal_pos, plate, image_aliases, log_fn,
@@ -2027,7 +1965,6 @@ class SessionManager:
         session_started_at=None,
         session_id=None,
     ):
-        import numpy as np
         attach_started_at = time.time()
 
         tracker = tracker or self.plate_tracker
