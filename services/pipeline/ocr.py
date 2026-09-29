@@ -6,7 +6,7 @@ import math
 import cv2
 import numpy as np
 
-from config import MIN_CROP_H, MIN_CROP_W, OCR_CONF_THRES, OCR_IOU_THRES, IMG_SIZE
+from config import MIN_CROP_H, MIN_CROP_W, OCR_CONF_THRES, OCR_IOU_THRES
 
 # Import inference helpers
 from .inference import preprocess, postprocess
@@ -146,7 +146,6 @@ def _compute_skew_angles(src_img):
     """Run Canny + HoughLines once, return skew angles for ct=0 and ct=1."""
     import cv2
     import math
-    import numpy as np
 
     if len(src_img.shape) == 3:
         h, w, _ = src_img.shape

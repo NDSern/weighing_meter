@@ -2,7 +2,6 @@ import os
 import gzip
 import json
 import tempfile
-import time
 import unittest
 import tarfile
 import importlib.util

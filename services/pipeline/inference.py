@@ -1,7 +1,6 @@
 """RKNN inference helpers for plate and vehicle detection."""
 
 import cv2
-import math
 
 import numpy as np
 
@@ -9,8 +8,6 @@ from config import (
     DET_CONF_THRES,
     DET_IOU_THRES,
     IMG_SIZE,
-    OCR_CONF_THRES,
-    OCR_IOU_THRES,
     YOLO26_CONF_THRES,
     YOLO26_IOU_THRES,
     VEHICLE_CLASS_IDS,

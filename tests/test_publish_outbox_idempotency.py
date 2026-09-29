@@ -1,6 +1,5 @@
 import json
 import os
-import queue
 import tempfile
 import unittest
 import sys
@@ -184,7 +183,6 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         self.assertEqual(json.loads(stored[0]), terminal)
 
     def test_plate_count_updates_once_per_session_id(self):
-        db_path = os.path.join(self.root.name, "plates.db")
         with patch.object(plate_registry_module, "SERVICE_DIR", self.root.name):
             first = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")
             replay = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")

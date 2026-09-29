@@ -3,7 +3,6 @@
 
 import argparse
 import fcntl
-import os
 import shutil
 import sqlite3
 import sys

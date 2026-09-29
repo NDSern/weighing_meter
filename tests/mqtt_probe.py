@@ -25,7 +25,6 @@ from config import (
     MQTT_TOPIC,
     MQTT_USERNAME,
     SCALE_DATA_DIR,
-    SERVICE_DIR,
     WEIGHT_THRESHOLD,
 )
 from mqtt_service import build_weighbridge_payload

@@ -1,7 +1,6 @@
 import queue
 import sys
 import tempfile
-import time
 import unittest
 from types import ModuleType
 from unittest import mock
