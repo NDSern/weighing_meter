@@ -26,6 +26,7 @@ from services.review.mock_integrations import (
     build_mqtt_compensation_intent,
     emit_mock_actions,
 )
+from services.scale.evidence import ScaleLogReader, iso_to_epoch
 
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS review_sessions ("
@@ -59,78 +60,18 @@ COLUMNS = (
 )
 
 
-def _iso_to_epoch(value):
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        return parsed.timestamp()
-    return parsed.timestamp()
-
-
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-class ScaleContinuityReader:
-    """Read-only access to the authoritative per-day scale-log databases."""
+class ScaleContinuityReader(ScaleLogReader):
+    """Decides whether an interval is one unbroken above-threshold load."""
 
-    def __init__(self, data_dir=SCALE_DATA_DIR, max_gap_seconds=DUPLICATE_REVIEW_MAX_GAP_SECONDS,
+    def __init__(self, data_dir=SCALE_DATA_DIR,
+                 max_gap_seconds=DUPLICATE_REVIEW_MAX_GAP_SECONDS,
                  weight_threshold=WEIGHT_THRESHOLD):
-        self.data_dir = data_dir
+        super().__init__(data_dir=data_dir, weight_threshold=weight_threshold)
         self.max_gap_seconds = float(max_gap_seconds)
-        self.weight_threshold = float(weight_threshold)
-
-    def _db_path(self, day):
-        return os.path.join(self.data_dir, "%s.db" % day.strftime("%Y-%m-%d"))
-
-    def _query(self, path, start_epoch, end_epoch):
-        iso_start = datetime.fromtimestamp(start_epoch).isoformat()
-        iso_end = datetime.fromtimestamp(end_epoch).isoformat()
-        with closing(sqlite3.connect(path)) as connection:
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(weight_log)")}
-            if "timestamp" not in columns or "weight_kg" not in columns:
-                raise sqlite3.Error("weight_log schema is not usable")
-            has_checksum = "checksum_ok" in columns
-            select = "timestamp, weight_kg" + (", checksum_ok" if has_checksum else "")
-            rows = connection.execute(
-                "SELECT %s FROM weight_log WHERE timestamp >= ? AND timestamp <= ?" % select,
-                (iso_start, iso_end),
-            ).fetchall()
-        readings = []
-        for row in rows:
-            epoch = _iso_to_epoch(row[0])
-            if epoch is None:
-                continue
-            if has_checksum and row[2] in (0, False):
-                readings.append((epoch, None))
-            else:
-                readings.append((epoch, float(row[1])))
-        return readings
-
-    def readings_between(self, start_epoch, end_epoch):
-        """Return (readings, complete). complete=False when data could not be read."""
-        readings = []
-        complete = True
-        if end_epoch < start_epoch:
-            return readings, complete
-        day = datetime.fromtimestamp(start_epoch).date()
-        last_day = datetime.fromtimestamp(end_epoch).date()
-        while day <= last_day:
-            path = self._db_path(day)
-            if not os.path.exists(path):
-                complete = False
-            else:
-                try:
-                    readings.extend(self._query(path, start_epoch, end_epoch))
-                except sqlite3.Error:
-                    complete = False
-            day += timedelta(days=1)
-        readings.sort(key=lambda item: item[0])
-        return readings, complete
 
     def continuous_load(self, start_epoch, end_epoch):
         """Return (is_continuous, reason) for the interval between two sessions."""
@@ -274,8 +215,8 @@ class DuplicateReviewer:
 
         for index in range(len(sessions) - 1):
             earlier, later = sessions[index], sessions[index + 1]
-            start = _iso_to_epoch(earlier["ended_at"])
-            end = _iso_to_epoch(later["started_at"])
+            start = iso_to_epoch(earlier["ended_at"])
+            end = iso_to_epoch(later["started_at"])
             if start is None or end is None or end < start:
                 continue
             continuous, reason = self.reader.continuous_load(start, end)

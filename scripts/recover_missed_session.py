@@ -8,7 +8,6 @@ import os
 import shutil
 import sqlite3
 import sys
-from collections import Counter
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -133,6 +132,13 @@ def _append_json_line(path, record):
     _fsync_directory(path.parent)
 
 
+from services.scale.evidence import (
+    ScaleLogReader,
+    group_loaded_cycles,
+    select_loaded_stable,
+)
+
+
 class MissedSessionRecovery:
     def __init__(self, service_dir=SERVICE_DIR, host_id=WEIGHBRIDGE_ID):
         self.service_dir = Path(service_dir).resolve()
@@ -191,31 +197,7 @@ class MissedSessionRecovery:
         return record, path
 
     def _scale_rows_between(self, local_start, local_end):
-        rows = []
-        day = local_start.date()
-        while day <= local_end.date():
-            database = self.scale_dir / f"{day.isoformat()}.db"
-            if not database.exists():
-                raise RuntimeError(f"raw scale database missing for {day.isoformat()}")
-            with closing(sqlite3.connect(database)) as connection:
-                columns = {
-                    row[1] for row in connection.execute("PRAGMA table_info(weight_log)")
-                }
-                required = {"timestamp", "weight_kg", "status"}
-                if not required.issubset(columns):
-                    raise RuntimeError(f"invalid raw scale schema for {day.isoformat()}")
-                checksum = "checksum_ok" if "checksum_ok" in columns else "1"
-                rows.extend(connection.execute(
-                    f"SELECT timestamp, weight_kg, status, {checksum} "
-                    "FROM weight_log WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp",
-                    (local_start.isoformat(), local_end.isoformat()),
-                ).fetchall())
-            day += timedelta(days=1)
-        if not rows:
-            raise RuntimeError("raw scale interval has no readings")
-        if any(row[3] not in (None, 1) for row in rows):
-            raise RuntimeError("raw scale interval contains invalid checksums")
-        return rows
+        return ScaleLogReader(str(self.scale_dir)).rows_between(local_start, local_end)
 
     def _scale_rows(self, started_at, ended_at):
         return self._scale_rows_between(
@@ -233,26 +215,7 @@ class MissedSessionRecovery:
             local_start - timedelta(seconds=30),
             local_end + timedelta(seconds=5),
         )
-        groups = []
-        current = []
-        previous_loaded_at = None
-        low_since_previous = []
-        for row in rows:
-            observed_at = self._as_local_datetime(row[0])
-            if float(row[1]) <= WEIGHT_THRESHOLD:
-                if current:
-                    low_since_previous.append(row)
-                continue
-            if current and low_since_previous:
-                gap = (observed_at - previous_loaded_at).total_seconds()
-                if gap >= SESSION_END_EMPTY_DWELL_SECONDS:
-                    groups.append(current)
-                    current = []
-            current.append(row)
-            previous_loaded_at = observed_at
-            low_since_previous = []
-        if current:
-            groups.append(current)
+        groups = group_loaded_cycles(rows, WEIGHT_THRESHOLD)
         overlapping = [
             group for group in groups
             if any(
@@ -303,15 +266,9 @@ class MissedSessionRecovery:
             raise RuntimeError("raw scale interval contains no loaded readings")
         if not stable:
             raise RuntimeError("raw scale interval contains no loaded STABLE readings")
-        stable_counts = Counter(float(row[1]) for row in stable)
-        latest_seen = {}
-        for index, row in enumerate(stable):
-            latest_seen[float(row[1])] = index
-        selected_weight = max(
-            stable_counts,
-            key=lambda value: (stable_counts[value], latest_seen[value]),
-        )
-        selected_rows = [row for row in stable if float(row[1]) == selected_weight]
+        selection = select_loaded_stable(rows, WEIGHT_THRESHOLD)
+        stable_counts = selection["counts"]
+        selected_weight = selection["selected_weight"]
         evidence = {
             "row_count": len(rows),
             "loaded_row_count": len(loaded),
@@ -319,7 +276,7 @@ class MissedSessionRecovery:
             "raw_peak_weight": max(float(row[1]) for row in loaded),
             "selected_weight": selected_weight,
             "selected_weight_count": stable_counts[selected_weight],
-            "selected_weight_observed_at": selected_rows[-1][0],
+            "selected_weight_observed_at": selection["selected_weight_observed_at"],
             "first_loaded_at": loaded[0][0],
             "last_loaded_at": loaded[-1][0],
         }
