@@ -303,6 +303,17 @@ class SessionWeightTests(unittest.TestCase):
         self.assertEqual(metadata["weight_source"], "filtered_peak")
         self.assertEqual(metadata["weight_observed_at"], "2026-09-28T10:08:47+00:00")
 
+    def test_stable_empty_frame_with_no_loaded_candidate_does_not_crash(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        self.assertIsNone(manager.session.stable_weight)
+
+        manager._handle_stable_frame(self.stable_frame(20), Mock())
+
+        self.assertIsNone(manager.session.stable_weight)
+        metadata = manager._snapshot_session("scale_empty")
+        self.assertEqual(metadata["weight_source"], "none")
+
     def test_eviction_mode_change_keeps_selected_weight_observation_time(self):
         manager = SessionManager(Mock())
         manager.session.session_active = True
