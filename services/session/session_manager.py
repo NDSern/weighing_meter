@@ -28,7 +28,6 @@ from services.session.result_builder import (
 )
 from services.session.evidence_selection import (
     CAMERAS,
-    UNKNOWN_PHOTO_MAX_OFFSET_SECONDS,
     UNKNOWN_THUMBNAIL_OFFSET_SECONDS,
     UNKNOWN_THUMBNAIL_WEIGHT_KG,
     UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS,
@@ -45,7 +44,6 @@ from services.session.evidence_selection import (
 )
 
 from config import (
-    CAPTURE_DIR,
     MQTT_ENABLED,
     NO_PLATE_DIR,
     NO_STABLE_DIR,

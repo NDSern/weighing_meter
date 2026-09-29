@@ -19,7 +19,7 @@ for _name, _default in (
     if not hasattr(config, _name):
         setattr(config, _name, _default)
 
-from services.session import session_manager
+from services.session import result_builder
 from services.session.session_manager import SessionManager
 
 
@@ -43,7 +43,7 @@ class DiagnosticArchiveConfigTests(unittest.TestCase):
 class CapturePathTests(unittest.TestCase):
     def test_capture_paths_no_longer_include_unchosen_images(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(
-            session_manager, "CAPTURE_DIR", tmp
+            result_builder, "CAPTURE_DIR", tmp
         ):
             manager = SessionManager(Mock())
             paths = manager._prepare_capture_paths(datetime.now(), "30A-12345", "sid")
