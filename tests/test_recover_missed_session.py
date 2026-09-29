@@ -1,0 +1,224 @@
+import json
+import sqlite3
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import Mock
+
+
+sys.modules.setdefault("cv2", Mock())
+sys.modules.setdefault("minio", Mock())
+sys.modules.setdefault("minio.error", Mock())
+
+from scripts import recover_missed_session as module
+
+
+SESSION_ID = "c9f95576942341a28ee7e93812f26061"
+
+
+class MissedSessionRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.service = Path(self.root.name)
+        for relative in ("storage/no-stable/2026/09/28", "scale_data", "storage"):
+            (self.service / relative).mkdir(parents=True, exist_ok=True)
+        self.started = "2026-09-28T09:08:53.950+00:00"
+        self.ended = "2026-09-28T09:09:51.281+00:00"
+        self.local_started = "2026-09-28T16:08:53.950000"
+        self.local_ended = "2026-09-28T16:09:51.281000"
+        self.image = self.service / "storage/no-stable/2026/09/28" / f"{SESSION_ID}_cam3.jpg"
+        self.image.write_bytes(b"audited-image")
+        metadata = {
+            "reason": "no_usable_weight",
+            "session_id": SESSION_ID,
+            "started_at": self.started,
+            "ended_at": self.ended,
+            "duration_s": 57.3,
+            "end_reason": "scale_empty",
+            "stable_weight": 20,
+            "weight_source": "stable",
+            "raw_peak_weight": 30640,
+            "filtered_peak_weight": 30630,
+            "filtered_peak_observed_at": "2026-09-28T09:09:14.532+00:00",
+            "decimal_pos": 0,
+            "images": [str(self.image)],
+        }
+        (self.image.parent / f"{SESSION_ID}.json").write_text(json.dumps(metadata))
+        self._create_finalization(metadata)
+        self._create_scale_db()
+        self.recovery = module.MissedSessionRecovery(self.service, module.HP1_ID)
+
+    def tearDown(self):
+        self.root.cleanup()
+
+    def _create_finalization(self, metadata):
+        path = self.service / "storage/session-finalization.db"
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            "CREATE TABLE finalized_sessions (session_id TEXT PRIMARY KEY, outcome TEXT, finalized_at TEXT);"
+            "CREATE TABLE terminal_outcomes (session_id TEXT PRIMARY KEY, event_type TEXT, record_json TEXT, finalized_at TEXT);"
+        )
+        terminal = {"event": "no_stable_attempt", "id": SESSION_ID, **metadata}
+        connection.execute(
+            "INSERT INTO finalized_sessions VALUES (?, ?, ?)",
+            (SESSION_ID, "no_weight", self.ended),
+        )
+        connection.execute(
+            "INSERT INTO terminal_outcomes VALUES (?, ?, ?, ?)",
+            (SESSION_ID, "no_stable_attempt", json.dumps(terminal), self.ended),
+        )
+        connection.commit()
+        connection.close()
+
+    def _create_scale_db(self):
+        path = self.service / "scale_data/2026-09-28.db"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE weight_log (timestamp TEXT, weight_kg REAL, status TEXT, checksum_ok INTEGER)"
+        )
+        rows = [
+            ("2026-09-28T16:08:50.000000", 0, "STABLE", 1),
+            (self.local_started, 1000, "UNSTABLE", 1),
+            ("2026-09-28T16:09:10.000000", 30630, "STABLE", 1),
+            ("2026-09-28T16:09:11.000000", 30620, "STABLE", 1),
+            ("2026-09-28T16:09:12.000000", 30630, "STABLE", 1),
+            ("2026-09-28T16:09:13.000000", 30640, "UNSTABLE", 1),
+            (self.local_ended, 0, "STABLE", 1),
+        ]
+        connection.executemany("INSERT INTO weight_log VALUES (?, ?, ?, ?)", rows)
+        connection.commit()
+        connection.close()
+
+    def test_plan_uses_raw_loaded_stable_mode_and_exact_image(self):
+        plan = self.recovery.plan(SESSION_ID)
+
+        self.assertEqual(plan["scale"]["selected_weight"], 30630)
+        self.assertEqual(plan["scale"]["selected_weight_count"], 2)
+        self.assertTrue(plan["scale"]["confirmed_empty_before"])
+        self.assertTrue(plan["scale"]["confirmed_empty_at_end"])
+        self.assertEqual(plan["source_image"], str(self.image.resolve()))
+        self.assertEqual(plan["outbox_event"]["id"], SESSION_ID)
+        self.assertEqual(
+            plan["outbox_event"]["session_result"]["stable_weight"], 30630,
+        )
+        self.assertEqual(
+            plan["outbox_event"]["image_object_keys"], [plan["object_key"]],
+        )
+        self.assertFalse(plan["pending"])
+        self.assertFalse(plan["completed"])
+
+    def test_wrong_host_is_blocked(self):
+        recovery = module.MissedSessionRecovery(self.service, module.HP2_ID)
+
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            recovery.plan(SESSION_ID)
+
+    def test_non_allowlisted_session_is_blocked(self):
+        with self.assertRaisesRegex(RuntimeError, "allowlist"):
+            self.recovery.plan("not-allowed")
+
+    def test_missing_or_unstable_loaded_evidence_is_blocked(self):
+        path = self.service / "scale_data/2026-09-28.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE weight_log SET status = 'UNSTABLE'")
+        connection.commit()
+        connection.close()
+
+        with self.assertRaisesRegex(RuntimeError, "no loaded STABLE"):
+            self.recovery.plan(SESSION_ID)
+
+    def test_missing_image_is_blocked(self):
+        self.image.unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "image is missing"):
+            self.recovery.plan(SESSION_ID)
+
+    def test_missing_empty_dwell_is_blocked(self):
+        path = self.service / "scale_data/2026-09-28.db"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "UPDATE weight_log SET weight_kg = 500 WHERE timestamp = ?",
+            (self.local_ended,),
+        )
+        connection.commit()
+        connection.close()
+
+        with self.assertRaisesRegex(RuntimeError, "stay empty"):
+            self.recovery.plan(SESSION_ID)
+
+    def test_apply_requires_exact_frontend_confirmation(self):
+        plan = self.recovery.plan(SESSION_ID)
+
+        with self.assertRaisesRegex(RuntimeError, "frontend absence"):
+            self.recovery.apply(plan, None, Mock())
+
+    def test_apply_uploads_then_stages_once_and_preserves_finalization(self):
+        plan = self.recovery.plan(SESSION_ID)
+        upload = Mock()
+
+        self.assertEqual(self.recovery.apply(plan, SESSION_ID, upload), "staged")
+        upload.assert_called_once_with(
+            module.MINIO_BUCKET, plan["object_key"], plan["destination_image"],
+        )
+        pending = module._read_json_lines(self.recovery.pending_file)
+        self.assertEqual([event["id"] for event in pending], [SESSION_ID])
+        self.assertTrue(pending[0]["activated"])
+        self.assertEqual(
+            pending[0]["session_result"]["offline_event_id"], SESSION_ID,
+        )
+        audits = module._read_json_lines(self.recovery.audit_file)
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["session_id"], SESSION_ID)
+        with sqlite3.connect(self.recovery.finalization_db) as connection:
+            outcome = connection.execute(
+                "SELECT outcome FROM finalized_sessions WHERE session_id = ?", (SESSION_ID,)
+            ).fetchone()[0]
+        self.assertEqual(outcome, "no_weight")
+
+        replay_plan = self.recovery.plan(SESSION_ID)
+        second_upload = Mock()
+        self.assertEqual(
+            self.recovery.apply(replay_plan, SESSION_ID, second_upload), "pending",
+        )
+        second_upload.assert_not_called()
+        self.assertEqual(len(module._read_json_lines(self.recovery.pending_file)), 1)
+        self.assertEqual(len(module._read_json_lines(self.recovery.audit_file)), 1)
+
+    def test_upload_failure_never_stages_outbox(self):
+        plan = self.recovery.plan(SESSION_ID)
+        upload = Mock(side_effect=OSError("offline"))
+
+        with self.assertRaisesRegex(RuntimeError, "upload failed"):
+            self.recovery.apply(plan, SESSION_ID, upload)
+
+        self.assertFalse(self.recovery.pending_file.exists())
+        self.assertFalse(self.recovery.audit_file.exists())
+
+    def test_completed_event_is_not_staged(self):
+        path = self.service / "storage/publish_completed.db"
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "CREATE TABLE completed_events (event_id TEXT PRIMARY KEY, completed_at TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO completed_events VALUES (?, ?)",
+                (SESSION_ID, datetime.now(timezone.utc).isoformat()),
+            )
+        plan = self.recovery.plan(SESSION_ID)
+        upload = Mock()
+
+        self.assertEqual(self.recovery.apply(plan, SESSION_ID, upload), "completed")
+        upload.assert_not_called()
+        self.assertFalse(self.recovery.pending_file.exists())
+
+    def test_hp2_allowlisted_case_blocks_without_attributable_image(self):
+        hp2 = "9c3dfb52707d4344a7baee4fdaf6ffed"
+        original = module.RECOVERY_CASES[hp2]
+        with self.assertRaisesRegex(RuntimeError, "no attributable local image"):
+            self.recovery._evidence(hp2, original, {})
+
+
+if __name__ == "__main__":
+    unittest.main()
