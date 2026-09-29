@@ -3,6 +3,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -171,7 +172,7 @@ class MissedSessionRecoveryTests(unittest.TestCase):
         audits = module._read_json_lines(self.recovery.audit_file)
         self.assertEqual(len(audits), 1)
         self.assertEqual(audits[0]["session_id"], SESSION_ID)
-        with sqlite3.connect(self.recovery.finalization_db) as connection:
+        with closing(sqlite3.connect(self.recovery.finalization_db)) as connection:
             outcome = connection.execute(
                 "SELECT outcome FROM finalized_sessions WHERE session_id = ?", (SESSION_ID,)
             ).fetchone()[0]
@@ -198,7 +199,7 @@ class MissedSessionRecoveryTests(unittest.TestCase):
 
     def test_completed_event_is_not_staged(self):
         path = self.service / "storage/publish_completed.db"
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             connection.execute(
                 "CREATE TABLE completed_events (event_id TEXT PRIMARY KEY, completed_at TEXT)"
             )
@@ -206,12 +207,40 @@ class MissedSessionRecoveryTests(unittest.TestCase):
                 "INSERT INTO completed_events VALUES (?, ?)",
                 (SESSION_ID, datetime.now(timezone.utc).isoformat()),
             )
+            connection.commit()
         plan = self.recovery.plan(SESSION_ID)
         upload = Mock()
 
         self.assertEqual(self.recovery.apply(plan, SESSION_ID, upload), "completed")
         upload.assert_not_called()
         self.assertFalse(self.recovery.pending_file.exists())
+
+    def test_completed_event_ignores_stale_audit_payload(self):
+        path = self.service / "storage/publish_completed.db"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                "CREATE TABLE completed_events (event_id TEXT PRIMARY KEY, completed_at TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO completed_events VALUES (?, ?)",
+                (SESSION_ID, datetime.now(timezone.utc).isoformat()),
+            )
+            connection.commit()
+        self.recovery.audit_file.write_text(
+            json.dumps(
+                {
+                    "event": "staged",
+                    "session_id": SESSION_ID,
+                    "payload_sha256": "0" * 64,
+                }
+            )
+            + "\n"
+        )
+
+        plan = self.recovery.plan(SESSION_ID)
+
+        self.assertTrue(plan["completed"])
+        self.assertTrue(plan["already_staged"])
 
     def test_hp2_case_is_image_less_when_allowed(self):
         hp2 = "9c3dfb52707d4344a7baee4fdaf6ffed"

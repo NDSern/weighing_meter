@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta
 
 from services.review.duplicate_review import (
@@ -35,7 +36,7 @@ def _session(session_id, start, end, weight=50000.0, plate="51A-12345",
 def _write_day(data_dir, day, readings):
     os.makedirs(data_dir, exist_ok=True)
     path = os.path.join(data_dir, "%s.db" % day.strftime("%Y-%m-%d"))
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS weight_log ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, "

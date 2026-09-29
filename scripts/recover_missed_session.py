@@ -461,16 +461,22 @@ class MissedSessionRecovery:
         )
         pending = self._pending(session_id)
         completed = self._completed(session_id)
-        if pending and _json_hash(pending.get("session_result")) != _json_hash(
-            outbox["session_result"]
-        ):
-            raise RuntimeError("existing pending event has different payload")
         audits = [
             record for record in _read_json_lines(self.audit_file)
             if record.get("session_id") == session_id and record.get("event") == "staged"
         ]
-        if any(record.get("payload_sha256") != _json_hash(outbox["session_result"]) for record in audits):
-            raise RuntimeError("existing recovery audit has different payload")
+        # A completed event is already published; payload hashes from earlier
+        # script revisions must not turn an idempotent re-run into an error.
+        if not completed:
+            if pending and _json_hash(pending.get("session_result")) != _json_hash(
+                outbox["session_result"]
+            ):
+                raise RuntimeError("existing pending event has different payload")
+            if any(
+                record.get("payload_sha256") != _json_hash(outbox["session_result"])
+                for record in audits
+            ):
+                raise RuntimeError("existing recovery audit has different payload")
         return {
             "session_id": session_id,
             "host_id": self.host_id,

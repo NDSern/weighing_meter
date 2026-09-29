@@ -1,0 +1,29 @@
+[
+  {
+    "label": "hp1-no-weight-30630",
+    "session_id": "c9f95576942341a28ee7e93812f26061",
+    "host_id": "100ecc11-dbcb-4c23-8e89-d41ccefcda37",
+    "started_at": "2026-09-28T09:08:53.950+00:00",
+    "ended_at": "2026-09-28T09:09:51.281+00:00",
+    "selected_weight": 30630,
+    "raw_peak_weight": 30640
+  },
+  {
+    "label": "hp1-no-weight-105960",
+    "session_id": "7679222acf0c4bce926192bc96636c3d",
+    "host_id": "100ecc11-dbcb-4c23-8e89-d41ccefcda37",
+    "started_at": "2026-09-28T10:06:12.700+00:00",
+    "ended_at": "2026-09-28T10:09:37.655+00:00",
+    "selected_weight": 105960,
+    "raw_peak_weight": 106040
+  },
+  {
+    "label": "hp2-duplicate-17710",
+    "session_id": "9c3dfb52707d4344a7baee4fdaf6ffed",
+    "host_id": "9aa29a10-6605-47dd-9460-970d66c3d1c3",
+    "started_at": "2026-09-27T07:40:24.276+00:00",
+    "ended_at": "2026-09-27T07:40:47.526+00:00",
+    "selected_weight": 17710,
+    "raw_peak_weight": 17940
+  }
+]

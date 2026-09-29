@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import sys
 import subprocess
+from contextlib import closing
 from pathlib import Path
 
 
@@ -44,7 +45,7 @@ def validate_source_schema(conn):
 
 def migrate(source, destination_dir, source_conn=None, created_targets=None):
     if source_conn is None:
-        with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as conn:
             return migrate(source, destination_dir, conn, created_targets)
     validate_source_schema(source_conn)
     cursor = source_conn.execute(
@@ -151,7 +152,7 @@ def main():
     try:
         try:
             require_exclusive_source(source)
-            with sqlite3.connect(source) as conn:
+            with closing(sqlite3.connect(source)) as conn:
                 conn.execute("PRAGMA busy_timeout=1000")
                 if conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] != 0:
                     raise RuntimeError("Stop the service before migrating scale_data.db")
