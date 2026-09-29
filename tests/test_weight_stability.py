@@ -253,6 +253,56 @@ class SessionWeightTests(unittest.TestCase):
         self.assertEqual(self.manager.session.stable_weight, 38500)
         self.assertEqual(len(self.manager.session.stable_weight_history), 25)
 
+    def test_empty_dwell_does_not_replace_loaded_stable_weight(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        started = datetime(2026, 9, 28, 9, 8, 52, tzinfo=timezone.utc)
+
+        for index in range(25):
+            frame = self.stable_frame(30630)
+            frame.timestamp = started + timedelta(seconds=index * 0.2)
+            manager._handle_stable_frame(frame, Mock())
+        loaded_observed_at = manager.session.stable_weight_observed_at
+
+        for index in range(25):
+            frame = self.stable_frame(20)
+            frame.timestamp = started + timedelta(seconds=5 + index * 0.2)
+            manager._handle_stable_frame(frame, Mock())
+
+        metadata = manager._snapshot_session("scale_empty")
+        self.assertEqual(manager.session.latest_stable_weight, 20)
+        self.assertEqual(manager.session.stable_weight, 30630)
+        self.assertEqual(len(manager.session.stable_weight_history), 25)
+        self.assertEqual(metadata["stable_weight"], 30630)
+        self.assertEqual(metadata["weight_source"], "stable")
+        self.assertEqual(metadata["weight_observed_at"], loaded_observed_at)
+
+    def test_stable_empty_status_change_does_not_replace_active_weight(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.stable_weight = 105960
+        frame = self.stable_frame(50)
+
+        manager.on_status_change(frame, "UNSTABLE", "STABLE", Mock())
+
+        self.assertEqual(manager.session.stable_weight, 105960)
+
+    def test_snapshot_rejects_sub_threshold_stable_candidate(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.stable_weight = 50
+        manager.session.stable_weight_observed_at = "2026-09-28T10:09:35+00:00"
+        manager._session_raw_peak = 106040
+        manager._session_raw_peak_observed_at = "2026-09-28T10:07:03+00:00"
+        manager._session_filtered_peak = 106040
+        manager._session_filtered_peak_observed_at = "2026-09-28T10:08:47+00:00"
+
+        metadata = manager._snapshot_session("scale_empty")
+
+        self.assertEqual(metadata["stable_weight"], 106040)
+        self.assertEqual(metadata["weight_source"], "filtered_peak")
+        self.assertEqual(metadata["weight_observed_at"], "2026-09-28T10:08:47+00:00")
+
     def test_eviction_mode_change_keeps_selected_weight_observation_time(self):
         manager = SessionManager(Mock())
         manager.session.session_active = True
@@ -927,26 +977,12 @@ class SessionWeightTests(unittest.TestCase):
         with unittest.mock.patch("services.session.session_manager.time.time", return_value=12.0):
             self.assertTrue(self.manager._can_start_session(Mock()))
 
-    def test_recent_same_plate_skips_regardless_of_weight(self):
+    def test_recent_same_plate_is_not_a_transaction_identity(self):
         self.manager._last_publish_plate = "15C-326.77"
         self.manager._last_publish_weight = 8500
         self.manager._last_publish_session_end = "2026-07-15T06:26:48+00:00"
 
-        self.assertTrue(self.manager._should_skip_duplicate_publish(
-            "15C-326.77", 47500, "2026-07-15T06:26:52+00:00"
-        ))
-        self.assertFalse(self.manager._should_skip_duplicate_publish(
-            "16N-6554", 47500, "2026-07-15T06:26:52+00:00"
-        ))
-
-    def test_same_plate_at_ten_seconds_is_allowed(self):
-        self.manager._last_publish_plate = "15C-326.77"
-        self.manager._last_publish_weight = 8500
-        self.manager._last_publish_session_end = "2026-07-15T06:26:48+00:00"
-
-        self.assertFalse(self.manager._should_skip_duplicate_publish(
-            "15C-326.77", 47500, "2026-07-15T06:26:58+00:00"
-        ))
+        self.assertFalse(hasattr(self.manager, "_should_skip_duplicate_publish"))
 
     def test_post_session_descent_does_not_start_chained_attempt(self):
         manager = SessionManager(Mock())

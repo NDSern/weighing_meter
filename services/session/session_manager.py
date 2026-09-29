@@ -25,7 +25,6 @@ from config import (
     PEAK_FILTER_FRAMES,
     PEAK_MOVEMENT_CANCEL_KG,
     PEAK_MOVEMENT_CONFIRM_FRAMES,
-    SAME_PLATE_DUPLICATE_SECONDS,
     SESSION_DEDUP_STATE_FILE,
     SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT,
     SESSION_FINALIZATION_DB,
@@ -326,6 +325,10 @@ class WeighingSessionState:
         if not self.session_active:
             self.stable_weight = weight
             self.stable_decimal_pos = decimal_pos
+            return
+
+        # Empty readings close the cycle; they are not loaded-weight candidates.
+        if weight <= WEIGHT_THRESHOLD:
             return
 
         self.stable_weight_sequence += 1
@@ -851,12 +854,13 @@ class SessionManager:
         self.session.stability_rule = frame.stability_rule
         if (
             self.session.session_active
+            and self.session.stable_weight is not None
             and self.session.stable_weight > WEIGHT_THRESHOLD
             and self.session.stable_weight != previous
         ):
             self._update_spool_metadata(log_fn)
         self.session.stable_count += 1
-        if self.session.stable_weight <= WEIGHT_THRESHOLD:
+        if self.session.stable_weight is None or self.session.stable_weight <= WEIGHT_THRESHOLD:
             return
         # Stable weight alone never starts a cycle; rising trend does.
 
@@ -1030,7 +1034,11 @@ class SessionManager:
         if frame.weight > WEIGHT_THRESHOLD:
             log_fn("SIGNAL", f"{old_status} → {new_status}  wt={frame.weight:.{frame.decimal_pos}f} kg")
 
-        if new_status == "STABLE" and frame.weight <= WEIGHT_THRESHOLD:
+        if (
+            not self.session.session_active
+            and new_status == "STABLE"
+            and frame.weight <= WEIGHT_THRESHOLD
+        ):
             self.session.stable_weight = frame.weight
 
     def _can_start_session(self, log_fn):
@@ -1588,7 +1596,12 @@ class SessionManager:
 
     def _snapshot_session(self, reason):
         ended_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-        stable = self.session.stable_weight if self.session.stable_weight and self.session.stable_weight > 0 else None
+        stable = (
+            self.session.stable_weight
+            if self.session.stable_weight is not None
+            and self.session.stable_weight > WEIGHT_THRESHOLD
+            else None
+        )
         if stable is not None:
             assigned, source = stable, "stable"
             observed_at = self.session.stable_weight_observed_at
@@ -1629,19 +1642,6 @@ class SessionManager:
             "local_peak_drop_snapshot_paths": dict(self.session.local_peak_drop_snapshot_paths),
             "local_peak_drop_snapshot_captured_at": dict(self.session.local_peak_drop_snapshot_captured_at),
         }
-
-    def _should_skip_duplicate_publish(self, plate, stable_weight, session_started_at=None):
-        with self._publish_lock:
-            plate_same = plate is not None and plate == self._last_publish_plate
-            recent = False
-            if plate_same and session_started_at and self._last_publish_session_end:
-                started = datetime.fromisoformat(session_started_at)
-                previous_end = datetime.fromisoformat(self._last_publish_session_end)
-                recent = 0 <= (started - previous_end).total_seconds() < SAME_PLATE_DUPLICATE_SECONDS
-            if recent:
-                log("MERGE", f"Same plate [{plate}] within {SAME_PLATE_DUPLICATE_SECONDS:g}s — skipping")
-                return True
-        return False
 
     def finalize_deferred_session(self, metadata, tracker, log_fn=None):
         """Finalize one immutable ended session after deferred LPR completes."""
@@ -2319,9 +2319,6 @@ class SessionManager:
         if registered_plate != plate:
             log_fn("REGISTRY", f"Corrected plate {plate} -> {registered_plate} reason={registry_reason}")
             plate = registered_plate
-        if self._should_skip_duplicate_publish(plate, stable_weight, metadata.get("started_at")):
-            return {"status": "duplicate", "plate": plate}
-
         result = self._build_publish_result(stable_weight, plate, count, all_plates, metadata)
         if metadata.get("session_id"):
             result["offline_event_id"] = metadata["session_id"]

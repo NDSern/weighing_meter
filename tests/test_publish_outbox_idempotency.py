@@ -212,7 +212,7 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
             "end_reason": "scale_empty",
         }
 
-    def test_duplicate_terminal_outcome_uses_registry_corrected_plate(self):
+    def test_registry_corrected_plate_session_is_published(self):
         manager = session_module.SessionManager(Mock())
         manager._last_publish_plate = "CANON-1"
         manager._last_publish_session_end = "2026-07-24T00:00:00+00:00"
@@ -223,14 +223,19 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         with patch.object(
             session_module, "correctWithRegisteredLicensePlate",
             return_value=("CANON-1", "exact"),
+        ), patch.object(
+            manager, "_attach_publish_images", return_value=True,
+        ), patch.object(
+            session_module, "saveConfirmedLicensePlate", return_value=1,
         ):
             self.assertTrue(manager.finalize_deferred_session(
                 self.deferred_metadata("registry"), tracker, Mock(),
             ))
 
+        self.assertEqual(session_module.getSessionFinalization("registry")[0], "published")
         self.assertEqual(self.terminal_outcome("registry")["plate"], "CANON-1")
 
-    def test_duplicate_terminal_outcome_uses_detailed_candidate_plate(self):
+    def test_detailed_candidate_plate_session_is_published(self):
         manager = session_module.SessionManager(Mock())
         manager._last_publish_plate = "15C12340"
         manager._last_publish_session_end = "2026-07-24T00:00:00+00:00"
@@ -241,12 +246,45 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         with patch.object(
             session_module, "correctWithRegisteredLicensePlate",
             side_effect=lambda plate: (plate, None),
+        ), patch.object(
+            manager, "_attach_publish_images", return_value=True,
+        ), patch.object(
+            session_module, "saveConfirmedLicensePlate", return_value=1,
         ):
             self.assertTrue(manager.finalize_deferred_session(
                 self.deferred_metadata("detailed"), tracker, Mock(),
             ))
 
+        self.assertEqual(session_module.getSessionFinalization("detailed")[0], "published")
         self.assertEqual(self.terminal_outcome("detailed")["plate"], "15C12340")
+
+    def test_same_plate_distinct_session_ids_are_both_enqueued(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = ("14C-017.80", 0.9, 4)
+        tracker.get_all_plates_summary.return_value = {"14C-017.80": 4}
+        first = self.deferred_metadata("cycle-1")
+        first["started_at"] = "2026-09-27T07:39:53+00:00"
+        first["ended_at"] = "2026-09-27T07:40:16+00:00"
+        second = self.deferred_metadata("cycle-2")
+        second["started_at"] = "2026-09-27T07:40:24+00:00"
+        second["ended_at"] = "2026-09-27T07:40:47+00:00"
+
+        with patch.object(
+            session_module, "correctWithRegisteredLicensePlate",
+            side_effect=lambda plate: (plate, None),
+        ), patch.object(
+            manager, "_attach_publish_images", return_value=True,
+        ), patch.object(
+            session_module, "saveConfirmedLicensePlate", return_value=1,
+        ):
+            self.assertTrue(manager.finalize_deferred_session(first, tracker, Mock()))
+            self.assertTrue(manager.finalize_deferred_session(second, tracker, Mock()))
+
+        self.assertEqual(session_module.getSessionFinalization("cycle-1")[0], "published")
+        self.assertEqual(session_module.getSessionFinalization("cycle-2")[0], "published")
+        self.assertIn("cycle-1", module._pending_events)
+        self.assertIn("cycle-2", module._pending_events)
 
     def test_publish_activates_outbox_only_after_terminal_ledger(self):
         manager = session_module.SessionManager(Mock())
