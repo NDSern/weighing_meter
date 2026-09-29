@@ -44,14 +44,26 @@ services/capture/frame_source.py            RTSP latest-frame grabbers
 services/capture/detect_coordinator.py      LPR and vehicle detection coordinators
 services/pipeline/license_plate_recognition.py  production LPR pipeline
 services/runtime/async_logging.py            nonblocking console/file logger
-services/session/session_manager.py         session lifecycle and publishing
+services/runtime/bootstrap.py                service construction and shutdown wiring
+services/session/session_manager.py         session lifecycle and publishing orchestration
+services/session/weight_state.py            loaded-weight candidate and trend state
+services/session/plate_registry.py          registered-plate correction cache
+services/session/evidence_selection.py      UNKNOWN_* result-image/frame selection
+services/session/result_builder.py          publish payload and result-image construction
 services/session/finalization_store.py      finalized-session ledger
 services/session/plate_store.py             confirmed-plate persistence
 services/session/diagnostic_archive.py      no-stable/no-plate evidence archive
+services/scale/evidence.py                  raw scale reads, cycles, loaded-stable mode
+services/review/duplicate_review.py         mock-only duplicate session reviewer
+services/review/mock_integrations.py        mock MQTT/MinIO removal intents
 services/storage/image_save_worker.py       local image save and MinIO retry queue
 services/storage/publish_outbox.py          durable MQTT outbox
+services/storage/retention_cleaner.py       retention, log compression, archive cleaner
+services/capture/camera_light_controller.py session-driven camera light control
 services/tracking/plate_tracker.py          plate aggregation and image selection
 services/tracking/vehicle_tracker.py        vehicle stability/left detection
+scripts/recover_missed_session.py           restricted audited-miss recovery tool
+scripts/cleanup_absorbed_peak_candidates.py safe exact peak-evidence cleanup
 ```
 
 ## Local Configuration
@@ -61,14 +73,25 @@ Production devices keep host-specific settings in untracked `config.local.py`.
 Common overrides:
 
 ```python
-RTSP_URL = "rtsp://user:pass@camera/front"
-RTSP_URL_2 = "rtsp://user:pass@camera/rear"
-RTSP_URL_3 = "rtsp://user:pass@camera/side"
+RTSP_HOST_CAM1 = "192.168.1.181"   # non-secret camera addresses
+RTSP_USERNAME = "..."              # secrets belong in the environment, see below
+RTSP_PASSWORD = "..."
 CAM2_RESULT_CROP = "left"  # left, right, or full
 WEIGHBRIDGE_ID = "..."
 ```
 
-Known HP-01 and HP-02 identities select their canonical transaction direction and plate-loss policy automatically. Any explicit local policy must match that canonical mapping.
+Effective setting precedence, lowest to highest:
+
+1. non-secret code defaults in `config.py`
+2. host-local `config.local.py` (device policy)
+3. `WEIGHING_*` environment variables, normally supplied by the root-owned
+   `EnvironmentFile=/etc/weighing-meter/weighing.env` systemd drop-in
+
+`validate_runtime_config()` runs before any worker starts and fails startup when
+required identities, endpoints, RTSP URLs, or credentials are missing or malformed.
+RTSP URLs are derived from `RTSP_USERNAME`/`RTSP_PASSWORD`/`RTSP_HOST_CAM*`/`RTSP_PATH`
+unless explicitly overridden. Never commit real credentials; track them only in the
+documented `WEIGHING_*` variables. See `SECURITY.md` and `docs/operations.md`.
 
 Do not commit `config.local.py` or `weighing_service.service`.
 
@@ -134,15 +157,27 @@ Runtime data is intentionally untracked:
 Important runtime files:
 
 ```text
-logs/YYYY-MM-DD/weighing_service.log  service logs (60-day retention)
+logs/YYYY-MM-DD/weighing_service.log  service logs
 scale_data/YYYY-MM-DD.db              daily scale readings (365-day retention)
 scale_data/scale_data.archive.db      legacy root database after migration
 confirmed_license_plates.db           confirmed plate counts
 storage/upload_pending.jsonl          MinIO upload retry queue
 storage/publish_pending.jsonl         MQTT publish retry queue
-storage/weighbridge/YYYY/MM/DD/       evidence images
+storage/weighbridge/YYYY/MM/DD/       published/publishable evidence images
 storage/undetectable/                 unknown plate evidence
+storage/no-stable/YYYY/MM/DD/         local-only no-usable-weight diagnostics
+storage/no-plate/YYYY/MM/DD/          local-only no-confirmed-plate diagnostics
+storage/peak-candidates/              shadow peak evidence
+storage/review-mock/                  mock-only duplicate-review intents
+storage/recovery-audit.jsonl          append-only recovery audit
 ```
+
+Retention is host-scoped. Defaults: logs and diagnostics 30 days (logs compressed
+after 1 day once enabled), `storage/undetectable`/`storage/peak-candidates` 20 days,
+raw scale 365 days. The HP-02 host policy narrows logs and no-stable/no-plate
+diagnostics to 14 days, enables verified log gzip, and suppresses redundant
+absorbed-active-session peak evidence. `storage/no-stable`, `storage/no-plate`, and
+`photo-unchosen` never had MinIO copies and are local-only. See `docs/storage.md`.
 
 ## Unknown Sessions
 
@@ -227,11 +262,15 @@ Post-processing order:
 OCR candidate formatting
 same-session detailed variant preference
 registered plate correction
-duplicate session skip
 local image save
 confirmed plate DB increment
 MQTT outbox enqueue
 ```
+
+Sessions are scale-authoritative: each confirmed empty-separated raw scale cycle is
+its own session, and durable finalization/outbox event IDs provide retry idempotency.
+OCR plates never collapse distinct scale cycles (the legacy same-plate/time skip was
+removed).
 
 Registered correction uses `registered_license_plates.json`:
 
@@ -255,7 +294,21 @@ Evidence images are saved locally before MQTT outbox enqueue. MinIO upload failu
 
 Local images with pending MinIO uploads are protected from retention cleanup until their upload succeeds.
 
-Unchosen LPR camera images are saved locally only. They are not uploaded to MinIO and are not included in MQTT payloads.
+Result images are the merged/front/rear set for recognised sessions and the per-camera
+set for `UNKNOWN_OCR`/`UNKNOWN_DETECTION`. Local-only diagnostic evidence
+(`storage/no-stable`, `storage/no-plate`) and shadow peak evidence are never uploaded to
+MinIO. The former local-only `photo-unchosen` files were removed: they created MinIO
+cache-cleaner mismatches without being part of any payload.
+
+Optional mock-only duplicate review (`services/review/*`, disabled unless
+`DUPLICATE_REVIEW_ENABLED` is set per host) can flag a losing session of a
+continuous-load pair. It only appends structured mock MQTT/MinIO intents to
+`storage/review-mock/`; it never contacts the broker/MinIO or deletes anything.
+
+Audited-miss recovery is operationally restricted: `scripts/recover_missed_session.py`
+is dry-run by default, allowlists exact session IDs, requires `--service-stopped`,
+explicit frontend-absence confirmation, and (for image-less cases) explicit
+`--allow-image-less` approval. See `docs/operations.md`.
 
 ## Deployment
 
@@ -281,26 +334,31 @@ git remote -v
 Expected remote:
 
 ```text
-https://github.com/NDSern/weighing_meter.git
+git@github.com:NDSern/weighing_meter.git
 ```
 
-Deploy latest on a device:
+Deploy reviewed code on a device:
 
 ```bash
 cd /home/<device-user>/apps/weighing_meter
-git pull --ff-only
-python3 -m py_compile weighing_service.py services/capture/frame_source.py services/session/session_manager.py services/storage/image_save_worker.py services/tracking/plate_tracker.py
+git fetch origin
+# apply only reviewed files/hunks; hosts carry unrelated local edits
+python3 -m compileall weighing_service.py services scripts
 sudo systemctl restart weighing_service.service
 systemctl is-active weighing_service.service
 ```
 
+Never use `git reset`, `git clean`, force pull, or broad checkout on a production host.
+
 ## Verification
 
-Local syntax check:
+Local checks (models, secret scan, lint, unit tests with warnings as errors):
 
 ```bash
-python3 -m py_compile weighing_service.py services/capture/frame_source.py services/session/session_manager.py services/storage/image_save_worker.py services/tracking/plate_tracker.py
+make verify
 ```
+
+CI runs the same sequence on Python 3.10 (production parity) and 3.12.
 
 Production health checks:
 
@@ -323,10 +381,13 @@ upload_pending.jsonl: 0
 publish_pending.jsonl: 0
 ```
 
-Image retention runs hourly. Files older than 30 days are removed first. When free disk
-falls below 7 GiB, oldest uploaded local JPEG/PNG evidence is removed until the target
-is restored; files still queued in `storage/upload_pending.jsonl` are never removed.
-Session capture keeps a separate 5 GiB hard reserve.
+Image retention runs hourly. Evidence older than the host retention window is removed
+first (default 20 days for `storage/undetectable`/`storage/peak-candidates`; see
+`docs/storage.md` for per-host diagnostic windows). When free disk falls below 7 GiB,
+oldest uploaded local JPEG/PNG evidence is removed until the target is restored; files
+still queued in `storage/upload_pending.jsonl` are never removed. Session capture keeps a
+separate 5 GiB hard reserve. Completed diagnostic days are archived after 2 days and
+expired by evidence date, so archive/expiry never depends on file mtime.
 
 Recover capture after a stopped service or low-disk incident:
 
@@ -355,3 +416,25 @@ XMinioStorageFull: Storage backend has reached its minimum free drive threshold
 ```
 
 If `ModuleNotFoundError: No module named 'services.storage'` appears, check that `/storage/` is ignored but `services/storage/` exists in Git.
+
+## Documentation
+
+```text
+docs/architecture.md   scale-authoritative lifecycle, finalization, outbox, evidence flow
+docs/operations.md     secrets, safe restart, queue/evidence checks, rollback, serial-stall
+docs/storage.md        retention classes and local-only evidence
+SECURITY.md            credential handling and rotation responsibilities
+LPR_2K_DEPLOYMENT.md   camera 1 2K rollout, health checks, rollback
+```
+
+## Known Follow-ups
+
+- Add a serial-reader watchdog: the reader thread can stall silently while the port stays
+  open, freezing scale ingestion until service restart. Detect stale frames and recover.
+- Consumer-side replay visibility: re-published audited events must be verifiable on the
+  frontend; compensation for a delivered MQTT event needs a consumer protocol.
+- Review and separately integrate the preserved LPR/camera experiment branch
+  (`wip/lpr-camera-experiments-2026-09-29`); it is intentionally not part of canonical
+  production.
+- Coordinate credential rotation and install the root-owned environment file on both
+  hosts (see `SECURITY.md`).

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Validate and stage audited missed weighbridge events for outbox replay."""
+"""Validate and stage audited missed weighbridge events for outbox replay.
+
+OPERATIONALLY RESTRICTED: dry-run by default, hard allowlist of session ids
+(`RECOVERY_CASES`), and apply gated on a stopped service, confirmed empty scale,
+and explicit frontend-absence confirmation. See `docs/operations.md`.
+Do not widen the allowlist or add unattended execution.
+"""
 
 import argparse
 import hashlib
