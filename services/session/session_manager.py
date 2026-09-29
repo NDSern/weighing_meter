@@ -7,7 +7,6 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
-from itertools import combinations as candidate_combinations, product
 
 import cv2
 import numpy as np
@@ -22,6 +21,23 @@ from services.session.plate_registry import (
     set_log_fn as set_plate_registry_log,
 )
 from services.session.weight_state import WeighingSessionState
+from services.session.evidence_selection import (
+    CAMERAS,
+    UNKNOWN_PHOTO_MAX_OFFSET_SECONDS,
+    UNKNOWN_THUMBNAIL_OFFSET_SECONDS,
+    UNKNOWN_THUMBNAIL_WEIGHT_KG,
+    UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS,
+    apply_start_window,
+    apply_threshold_window,
+    build_session_start_candidates,
+    build_timeline,
+    dedicated_candidates,
+    rank_combinations,
+    resolve_detector_tracks,
+    select_candidate_sets,
+    select_target_timestamp,
+    synchronize_cameras,
+)
 
 from config import (
     CAPTURE_DIR,
@@ -50,12 +66,6 @@ from config import (
 
 _log_fn = None
 REAR_CAPTURE_FALLBACK_SECONDS = 2.0
-UNKNOWN_PHOTO_MAX_OFFSET_SECONDS = 1.0
-UNKNOWN_THUMBNAIL_OFFSET_SECONDS = 2.0
-UNKNOWN_THUMBNAIL_WEIGHT_KG = 10000.0
-UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS = (
-    UNKNOWN_THUMBNAIL_OFFSET_SECONDS + UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
-)
 
 
 def set_log_fn(log_fn):
@@ -1682,28 +1692,10 @@ class SessionManager:
         self, metadata, frame_metadata, log_fn, spool_started_at=None,
         unknown_plate="UNKNOWN",
     ):
-        if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
-            target_at = (
-                metadata.get("local_peak_observed_at")
-                or metadata.get("filtered_peak_observed_at")
-                or metadata.get("raw_peak_observed_at")
-                or metadata.get("weight_observed_at")
-                or metadata.get("ended_at")
-            )
-        else:
-            target_at = (
-                metadata.get("weight_observed_at")
-                or metadata.get("filtered_peak_observed_at")
-                or metadata.get("raw_peak_observed_at")
-                or metadata.get("ended_at")
-            )
-        try:
-            target_ts = datetime.fromisoformat(target_at).timestamp()
-        except (TypeError, ValueError):
-            target_ts = None
-            if unknown_plate in ("UNKNOWN", "UNKNOWN_OCR", "UNKNOWN_DETECTION"):
-                log_fn("WARNING", f"Unknown photo timing unavailable id={metadata['session_id']}")
-                return {}, {}
+        target_ts = select_target_timestamp(metadata, unknown_plate)
+        if target_ts is None and unknown_plate in ("UNKNOWN", "UNKNOWN_OCR", "UNKNOWN_DETECTION"):
+            log_fn("WARNING", f"Unknown photo timing unavailable id={metadata['session_id']}")
+            return {}, {}
 
         session_dir = metadata.get("session_dir")
         started_at = spool_started_at or metadata.get("started_at")
@@ -1714,260 +1706,45 @@ class SessionManager:
         interval = float(metadata.get("capture_interval_seconds", 0.2))
         start_target_ts = started_ts + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
         deadline_ts = started_ts + UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS
-        cameras = ("cam1", "cam2", "cam3")
-        timeline = {camera: [] for camera in cameras}
-        start_snapshots = {}
-        first_seen_by_frame_id = {camera: {} for camera in cameras}
+        cameras = CAMERAS
         rejected = {}
 
-        for relative_path in metadata.get("session_files", []):
-            camera = relative_path.split("-", 1)[0]
-            if camera not in timeline:
-                continue
-            item_metadata = frame_metadata.get(relative_path) or {}
-            observed_iso = item_metadata.get("captured_at")
-            try:
-                observed_ts = datetime.fromisoformat(observed_iso).timestamp()
-            except (TypeError, ValueError):
-                try:
-                    index = int(relative_path.split("-", 2)[1])
-                except (ValueError, IndexError):
-                    continue
-                observed_ts = started_ts + index * interval
-                observed_iso = datetime.fromtimestamp(
-                    observed_ts, timezone.utc,
-                ).isoformat(timespec="milliseconds")
-            if observed_ts < started_ts - interval:
-                continue
-            path = os.path.abspath(os.path.join(session_dir, relative_path))
-            if os.path.commonpath((session_dir, path)) != session_dir:
-                continue
-            candidate = {
-                "path": path, "captured_at": observed_iso, "timestamp": observed_ts,
-                "origin": "timeline", "camera": camera, "relative_path": relative_path,
-            }
-            frame_id = item_metadata.get("frame_id")
-            if frame_id is not None:
-                first_seen = first_seen_by_frame_id[camera]
-                if frame_id in first_seen:
-                    continue
-                first_seen[frame_id] = observed_ts
-            if relative_path.endswith("-start.jpg"):
-                start_snapshots[camera] = candidate
-            else:
-                timeline[camera].append(candidate)
-
-        def dedicated_candidates(paths_key, times_key, source):
-            candidates = {camera: [] for camera in cameras}
-            paths = metadata.get(paths_key) or {}
-            times = metadata.get(times_key) or {}
-            for camera in cameras:
-                path, observed_iso = paths.get(camera), times.get(camera)
-                if not path or not observed_iso:
-                    continue
-                try:
-                    observed_ts = datetime.fromisoformat(observed_iso).timestamp()
-                except (TypeError, ValueError):
-                    rejected[camera] = {
-                        "source": source, "reason": "invalid_timestamp",
-                        "captured_at": observed_iso,
-                    }
-                    continue
-                candidates[camera].append({
-                    "path": os.path.abspath(path), "captured_at": observed_iso,
-                    "timestamp": observed_ts, "origin": "dedicated", "camera": camera,
-                    "relative_path": os.path.basename(path),
-                })
-            return candidates
+        timeline, start_snapshots = build_timeline(
+            metadata, frame_metadata, started_ts, interval, session_dir, cameras,
+        )
 
         start_candidates = dedicated_candidates(
-            "unknown_snapshot_paths", "unknown_snapshot_captured_at", "start_2s",
+            metadata, "unknown_snapshot_paths", "unknown_snapshot_captured_at",
+            "start_2s", rejected, cameras,
         )
-        for camera in cameras:
-            eligible = []
-            for candidate in start_candidates[camera]:
-                if abs(candidate["timestamp"] - start_target_ts) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS:
-                    eligible.append(candidate)
-                else:
-                    rejected[camera] = {
-                        "source": "start_2s", "reason": "late_or_invalid_timestamp",
-                        "captured_at": candidate["captured_at"],
-                    }
-            start_candidates[camera] = eligible
-            start_candidates[camera].extend(
-                candidate for candidate in timeline[camera]
-                if abs(candidate["timestamp"] - start_target_ts) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
-            )
+        apply_start_window(start_candidates, timeline, start_target_ts, rejected, cameras)
 
         threshold_candidates = dedicated_candidates(
-            "unknown_weight_snapshot_paths", "unknown_weight_snapshot_captured_at",
-            "weight_10000",
+            metadata, "unknown_weight_snapshot_paths", "unknown_weight_snapshot_captured_at",
+            "weight_10000", rejected, cameras,
         )
-        trigger_at = metadata.get("unknown_weight_snapshot_triggered_at")
-        try:
-            threshold_target_ts = datetime.fromisoformat(trigger_at).timestamp()
-            threshold_target_valid = started_ts <= threshold_target_ts <= deadline_ts
-        except (TypeError, ValueError):
-            timely_dedicated = [
-                candidate["timestamp"]
-                for candidates in threshold_candidates.values()
-                for candidate in candidates
-                if started_ts <= candidate["timestamp"] <= deadline_ts
-            ]
-            threshold_target_ts = min(timely_dedicated) if timely_dedicated else None
-            threshold_target_valid = threshold_target_ts is not None
-        if threshold_target_valid:
-            for camera in cameras:
-                threshold_candidates[camera].extend(
-                    candidate for candidate in timeline[camera]
-                    if threshold_target_ts <= candidate["timestamp"] <= deadline_ts
-                )
-                eligible = []
-                for candidate in threshold_candidates[camera]:
-                    if threshold_target_ts <= candidate["timestamp"] <= deadline_ts:
-                        eligible.append(candidate)
-                    elif candidate["origin"] == "dedicated":
-                        rejected[camera] = {
-                            "source": "weight_10000",
-                            "reason": "late_or_invalid_timestamp",
-                            "captured_at": candidate["captured_at"],
-                        }
-                threshold_candidates[camera] = eligible
-        else:
-            for camera in cameras:
-                for candidate in threshold_candidates[camera]:
-                    rejected[camera] = {
-                        "source": "weight_10000",
-                        "reason": "late_or_invalid_timestamp",
-                        "captured_at": candidate["captured_at"],
-                    }
-            threshold_candidates = {camera: [] for camera in cameras}
+        threshold_candidates = apply_threshold_window(
+            threshold_candidates, timeline, metadata, started_ts, deadline_ts, rejected, cameras,
+        )
 
-        session_start_candidates = {camera: [] for camera in cameras}
-        for camera in cameras:
-            if camera in start_snapshots:
-                start_snapshot = dict(start_snapshots[camera])
-                start_snapshot["origin"] = "session_start"
-                session_start_candidates[camera].append(start_snapshot)
-        if metadata.get("rear_start_path"):
-            try:
-                rear_ts = datetime.fromisoformat(metadata.get("rear_captured_at")).timestamp()
-            except (TypeError, ValueError):
-                rear_ts = None
-            if rear_ts is not None:
-                session_start_candidates["cam2"].append({
-                    "path": os.path.abspath(metadata["rear_start_path"]),
-                    "captured_at": metadata["rear_captured_at"],
-                    "timestamp": rear_ts, "origin": "session_start",
-                })
+        session_start_candidates = build_session_start_candidates(start_snapshots, metadata, cameras)
 
-        if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
-            dwell_candidates = dedicated_candidates(
-                "local_peak_dwell_snapshot_paths",
-                "local_peak_dwell_snapshot_captured_at", "local_peak_dwell",
-            )
-            drop_candidates = dedicated_candidates(
-                "local_peak_drop_snapshot_paths",
-                "local_peak_drop_snapshot_captured_at", "local_peak_drop",
-            )
-            source = "local_peak" if metadata.get("local_peak_observed_at") else "weight_recorded"
-            target = target_ts
-            candidate_sets = {}
-            for camera in cameras:
-                if dwell_candidates[camera]:
-                    candidate_sets[camera] = dwell_candidates[camera]
-                    continue
-                if drop_candidates[camera]:
-                    candidate_sets[camera] = drop_candidates[camera]
-                    continue
-                nearest = min(
-                    timeline[camera], key=lambda item: abs(item["timestamp"] - target),
-                    default=None,
-                )
-                if (
-                    nearest is not None
-                    and abs(nearest["timestamp"] - target) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
-                ):
-                    candidate_sets[camera] = [nearest]
-                else:
-                    candidate_sets[camera] = []
-                    if nearest is not None:
-                        rejected[camera] = {
-                            "source": source, "reason": "outside_target_window",
-                            "captured_at": nearest["captured_at"],
-                            "offset_ms": round((nearest["timestamp"] - target) * 1000),
-                        }
-        elif "unknown_snapshot_paths" in metadata or any(session_start_candidates[camera] for camera in cameras):
-            source = "session_start"
-            target = started_ts
-            candidate_sets = session_start_candidates
-        else:
-            source = "legacy_weight"
-            target = target_ts
-            candidate_sets = {
-                camera: [
-                    candidate for candidate in timeline[camera]
-                    if abs(candidate["timestamp"] - target_ts) <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
-                ]
-                for camera in cameras
-            }
+        source, target, candidate_sets = select_candidate_sets(
+            metadata, timeline, target_ts, started_ts, unknown_plate,
+            session_start_candidates, rejected, cameras,
+        )
 
         available_cameras = [camera for camera in cameras if candidate_sets[camera]]
         if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION") and len(available_cameras) > 1:
-            synchronized_groups = [
-                group
-                for size in range(1, len(available_cameras) + 1)
-                for group in candidate_combinations(available_cameras, size)
-                if (
-                    max(candidate_sets[camera][0]["timestamp"] for camera in group)
-                    - min(candidate_sets[camera][0]["timestamp"] for camera in group)
-                    <= UNKNOWN_PHOTO_MAX_OFFSET_SECONDS
-                )
-            ]
-            synchronized_cameras = min(
-                synchronized_groups,
-                key=lambda group: (
-                    -len(group),
-                    sum(abs(candidate_sets[camera][0]["timestamp"] - target) for camera in group),
-                    max(candidate_sets[camera][0]["timestamp"] for camera in group)
-                    - min(candidate_sets[camera][0]["timestamp"] for camera in group),
-                    group,
-                ),
+            available_cameras = synchronize_cameras(
+                available_cameras, candidate_sets, target, source, rejected, cameras,
             )
-            for camera in set(available_cameras) - set(synchronized_cameras):
-                candidate = candidate_sets[camera][0]
-                rejected[camera] = {
-                    "source": source, "reason": "inter_camera_skew",
-                    "captured_at": candidate["captured_at"],
-                    "offset_ms": round((candidate["timestamp"] - target) * 1000),
-                }
-                candidate_sets[camera] = []
-            available_cameras = [camera for camera in cameras if candidate_sets[camera]]
+
         selected = {}
         captured_at = {}
         selection = {}
         synchronized_gap_ms = None
-        ranked = []
-        if available_cameras:
-            combinations = product(*(candidate_sets[camera] for camera in available_cameras))
-            if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION"):
-                ranked = sorted(
-                    combinations,
-                    key=lambda items: (
-                        sum(abs(item["timestamp"] - target) for item in items),
-                        max(item["timestamp"] for item in items)
-                        - min(item["timestamp"] for item in items),
-                    ),
-                )
-            else:
-                ranked = sorted(
-                    combinations,
-                    key=lambda items: (
-                        max(item["timestamp"] for item in items)
-                        - min(item["timestamp"] for item in items),
-                        sum(abs(item["timestamp"] - target) for item in items),
-                    ),
-                )
+        ranked = rank_combinations(available_cameras, candidate_sets, target, unknown_plate)
         for combination in ranked:
             frames = [cv2.imread(item["path"]) for item in combination]
             if any(frame is None for frame in frames):
@@ -1976,27 +1753,10 @@ class SessionManager:
             synchronized_gap_ms = round((max(timestamps) - min(timestamps)) * 1000)
             for camera, item, frame in zip(available_cameras, combination, frames):
                 if unknown_plate == "UNKNOWN_OCR":
-                    tracks = (frame_metadata.get(item.get("relative_path")) or {}).get("tracks") or []
-                    if not tracks:
-                        detected_boxes = (metadata.get("lpr_diagnostics") or {}).get(
-                            "detected_boxes", {}
-                        )
-                        tracks = detected_boxes.get(item.get("relative_path"), [])
-                        if not tracks:
-                            tracks = max(
-                                (
-                                    boxes for path, boxes in detected_boxes.items()
-                                    if path.startswith(camera + "-") and boxes
-                                ),
-                                key=lambda boxes: max(
-                                    box.get("confidence", 0.0) for box in boxes
-                                ),
-                                default=[],
-                            )
-                    self._draw_unknown_ocr_bbox(
-                        frame,
-                        tracks,
+                    tracks = resolve_detector_tracks(
+                        camera, item.get("relative_path"), frame_metadata, metadata,
                     )
+                    self._draw_unknown_ocr_bbox(frame, tracks)
                 selected[camera] = frame
                 captured_at[camera] = item["captured_at"]
                 selection[camera] = {
@@ -2021,6 +1781,8 @@ class SessionManager:
             synchronized_gap_ms=synchronized_gap_ms,
             selected=selection, rejected=rejected, missing_cameras=missing,
         )
+        return selected, captured_at
+
         return selected, captured_at
 
     @staticmethod
