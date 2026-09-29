@@ -213,11 +213,112 @@ class MissedSessionRecoveryTests(unittest.TestCase):
         upload.assert_not_called()
         self.assertFalse(self.recovery.pending_file.exists())
 
-    def test_hp2_allowlisted_case_blocks_without_attributable_image(self):
+    def test_hp2_case_is_image_less_when_allowed(self):
         hp2 = "9c3dfb52707d4344a7baee4fdaf6ffed"
         original = module.RECOVERY_CASES[hp2]
-        with self.assertRaisesRegex(RuntimeError, "no attributable local image"):
-            self.recovery._evidence(hp2, original, {})
+        self.assertEqual(self.recovery._evidence(hp2, original, {}), (None, None, None))
+
+
+class ImageLessRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.service = Path(self.root.name)
+        for relative in ("storage", "scale_data"):
+            (self.service / relative).mkdir(parents=True, exist_ok=True)
+        self.started = "2026-09-27T07:40:24.276+00:00"
+        self.ended = "2026-09-27T07:40:47.526+00:00"
+        metadata = {
+            "event": "session_duplicate",
+            "id": module.HP2_CASE_ID,
+            "session_id": module.HP2_CASE_ID,
+            "started_at": self.started,
+            "ended_at": self.ended,
+            "end_reason": "scale_empty",
+            "stable_weight": 17710,
+            "weight_source": "stable",
+            "raw_peak_weight": 17940,
+        }
+        path = self.service / "storage/session-finalization.db"
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            "CREATE TABLE finalized_sessions (session_id TEXT PRIMARY KEY, outcome TEXT, finalized_at TEXT);"
+            "CREATE TABLE terminal_outcomes (session_id TEXT PRIMARY KEY, event_type TEXT, record_json TEXT, finalized_at TEXT);"
+        )
+        connection.execute(
+            "INSERT INTO finalized_sessions VALUES (?, ?, ?)",
+            (module.HP2_CASE_ID, "duplicate", self.ended),
+        )
+        connection.execute(
+            "INSERT INTO terminal_outcomes VALUES (?, ?, ?, ?)",
+            (module.HP2_CASE_ID, "session_duplicate", json.dumps(metadata), self.ended),
+        )
+        connection.commit()
+        connection.close()
+        path = self.service / "scale_data/2026-09-27.db"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE weight_log (timestamp TEXT, weight_kg REAL, status TEXT, checksum_ok INTEGER)"
+        )
+        rows = [
+            ("2026-09-27T14:40:10.000000", 41300, "STABLE", 1),
+            ("2026-09-27T14:40:16.000000", 0, "STABLE", 1),
+            ("2026-09-27T14:40:26.736000", 17680, "UNSTABLE", 1),
+            ("2026-09-27T14:40:30.000000", 17710, "STABLE", 1),
+            ("2026-09-27T14:40:35.000000", 17710, "STABLE", 1),
+            ("2026-09-27T14:40:40.000000", 17710, "STABLE", 1),
+            ("2026-09-27T14:40:43.000000", 17940, "UNSTABLE", 1),
+            ("2026-09-27T14:40:45.216000", 17720, "STABLE", 1),
+            ("2026-09-27T14:40:46.500000", 0, "STABLE", 1),
+        ]
+        connection.executemany("INSERT INTO weight_log VALUES (?, ?, ?, ?)", rows)
+        connection.commit()
+        connection.close()
+        self.recovery = module.MissedSessionRecovery(self.service, module.HP2_ID)
+
+    def tearDown(self):
+        self.root.cleanup()
+
+    def test_hp2_plans_image_less_without_attributable_image(self):
+        plan = self.recovery.plan(module.HP2_CASE_ID)
+
+        self.assertTrue(plan["image_less"])
+        self.assertIsNone(plan["object_key"])
+        self.assertIsNone(plan["source_image"])
+        self.assertIsNone(plan["destination_image"])
+        self.assertEqual(plan["outbox_event"]["image_object_keys"], [])
+        self.assertEqual(plan["outbox_event"]["image_paths"], [])
+        self.assertEqual(plan["outbox_event"]["session_result"]["photos"], [])
+        self.assertTrue(plan["outbox_event"]["session_result"]["metadata"]["image_less"])
+        self.assertEqual(plan["scale"]["selected_weight"], 17710)
+        self.assertEqual(plan["scale"]["raw_peak_weight"], 17940)
+        self.assertTrue(plan["scale"]["confirmed_empty_before"])
+        self.assertTrue(plan["scale"]["confirmed_empty_at_end"])
+
+    def test_image_less_apply_requires_explicit_approval(self):
+        plan = self.recovery.plan(module.HP2_CASE_ID)
+
+        with self.assertRaisesRegex(RuntimeError, "image-less"):
+            self.recovery.apply(plan, module.HP2_CASE_ID, Mock())
+
+    def test_image_less_apply_stages_without_upload(self):
+        plan = self.recovery.plan(module.HP2_CASE_ID)
+        upload = Mock()
+
+        self.assertEqual(
+            self.recovery.apply(
+                plan, module.HP2_CASE_ID, upload, allow_image_less=True,
+            ),
+            "staged",
+        )
+        upload.assert_not_called()
+        pending = module._read_json_lines(self.recovery.pending_file)
+        self.assertEqual([event["id"] for event in pending], [module.HP2_CASE_ID])
+        self.assertEqual(pending[0]["image_object_keys"], [])
+        self.assertEqual(pending[0]["image_paths"], [])
+        audits = module._read_json_lines(self.recovery.audit_file)
+        self.assertEqual(len(audits), 1)
+        self.assertTrue(audits[0]["image_less"])
+        self.assertIsNone(audits[0]["object_key"])
 
 
 if __name__ == "__main__":

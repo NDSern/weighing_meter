@@ -33,6 +33,7 @@ from config import (  # noqa: E402
 
 HP1_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"
 HP2_ID = "9aa29a10-6605-47dd-9460-970d66c3d1c3"
+HP2_CASE_ID = "9c3dfb52707d4344a7baee4fdaf6ffed"
 
 RECOVERY_CASES = {
     "c9f95576942341a28ee7e93812f26061": {
@@ -64,6 +65,7 @@ RECOVERY_CASES = {
         "raw_peak_weight": 17940.0,
         "plate": "14C-017.80",
         "evidence_camera": None,
+        "allow_no_image": True,
     },
 }
 
@@ -353,6 +355,8 @@ class MissedSessionRecovery:
     def _evidence(self, session_id, case, metadata):
         camera = case["evidence_camera"]
         if not camera:
+            if case.get("allow_no_image"):
+                return None, None, None
             raise RuntimeError("blocked: no attributable local image for this audited session")
         images = [Path(path) for path in metadata.get("images") or []]
         suffix = f"{session_id}_{camera}.jpg"
@@ -378,18 +382,24 @@ class MissedSessionRecovery:
         event_time = _parse_timestamp(metadata["ended_at"])
         local_time = event_time.astimezone()
         date_path = local_time.strftime("%Y/%m/%d")
-        filename = f"{session_id}_{case['plate']}_photo-{camera}.jpg"
-        destination = self.capture_dir / local_time.strftime("%Y") / local_time.strftime(
-            "%m"
-        ) / local_time.strftime("%d") / filename
-        object_key = f"storage/weighbridge/{date_path}/{filename}"
-        photo = {
-            "url": f"/storage/weighbridge/{date_path}/{filename}",
-            "type": camera,
-            "captured_at": metadata.get("filtered_peak_observed_at")
-            or metadata.get("raw_peak_observed_at")
-            or metadata.get("ended_at"),
-        }
+        image_less = source is None or camera is None
+        if image_less:
+            destination = None
+            object_key = None
+            photos = []
+        else:
+            filename = f"{session_id}_{case['plate']}_photo-{camera}.jpg"
+            destination = self.capture_dir / local_time.strftime(
+                "%Y"
+            ) / local_time.strftime("%m") / local_time.strftime("%d") / filename
+            object_key = f"storage/weighbridge/{date_path}/{filename}"
+            photos = [{
+                "url": f"/storage/weighbridge/{date_path}/{filename}",
+                "type": camera,
+                "captured_at": metadata.get("filtered_peak_observed_at")
+                or metadata.get("raw_peak_observed_at")
+                or metadata.get("ended_at"),
+            }]
         session_result = {
             "start": _parse_timestamp(metadata["started_at"]).astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S"
@@ -404,11 +414,12 @@ class MissedSessionRecovery:
             "image_path": None,
             "offline_event_id": session_id,
             "ocr_plate_read": None if case["plate"].startswith("UNKNOWN") else case["plate"],
-            "photos": [photo],
+            "photos": photos,
             "metadata": {
                 "plate_status": "unreadable" if case["plate"].startswith("UNKNOWN") else "confirmed",
                 "recovery": True,
                 "recovery_reason": "audited_missed_session",
+                "image_less": image_less,
                 "original_outcome": case["expected_outcome"],
                 "weight_source": "raw_scale_stable_mode",
                 "loaded_stable_samples": scale["loaded_stable_row_count"],
@@ -419,8 +430,8 @@ class MissedSessionRecovery:
         outbox = {
             "id": session_id,
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "image_object_keys": [object_key],
-            "image_paths": [str(destination)],
+            "image_object_keys": [object_key] if object_key else [],
+            "image_paths": [str(destination)] if destination else [],
             "session_result": session_result,
             "activated": True,
         }
@@ -468,16 +479,17 @@ class MissedSessionRecovery:
             "pending": bool(pending),
             "already_staged": bool(audits),
             "metadata_path": str(metadata_path) if metadata_path else None,
-            "source_image": str(source),
+            "source_image": str(source) if source else None,
             "source_sha256": source_sha256,
-            "destination_image": str(destination),
+            "destination_image": str(destination) if destination else None,
             "object_key": object_key,
+            "image_less": source is None,
             "scale": scale,
             "payload_sha256": _json_hash(outbox["session_result"]),
             "outbox_event": outbox,
         }
 
-    def apply(self, plan, frontend_confirmation, uploader):
+    def apply(self, plan, frontend_confirmation, uploader, allow_image_less=False):
         session_id = plan["session_id"]
         if frontend_confirmation != session_id:
             raise RuntimeError("frontend absence confirmation must equal session ID")
@@ -485,30 +497,34 @@ class MissedSessionRecovery:
             return "completed"
         if plan["pending"]:
             return "pending"
-        destination = Path(plan["destination_image"])
-        source = Path(plan["source_image"])
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            if destination.is_symlink() or hashlib.sha256(destination.read_bytes()).hexdigest() != plan[
-                "source_sha256"
-            ]:
-                raise RuntimeError("existing recovery image differs from audited evidence")
+        if plan["image_less"]:
+            if not allow_image_less:
+                raise RuntimeError("image-less recovery requires explicit approval")
         else:
-            temporary = destination.with_name(destination.name + ".recovery.tmp")
-            shutil.copyfile(source, temporary)
-            with temporary.open("rb") as handle:
-                os.fsync(handle.fileno())
-            if hashlib.sha256(temporary.read_bytes()).hexdigest() != plan["source_sha256"]:
-                temporary.unlink(missing_ok=True)
-                raise RuntimeError("recovery image copy verification failed")
-            os.replace(temporary, destination)
-            _fsync_directory(destination.parent)
-        try:
-            uploader(MINIO_BUCKET, plan["object_key"], str(destination))
-        except Exception as exc:
-            raise RuntimeError(f"recovery image upload failed: {exc}") from exc
-        if self._upload_pending(plan["object_key"]):
-            raise RuntimeError("recovery object key already exists in upload retry queue")
+            destination = Path(plan["destination_image"])
+            source = Path(plan["source_image"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if destination.is_symlink() or hashlib.sha256(destination.read_bytes()).hexdigest() != plan[
+                    "source_sha256"
+                ]:
+                    raise RuntimeError("existing recovery image differs from audited evidence")
+            else:
+                temporary = destination.with_name(destination.name + ".recovery.tmp")
+                shutil.copyfile(source, temporary)
+                with temporary.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                if hashlib.sha256(temporary.read_bytes()).hexdigest() != plan["source_sha256"]:
+                    temporary.unlink(missing_ok=True)
+                    raise RuntimeError("recovery image copy verification failed")
+                os.replace(temporary, destination)
+                _fsync_directory(destination.parent)
+            try:
+                uploader(MINIO_BUCKET, plan["object_key"], str(destination))
+            except Exception as exc:
+                raise RuntimeError(f"recovery image upload failed: {exc}") from exc
+            if self._upload_pending(plan["object_key"]):
+                raise RuntimeError("recovery object key already exists in upload retry queue")
         records = _read_json_lines(self.pending_file)
         if any(record.get("id") == session_id for record in records):
             return "pending"
@@ -520,6 +536,7 @@ class MissedSessionRecovery:
             "host_id": self.host_id,
             "staged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "frontend_absence_confirmed": True,
+            "image_less": bool(plan["image_less"]),
             "payload_sha256": plan["payload_sha256"],
             "source_sha256": plan["source_sha256"],
             "object_key": plan["object_key"],
@@ -564,6 +581,10 @@ def main(argv=None):
         "--service-stopped", action="store_true",
         help="confirm weighing_service was stopped at empty scale before apply",
     )
+    parser.add_argument(
+        "--allow-image-less", metavar="SESSION_ID",
+        help="required apply gate for an audited session with no attributable image",
+    )
     args = parser.parse_args(argv)
     recovery = MissedSessionRecovery()
     try:
@@ -576,7 +597,12 @@ def main(argv=None):
             raise RuntimeError("--service-stopped is required for outbox staging")
         if _service_running():
             raise RuntimeError("weighing_service.py is still running")
-        status = recovery.apply(plan, args.frontend_absence_confirmed, _upload_image)
+        status = recovery.apply(
+            plan,
+            args.frontend_absence_confirmed,
+            _upload_image,
+            allow_image_less=args.allow_image_less == args.session_id,
+        )
         print(json.dumps({"status": status, **public}, indent=2, sort_keys=True))
         return 0
     except (OSError, sqlite3.Error, KeyError, TypeError, ValueError, RuntimeError) as exc:
