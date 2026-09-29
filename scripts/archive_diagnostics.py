@@ -7,7 +7,14 @@ import sys
 SERVICE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SERVICE_DIR)
 
-from config import IMAGE_RETENTION_CHECK_INTERVAL_SECONDS, LPR_SPOOL_DIR, NO_PLATE_DIR, NO_STABLE_DIR
+from config import (
+    DIAGNOSTIC_ARCHIVE_AFTER_DAYS,
+    DIAGNOSTIC_ARCHIVE_RETENTION_DAYS,
+    IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
+    LPR_SPOOL_DIR,
+    NO_PLATE_DIR,
+    NO_STABLE_DIR,
+)
 from services.storage.retention_cleaner import DiagnosticArchiveCleaner
 
 
@@ -29,8 +36,8 @@ def main():
         return 0
     result = DiagnosticArchiveCleaner(
         [NO_STABLE_DIR, NO_PLATE_DIR],
-        3,
-        30,
+        DIAGNOSTIC_ARCHIVE_AFTER_DAYS,
+        DIAGNOSTIC_ARCHIVE_RETENTION_DAYS,
         IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
         log_fn=log,
     ).run_once()

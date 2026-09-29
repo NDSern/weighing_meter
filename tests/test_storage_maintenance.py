@@ -1,4 +1,5 @@
 import os
+import gzip
 import json
 import tempfile
 import time
@@ -148,6 +149,115 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(os.path.exists(current_watchdog))
             self.assertTrue(os.path.exists(recent_service))
 
+    def test_compresses_completed_logs_and_keeps_active_or_recent_logs(self):
+        with tempfile.TemporaryDirectory() as root:
+            completed_dir = os.path.join(root, "2026-07-12")
+            recent_dir = os.path.join(root, "2026-07-13")
+            active_dir = os.path.join(root, "2026-07-14")
+            os.makedirs(completed_dir)
+            os.makedirs(recent_dir)
+            os.makedirs(active_dir)
+            completed = os.path.join(completed_dir, "weighing_service.log")
+            recent = os.path.join(recent_dir, "weighing_service.log")
+            active = os.path.join(active_dir, "weighing_service.log")
+            for path, content in (
+                (completed, b"completed\n"),
+                (recent, b"recent\n"),
+                (active, b"active\n"),
+            ):
+                with open(path, "wb") as handle:
+                    handle.write(content)
+            now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
+
+            with patch("services.storage.retention_cleaner.LOG_DIR", root):
+                first = StorageMaintenance(86400).run_once(now=now)
+                second = StorageMaintenance(86400).run_once(now=now)
+
+            self.assertEqual(first["logs_compressed"], 1)
+            self.assertEqual(first["log_compression_failed"], 0)
+            self.assertEqual(second["logs_compressed"], 0)
+            self.assertFalse(os.path.exists(completed))
+            with gzip.open(completed + ".gz", "rb") as handle:
+                self.assertEqual(handle.read(), b"completed\n")
+            self.assertTrue(os.path.exists(recent))
+            self.assertTrue(os.path.exists(active))
+
+    def test_log_compression_keeps_source_when_verification_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            day_dir = os.path.join(root, "2026-07-12")
+            os.makedirs(day_dir)
+            source = os.path.join(day_dir, "weighing_service.log")
+            with open(source, "wb") as handle:
+                handle.write(b"source\n")
+            maintenance = StorageMaintenance(86400)
+            now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
+
+            with patch("services.storage.retention_cleaner.LOG_DIR", root), patch.object(
+                maintenance, "_gzip_matches_source", return_value=False,
+            ):
+                result = maintenance.run_once(now=now)
+
+            self.assertEqual(result["logs_compressed"], 0)
+            self.assertEqual(result["log_compression_failed"], 1)
+            self.assertTrue(os.path.exists(source))
+            self.assertFalse(os.path.exists(source + ".gz"))
+
+    def test_log_compression_skips_open_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            day_dir = os.path.join(root, "2026-07-12")
+            os.makedirs(day_dir)
+            source = os.path.join(day_dir, "weighing_service.log")
+            with open(source, "wb") as handle:
+                handle.write(b"open\n")
+            now = datetime(2026, 7, 14, 12, 0, 0).timestamp()
+
+            with patch("services.storage.retention_cleaner.LOG_DIR", root), patch.object(
+                StorageMaintenance, "_open_file_paths", return_value={os.path.abspath(source)},
+            ):
+                result = StorageMaintenance(86400).run_once(now=now)
+
+            self.assertEqual(result["logs_compressed"], 0)
+            self.assertTrue(os.path.exists(source))
+            self.assertFalse(os.path.exists(source + ".gz"))
+
+    def test_log_expiry_removes_compressed_cutoff_date(self):
+        with tempfile.TemporaryDirectory() as root:
+            day_dir = os.path.join(root, "2026-06-30")
+            os.makedirs(day_dir)
+            compressed = os.path.join(day_dir, "weighing_service.log.gz")
+            with gzip.open(compressed, "wb") as handle:
+                handle.write(b"old\n")
+
+            with patch("services.storage.retention_cleaner.LOG_DIR", root), patch(
+                "services.storage.retention_cleaner.LOG_RETENTION_DAYS", 14,
+            ):
+                result = StorageMaintenance(86400).run_once(
+                    now=datetime(2026, 7, 14, 12, 0, 0).timestamp(),
+                )
+
+            self.assertEqual(result["logs_deleted"], 1)
+            self.assertFalse(os.path.exists(compressed))
+
+    def test_log_expiry_keeps_open_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            day_dir = os.path.join(root, "2026-06-30")
+            os.makedirs(day_dir)
+            active = os.path.join(day_dir, "weighing_service.log")
+            with open(active, "wb") as handle:
+                handle.write(b"still open\n")
+
+            with patch("services.storage.retention_cleaner.LOG_DIR", root), patch(
+                "services.storage.retention_cleaner.LOG_RETENTION_DAYS", 14,
+            ), patch.object(
+                StorageMaintenance, "_open_file_paths", return_value={os.path.abspath(active)},
+            ):
+                result = StorageMaintenance(86400).run_once(
+                    now=datetime(2026, 7, 14, 12, 0, 0).timestamp(),
+                )
+
+            self.assertEqual(result["logs_deleted"], 0)
+            self.assertTrue(os.path.exists(active))
+
     def test_scale_retention_keeps_archive_and_removes_sidecars(self):
         with tempfile.TemporaryDirectory() as root:
             for name in (
@@ -278,6 +388,23 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertEqual(runner.main(), 0)
 
         cleaner.assert_not_called()
+
+    def test_diagnostic_archive_runner_uses_shared_policy(self):
+        runner = load_archive_script()
+
+        with patch.object(runner, "spool_is_busy", return_value=False), patch.object(
+            runner, "DiagnosticArchiveCleaner",
+        ) as cleaner:
+            cleaner.return_value.run_once.return_value = {"failed": 0}
+            self.assertEqual(runner.main(), 0)
+
+        cleaner.assert_called_once_with(
+            [runner.NO_STABLE_DIR, runner.NO_PLATE_DIR],
+            runner.DIAGNOSTIC_ARCHIVE_AFTER_DAYS,
+            runner.DIAGNOSTIC_ARCHIVE_RETENTION_DAYS,
+            runner.IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
+            log_fn=runner.log,
+        )
 
     def test_pressure_cleanup_deletes_oldest_images_but_keeps_pending_images(self):
         with tempfile.TemporaryDirectory() as service_dir:

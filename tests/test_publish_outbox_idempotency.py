@@ -329,11 +329,11 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
 
         outcome, terminal = session_module.getSessionFinalization("no-plate-event")
         self.assertEqual(outcome, "published")
-        self.assertEqual(terminal["plate"], "UNKNOWN")
+        self.assertEqual(terminal["plate"], "UNKNOWN_DETECTION")
         self.assertEqual(terminal["plate_status"], "unreadable")
         self.assertEqual(module._publish_queue.get_nowait(), "no-plate-event")
         queued = module._pending_events["no-plate-event"]["session_result"]
-        self.assertEqual(queued["official_plate"], "UNKNOWN")
+        self.assertEqual(queued["official_plate"], "UNKNOWN_DETECTION")
         self.assertEqual(queued["stable_weight"], 39220)
         self.assertIsNone(queued["ocr_plate_read"])
         self.assertEqual(queued["metadata"]["plate_status"], "unreadable")

@@ -12,6 +12,7 @@ import ctypes
 import os
 import re
 import signal
+from datetime import datetime
 import sys
 import threading
 import time
@@ -48,6 +49,9 @@ from config import (
     CAM2_RESULT_CROP,
     CAM3_LPR_CROP,
     CAPTURE_DIR,
+    DIAGNOSTIC_ARCHIVE_AFTER_DAYS,
+    DIAGNOSTIC_ARCHIVE_CHECK_INTERVAL_SECONDS,
+    DIAGNOSTIC_ARCHIVE_RETENTION_DAYS,
     DUPLICATE_REVIEW_ENABLED,
     IMAGE_RETENTION_CHECK_INTERVAL_SECONDS,
     IMAGE_RETENTION_DAYS,
@@ -119,6 +123,7 @@ from services.pipeline import detector_obb_decode
 
 from services.tracking import PlateTracker
 from services.capture import FrameGrabber, CameraGrabber, DetectCoordinator
+from services.capture.camera_light_controller import CameraLightController
 from services.capture.detect_coordinator import set_log_fn as set_detect_coordinator_log
 from services.capture.session_frame_spool import SessionFrameSpool
 from services.pipeline.deferred_lpr_worker import DeferredLprWorker
@@ -127,7 +132,8 @@ from services.storage.image_save_worker import ImageSaveWorker
 from services.storage.image_save_worker import set_log_fn as set_image_save_log
 from services.storage.publish_outbox import PublishOutbox
 from services.storage.retention_cleaner import (
-    ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
+    DiagnosticArchiveCleaner, ImageRetentionCleaner, StorageMaintenance,
+    VerifiedMinioCacheCleaner,
 )
 from services.review.duplicate_review import DuplicateReviewer
 from services.runtime import RknnModelSet
@@ -152,6 +158,7 @@ def main():
     models = mqtt_svc = cam1 = cam3 = grabber2 = None
     detect_coord = reader = frame_spool = deferred_lpr = None
     retention_cleaner = minio_cache_cleaner = storage_maintenance = session_manager = plate_tracker = None
+    diagnostic_archive_cleaner = None
     duplicate_reviewer = None
     mqtt_started = image_worker_started = outbox_started = False
     detect_stopped = deferred_stopped = True
@@ -249,6 +256,14 @@ def main():
                 log_fn=log,
             )
             minio_cache_cleaner.start()
+            diagnostic_archive_cleaner = DiagnosticArchiveCleaner(
+                [NO_STABLE_DIR, NO_PLATE_DIR],
+                DIAGNOSTIC_ARCHIVE_AFTER_DAYS,
+                DIAGNOSTIC_ARCHIVE_RETENTION_DAYS,
+                DIAGNOSTIC_ARCHIVE_CHECK_INTERVAL_SECONDS,
+                log_fn=log,
+            )
+            diagnostic_archive_cleaner.start()
 
         if DUPLICATE_REVIEW_ENABLED:
             duplicate_reviewer = DuplicateReviewer(log_fn=log)
@@ -262,6 +277,9 @@ def main():
             save_images_fn=ImageSaveWorker.save_and_upload_now,
             undetectable_dir=UNDETECTABLE_DIR,
             cam2_result_crop=CAM2_RESULT_CROP,
+            lpr_light_controller=CameraLightController(
+                [RTSP_URL, RTSP_URL_2, RTSP_URL_3], datetime.now,
+            ),
             duplicate_reviewer=duplicate_reviewer,
         )
         detect_coord = DetectCoordinator(
@@ -347,6 +365,8 @@ def main():
             cleanup("minio_cache_retention", minio_cache_cleaner.stop)
         if storage_maintenance:
             cleanup("storage_maintenance", storage_maintenance.stop)
+        if diagnostic_archive_cleaner:
+            cleanup("diagnostic_archive", diagnostic_archive_cleaner.stop)
         if outbox_started:
             cleanup("publish_outbox", PublishOutbox.stop)
         if mqtt_started and mqtt_svc:

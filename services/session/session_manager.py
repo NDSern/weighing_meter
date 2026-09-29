@@ -25,6 +25,7 @@ from config import (
     PEAK_FILTER_FRAMES,
     PEAK_MOVEMENT_CANCEL_KG,
     PEAK_MOVEMENT_CONFIRM_FRAMES,
+    SAVE_ABSORBED_PEAK_CANDIDATE_EVIDENCE,
     SESSION_DEDUP_STATE_FILE,
     SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT,
     SESSION_FINALIZATION_DB,
@@ -408,6 +409,7 @@ class SessionManager:
         undetectable_dir=None,
         cam2_result_crop="left",
         frame_spool=None,
+        lpr_light_controller=None,
         duplicate_reviewer=None,
     ):
         if cam2_result_crop not in ("left", "right", "full"):
@@ -421,6 +423,7 @@ class SessionManager:
         self.undetectable_dir = undetectable_dir
         self.cam2_result_crop = cam2_result_crop
         self.frame_spool = frame_spool
+        self.lpr_light_controller = lpr_light_controller
         self.duplicate_reviewer = duplicate_reviewer
 
         self.session = WeighingSessionState()
@@ -596,18 +599,18 @@ class SessionManager:
             return
         if (
             self.session.session_active
-            and self._plate_owned
-            and self._plate_absent_since is not None
-            and time.monotonic() - self._plate_absent_since >= 1.0
-        ):
-            self._complete_plate_loss(log_fn, frame.weight)
-        if (
-            self.session.session_active
             and not self.session.scale_owned
             and frame.weight > WEIGHT_THRESHOLD
         ):
             if self._promote_plate_candidate(frame, log_fn) is False:
                 return
+        if (
+            self.session.session_active
+            and self._plate_owned
+            and self._plate_absent_since is not None
+            and time.monotonic() - self._plate_absent_since >= 1.0
+        ):
+            self._complete_plate_loss(log_fn, frame.weight)
         self._capture_rear_fallback_if_due(log_fn)
         self._capture_unknown_snapshots_if_due(log_fn)
         self._capture_unknown_weight_snapshots_if_due(frame.weight, log_fn)
@@ -809,9 +812,15 @@ class SessionManager:
             "end_weight_kg": frame.weight,
             "shadow_only": True,
         })
-        saved = self._save_diagnostic_frames(
-            PEAK_CANDIDATE_DIR, candidate["id"], candidate["start_frames"], metadata, log_fn,
+        save_evidence = not (
+            category == "absorbed_active_session"
+            and not SAVE_ABSORBED_PEAK_CANDIDATE_EVIDENCE
         )
+        saved = 0
+        if save_evidence:
+            saved = self._save_diagnostic_frames(
+                PEAK_CANDIDATE_DIR, candidate["id"], candidate["start_frames"], metadata, log_fn,
+            )
         log_metric(
             log_fn, "weight_peak_rejected" if category != "stable_session" else "weight_peak_promoted",
             id=candidate["id"], category=category,
@@ -1124,6 +1133,8 @@ class SessionManager:
         if self.session.scale_owned and self._start_session_spool(log_fn, trigger) is False:
             return False
         self.session.session_active = True
+        if self.lpr_light_controller:
+            self.lpr_light_controller.set_lpr_active(True, log_fn)
         self.session.unknown_snapshot_deadline = (
             self.session.started_at + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
         )
@@ -1547,6 +1558,8 @@ class SessionManager:
         self._attempt_wait_reference = None
         self._post_session_low = None
 
+        if self.lpr_light_controller:
+            self.lpr_light_controller.set_lpr_active(False, log_fn)
         self.session.session_active = False
         self._generation += 1
         self._plate_owned = False
@@ -2447,8 +2460,6 @@ class SessionManager:
             "cam1": _make("photo-cam1"),
             "cam2": _make("photo-cam2"),
             "cam3": _make("photo-cam3"),
-            "unchosen_cam1": _make("photo-unchosen-cam1"),
-            "unchosen_cam3": _make("photo-unchosen-cam3"),
         }
 
     def _attach_unknown_publish_images(
@@ -2530,7 +2541,7 @@ class SessionManager:
 
         tracker = tracker or self.plate_tracker
         image = tracker.get_image_frame(plate, aliases=image_aliases)
-        frame, img_plate, camera_name, observed_at = image[:4]
+        frame, img_plate, _camera_name, observed_at = image[:4]
         if frame is None or not plate:
             return False
         if img_plate != plate:
@@ -2559,24 +2570,6 @@ class SessionManager:
         if rear_img is not None:
             photos.append({"url": paths["rear"][2], "type": "rear", "captured_at": captured_at})
             save_items.append([paths["rear"][0], rear_img, paths["rear"][1]])
-
-        unchosen_camera = None
-        if camera_name == "cam1":
-            unchosen_camera = "cam3"
-        elif camera_name == "cam3":
-            unchosen_camera = "cam1"
-        if unchosen_camera:
-            unchosen_frame = None
-            if start_frame_paths and start_frame_paths.get(unchosen_camera):
-                unchosen_frame = cv2.imread(start_frame_paths[unchosen_camera])
-            elif not start_frame_paths:
-                unchosen_frame = self.session.lpr_start_frames.get(unchosen_camera)
-            unchosen_key = f"unchosen_{unchosen_camera}"
-            if unchosen_frame is not None and unchosen_key in paths:
-                if ImageSaveWorker.save_local_only(paths[unchosen_key][0], unchosen_frame):
-                    log_fn("SAVE", f"Saved local-only unchosen LPR start image camera={unchosen_camera} plate={plate}")
-                else:
-                    log_fn("WARNING", f"Failed local-only unchosen LPR start image camera={unchosen_camera} plate={plate}")
 
         result["photos"] = photos
         result["_image_object_keys"] = [item[2] for item in save_items]

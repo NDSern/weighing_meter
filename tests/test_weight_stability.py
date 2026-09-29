@@ -192,8 +192,8 @@ class SessionWeightTests(unittest.TestCase):
         self.manager.on_frame(self.stable_frame(39120), Mock())
         self.assertEqual(self.manager.session.stable_weight, 39120)
 
-    def test_falling_trend_ends_session_and_starts_chained_attempt(self):
-        end_session = Mock(side_effect=lambda *_args: setattr(self.manager.session, "session_active", False))
+    def test_falling_trend_does_not_end_loaded_session(self):
+        end_session = Mock()
         self.manager._end_session = end_session
         self.manager.session.weight_trend_window.clear()
 
@@ -202,8 +202,9 @@ class SessionWeightTests(unittest.TestCase):
             frame.status = "UNSTABLE"
             self.manager.on_frame(frame, Mock())
 
-        end_session.assert_called_once_with("weight_trend_falling", unittest.mock.ANY)
-        self.assertIsNotNone(self.manager._attempt)
+        end_session.assert_not_called()
+        self.assertTrue(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.scale_owned)
 
     def test_rising_trend_does_not_split_active_session(self):
         self.manager._end_session = Mock()
@@ -1655,12 +1656,30 @@ class PeakCandidateTests(unittest.TestCase):
 
         self.assertEqual(self.archived_metadata()["category"], "blocked_waiting_for_empty")
 
-    def test_active_session_peak_records_absorption_reason(self):
+    def test_active_session_peak_does_not_write_redundant_evidence(self):
         self.manager.session.session_active = True
         self.manager.session.session_id = "session-1"
         self.manager.session.weight_departure_baseline = 20000
         self.manager.session.latest_stable_weight = 20000
-        self.finish_peak()
+        with unittest.mock.patch(
+            "services.session.session_manager.SAVE_ABSORBED_PEAK_CANDIDATE_EVIDENCE", False,
+        ):
+            self.finish_peak()
+
+        self.manager._save_diagnostic_frames.assert_not_called()
+        metrics = [call.args[1] for call in self.log.call_args_list if call.args[0] == "METRIC"]
+        self.assertTrue(any('"category":"absorbed_active_session"' in metric for metric in metrics))
+        self.assertTrue(any('"images":0' in metric for metric in metrics))
+
+    def test_active_session_peak_keeps_shadow_evidence_when_enabled(self):
+        self.manager.session.session_active = True
+        self.manager.session.session_id = "session-1"
+        self.manager.session.weight_departure_baseline = 20000
+        self.manager.session.latest_stable_weight = 20000
+        with unittest.mock.patch(
+            "services.session.session_manager.SAVE_ABSORBED_PEAK_CANDIDATE_EVIDENCE", True,
+        ):
+            self.finish_peak()
 
         metadata = self.archived_metadata()
         self.assertEqual(metadata["category"], "absorbed_active_session")

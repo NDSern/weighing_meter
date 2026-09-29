@@ -1,5 +1,6 @@
 """Image retention cleanup for local storage."""
 
+import gzip
 import json
 import hashlib
 import os
@@ -12,6 +13,8 @@ from datetime import date, datetime, timedelta
 
 from config import (
     IMAGE_DEAD_LETTER_RETENTION_DAYS,
+    LOG_COMPRESSION_ENABLED,
+    LOG_COMPRESS_AFTER_DAYS,
     LOG_DIR,
     LOG_FILE_PREFIX,
     LOG_RETENTION_DAYS,
@@ -609,26 +612,152 @@ class StorageMaintenance:
         except ValueError:
             return None
 
+    @staticmethod
+    def _gzip_matches_source(source_path, gzip_path):
+        source_digest = hashlib.sha256()
+        gzip_digest = hashlib.sha256()
+        try:
+            with open(source_path, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    source_digest.update(chunk)
+            with gzip.open(gzip_path, "rb") as compressed:
+                for chunk in iter(lambda: compressed.read(1024 * 1024), b""):
+                    gzip_digest.update(chunk)
+        except (OSError, EOFError, gzip.BadGzipFile):
+            return False
+        return source_digest.digest() == gzip_digest.digest()
+
+    def _compress_log(self, path):
+        compressed_path = path + ".gz"
+        temp_path = compressed_path + ".tmp"
+        if os.path.exists(compressed_path):
+            if os.path.islink(compressed_path) or not os.path.isfile(compressed_path):
+                return False
+            if not self._gzip_matches_source(path, compressed_path):
+                return False
+            os.remove(path)
+            return True
+        try:
+            with open(path, "rb") as source, open(temp_path, "xb") as raw_output:
+                with gzip.GzipFile(
+                    filename=os.path.basename(path), mode="wb", fileobj=raw_output,
+                    compresslevel=1, mtime=0,
+                ) as compressed:
+                    shutil.copyfileobj(source, compressed, length=1024 * 1024)
+                raw_output.flush()
+                os.fsync(raw_output.fileno())
+            if not self._gzip_matches_source(path, temp_path):
+                return False
+            os.replace(temp_path, compressed_path)
+            os.remove(path)
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _open_file_paths():
+        paths = set()
+        proc_root = "/proc"
+        try:
+            pids = os.listdir(proc_root)
+        except OSError:
+            return paths
+        for pid in pids:
+            if not pid.isdigit():
+                continue
+            fd_root = os.path.join(proc_root, pid, "fd")
+            try:
+                fds = os.listdir(fd_root)
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    target = os.readlink(os.path.join(fd_root, fd))
+                except OSError:
+                    continue
+                if target.endswith(" (deleted)"):
+                    target = target[:-10]
+                if os.path.isabs(target):
+                    paths.add(os.path.abspath(target))
+        return paths
+
+    def _compress_completed_logs(self, now):
+        cutoff = datetime.fromtimestamp(now).date() - timedelta(days=LOG_COMPRESS_AFTER_DAYS)
+        compressed = failed = 0
+        if not LOG_COMPRESSION_ENABLED:
+            return compressed, failed
+        open_paths = self._open_file_paths()
+        if not os.path.isdir(LOG_DIR):
+            return compressed, failed
+        for name in os.listdir(LOG_DIR):
+            path = os.path.join(LOG_DIR, name)
+            candidates = []
+            match = re.fullmatch(
+                rf"{re.escape(LOG_FILE_PREFIX)}_(\d{{4}}-\d{{2}}-\d{{2}})\.log", name,
+            )
+            if match:
+                candidates.append((self._dated_name(match.group(1)), path))
+            else:
+                match = re.fullmatch(r"resource-watchdog\.(\d{8})_\d{6}\.jsonl", name)
+                if match:
+                    try:
+                        candidates.append((datetime.strptime(match.group(1), "%Y%m%d").date(), path))
+                    except ValueError:
+                        pass
+                elif not os.path.islink(path) and os.path.isdir(path):
+                    date_value = self._dated_name(name)
+                    candidates.append(
+                        (date_value, os.path.join(path, f"{LOG_FILE_PREFIX}.log"))
+                    )
+            for file_date, candidate in candidates:
+                if file_date is None or file_date >= cutoff:
+                    continue
+                if (
+                    os.path.islink(candidate)
+                    or not os.path.isfile(candidate)
+                    or os.path.abspath(candidate) in open_paths
+                ):
+                    continue
+                if self._compress_log(candidate):
+                    compressed += 1
+                else:
+                    failed += 1
+                    self._log("WARNING", f"Log compression failed path={candidate}")
+        return compressed, failed
+
     def _remove_expired_logs(self, now):
         cutoff = datetime.fromtimestamp(now - LOG_RETENTION_DAYS * 86400).date()
         deleted = directories_deleted = 0
         if not os.path.isdir(LOG_DIR):
             return deleted, directories_deleted
+        open_paths = self._open_file_paths()
         for name in os.listdir(LOG_DIR):
             path = os.path.join(LOG_DIR, name)
             file_date = None
-            match = re.fullmatch(rf"{re.escape(LOG_FILE_PREFIX)}_(\d{{4}}-\d{{2}}-\d{{2}})\.log", name)
+            match = re.fullmatch(
+                rf"{re.escape(LOG_FILE_PREFIX)}_(\d{{4}}-\d{{2}}-\d{{2}})\.log(?:\.gz)?", name,
+            )
             if match:
                 file_date = self._dated_name(match.group(1))
             else:
-                match = re.fullmatch(r"resource-watchdog\.(\d{8})_\d{6}\.jsonl", name)
+                match = re.fullmatch(r"resource-watchdog\.(\d{8})_\d{6}\.jsonl(?:\.gz)?", name)
                 if match:
                     try:
                         file_date = datetime.strptime(match.group(1), "%Y%m%d").date()
                     except ValueError:
                         file_date = None
             if file_date is not None:
-                if file_date <= cutoff and os.path.isfile(path) and not os.path.islink(path):
+                if (
+                    file_date <= cutoff
+                    and os.path.isfile(path)
+                    and not os.path.islink(path)
+                    and os.path.abspath(path) not in open_paths
+                ):
                     try:
                         os.remove(path)
                         deleted += 1
@@ -640,11 +769,19 @@ class StorageMaintenance:
             date_value = self._dated_name(name)
             if date_value is None or date_value > cutoff:
                 continue
-            log_path = os.path.join(path, f"{LOG_FILE_PREFIX}.log")
+            log_paths = (
+                os.path.join(path, f"{LOG_FILE_PREFIX}.log"),
+                os.path.join(path, f"{LOG_FILE_PREFIX}.log.gz"),
+            )
             try:
-                if os.path.isfile(log_path) and not os.path.islink(log_path):
-                    os.remove(log_path)
-                    deleted += 1
+                for log_path in log_paths:
+                    if (
+                        os.path.isfile(log_path)
+                        and not os.path.islink(log_path)
+                        and os.path.abspath(log_path) not in open_paths
+                    ):
+                        os.remove(log_path)
+                        deleted += 1
                 if not os.listdir(path):
                     os.rmdir(path)
                     directories_deleted += 1
@@ -676,6 +813,7 @@ class StorageMaintenance:
     def run_once(self, now=None):
         now = time.time() if now is None else now
         log_deleted, log_directories_deleted = self._remove_expired_logs(now)
+        logs_compressed, log_compression_failed = self._compress_completed_logs(now)
         scale_databases_deleted = self._remove_expired_scale_databases(now)
         dead_letter_dir = os.path.join(SERVICE_DIR, "storage", "dead-letter")
         mqtt_deleted = self._remove_older_than(
@@ -692,12 +830,15 @@ class StorageMaintenance:
         )
         self._log(
             "INFO",
-            f"Storage maintenance complete: logs_deleted={log_deleted} "
+            f"Storage maintenance complete: logs_compressed={logs_compressed} "
+            f"log_compression_failed={log_compression_failed} logs_deleted={log_deleted} "
             f"log_directories_deleted={log_directories_deleted} "
             f"scale_databases_deleted={scale_databases_deleted} "
             f"mqtt_dead_letters_deleted={mqtt_deleted} image_dead_letters_deleted={image_deleted}",
         )
         return {
+            "logs_compressed": logs_compressed,
+            "log_compression_failed": log_compression_failed,
             "logs_deleted": log_deleted,
             "log_directories_deleted": log_directories_deleted,
             "scale_databases_deleted": scale_databases_deleted,
