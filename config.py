@@ -97,9 +97,9 @@ SESSION_FRAME_JPEG_QUALITY = 82
 SESSION_FRAME_QUEUE_SIZE = 32
 SESSION_FRAME_DISK_CAP_BYTES = 20 * 1024 * 1024 * 1024
 SESSION_FRAME_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024
+IMAGE_STORAGE_TARGET_FREE_BYTES = 7 * 1024 * 1024 * 1024
 UNKNOWN_PHOTO_LOCAL_PEAK_DWELL_SECONDS = 1.0
 UNKNOWN_PHOTO_LOCAL_PEAK_DROP_KG = 300.0
-SAME_PLATE_DUPLICATE_SECONDS = 10.0
 
 # Duplicate session review (mock-only; enable per host via config.local.py)
 DUPLICATE_REVIEW_ENABLED = False
@@ -282,6 +282,8 @@ def validate_runtime_config():
         errors.append("DEFAULT_TRANSACTION_TYPE is invalid")
     if not isinstance(SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT, bool):
         errors.append("SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT must be a boolean")
+    if IMAGE_STORAGE_TARGET_FREE_BYTES < SESSION_FRAME_MIN_FREE_BYTES:
+        errors.append("IMAGE_STORAGE_TARGET_FREE_BYTES must be >= SESSION_FRAME_MIN_FREE_BYTES")
     if _HOST_POLICY:
         for name, expected in _HOST_POLICY.items():
             if globals().get(name) != expected:
