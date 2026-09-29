@@ -14,6 +14,7 @@ sys.modules.setdefault("minio.error", Mock())
 from services.storage import publish_outbox as module
 from services.storage.publish_outbox import PublishOutbox
 from services.session import session_manager as session_module
+from services.session import plate_registry as plate_registry_module
 
 
 class PublishOutboxIdempotencyTests(unittest.TestCase):
@@ -184,7 +185,7 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
 
     def test_plate_count_updates_once_per_session_id(self):
         db_path = os.path.join(self.root.name, "plates.db")
-        with patch.object(session_module, "SERVICE_DIR", self.root.name):
+        with patch.object(plate_registry_module, "SERVICE_DIR", self.root.name):
             first = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")
             replay = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")
 
