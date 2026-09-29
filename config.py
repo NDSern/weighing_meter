@@ -1,5 +1,6 @@
 import importlib.util
 import os
+from urllib.parse import urlsplit
 
 
 SERVICE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7,9 +8,17 @@ LPR_DIR = os.path.join(SERVICE_DIR, "yolov5lpr")
 
 SERIAL_PORT = "/dev/ttyS6"
 BAUD_RATE = 9600
-RTSP_URL = "rtsp://admin:123456@192.168.1.181:554/ch01/0"
-RTSP_URL_2 = "rtsp://admin:123456@192.168.1.179:554/ch01/0"
-RTSP_URL_3 = "rtsp://admin:123456@192.168.1.177:554/ch01/0"
+# Camera addressing is not secret; credentials come from the host environment
+# or config.local.py and are never stored in tracked code.
+RTSP_HOST_CAM1 = "192.168.1.181"
+RTSP_HOST_CAM2 = "192.168.1.179"
+RTSP_HOST_CAM3 = "192.168.1.177"
+RTSP_PATH = "/ch01/0"
+RTSP_USERNAME = ""
+RTSP_PASSWORD = ""
+RTSP_URL = ""
+RTSP_URL_2 = ""
+RTSP_URL_3 = ""
 CAM1_EXPECTED_RESOLUTION = None
 
 WEIGHT_THRESHOLD = 100.0
@@ -30,8 +39,8 @@ SESSION_FINALIZATION_DB = os.path.join(SERVICE_DIR, "storage", "session-finaliza
 MQTT_ENABLED = True
 MQTT_HOST = "103.75.184.181"
 MQTT_PORT = 1883
-MQTT_USERNAME = "90157317-f4b2-48d2-8d8b-d5a9e899bad2"
-MQTT_PASSWORD = "0b91a95f-7b15-4778-a700-a1994878112c"
+MQTT_USERNAME = ""
+MQTT_PASSWORD = ""
 MQTT_QOS = 1
 MQTT_KEEPALIVE = 30
 WEIGHBRIDGE_ID = "9aa29a10-6605-47dd-9460-970d66c3d1c3"
@@ -64,8 +73,8 @@ SQLITE_WAL_TRUNCATE_BYTES = 100 * 1024 * 1024
 RESULT_JPEG_QUALITY = 82
 
 MINIO_ENDPOINT = "storage.mobifone.vn:8443"
-MINIO_ACCESS_KEY = "RHgVMNk4r78QrgqYmA8L"
-MINIO_SECRET_KEY = "n8c63EwVTCJmCjx2wL1lGNoRI1kXJ3tUHXAmyB5d"
+MINIO_ACCESS_KEY = ""
+MINIO_SECRET_KEY = ""
 MINIO_BUCKET = "vns-camera-poc"
 MINIO_SECURE = True
 MINIO_REGION = "HCM-Q9"
@@ -173,6 +182,41 @@ if os.path.exists(_LOCAL_CONFIG):
             globals()[_name] = getattr(_module, _name)
             _LOCAL_OVERRIDES.add(_name)
 
+# Environment values win over config.local.py for secrets and endpoints.
+# systemd supplies them through /etc/weighing-meter/weighing.env.
+_ENV_OVERRIDES = {
+    "WEIGHBRIDGE_ID": "WEIGHING_WEIGHBRIDGE_ID",
+    "RTSP_URL": "WEIGHING_RTSP_URL",
+    "RTSP_URL_2": "WEIGHING_RTSP_URL_2",
+    "RTSP_URL_3": "WEIGHING_RTSP_URL_3",
+    "RTSP_USERNAME": "WEIGHING_RTSP_USERNAME",
+    "RTSP_PASSWORD": "WEIGHING_RTSP_PASSWORD",
+    "MQTT_HOST": "WEIGHING_MQTT_HOST",
+    "MQTT_PORT": "WEIGHING_MQTT_PORT",
+    "MQTT_USERNAME": "WEIGHING_MQTT_USERNAME",
+    "MQTT_PASSWORD": "WEIGHING_MQTT_PASSWORD",
+    "MINIO_ENDPOINT": "WEIGHING_MINIO_ENDPOINT",
+    "MINIO_ACCESS_KEY": "WEIGHING_MINIO_ACCESS_KEY",
+    "MINIO_SECRET_KEY": "WEIGHING_MINIO_SECRET_KEY",
+}
+for _name, _env_name in _ENV_OVERRIDES.items():
+    _env_value = os.environ.get(_env_name)
+    if _env_value:
+        if _name == "MQTT_PORT":
+            try:
+                _env_value = int(_env_value)
+            except ValueError:
+                _env_value = -1
+        globals()[_name] = _env_value
+        _LOCAL_OVERRIDES.add(_name)
+
+if "RTSP_URL" not in _LOCAL_OVERRIDES:
+    RTSP_URL = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{RTSP_HOST_CAM1}:554{RTSP_PATH}"
+if "RTSP_URL_2" not in _LOCAL_OVERRIDES:
+    RTSP_URL_2 = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{RTSP_HOST_CAM2}:554{RTSP_PATH}"
+if "RTSP_URL_3" not in _LOCAL_OVERRIDES:
+    RTSP_URL_3 = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{RTSP_HOST_CAM3}:554{RTSP_PATH}"
+
 if "MQTT_WEIGHBRIDGE_TOPIC_ID" not in _LOCAL_OVERRIDES:
     MQTT_WEIGHBRIDGE_TOPIC_ID = WEIGHBRIDGE_ID
 if "MQTT_CLIENT_ID" not in _LOCAL_OVERRIDES:
@@ -218,6 +262,20 @@ def validate_runtime_config():
         "MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET",
     ):
         require_text(name)
+
+    def require_rtsp(name):
+        value = globals().get(name)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{name} must be a non-empty string")
+            return
+        parts = urlsplit(value)
+        if not parts.hostname:
+            errors.append(f"{name} must include a camera host")
+        if parts.username is not None and (not parts.username or not parts.password):
+            errors.append(f"{name} credentials are incomplete")
+
+    for name in ("RTSP_URL", "RTSP_URL_2", "RTSP_URL_3"):
+        require_rtsp(name)
     if DEFAULT_TRANSACTION_TYPE not in (
         "gate_in", "gate_out", "vgm", "reweigh", "spot_check",
     ):

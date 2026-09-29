@@ -3,9 +3,20 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Tracked defaults carry no credentials; hosts supply them locally or via env.
+_CREDENTIALS = (
+    'RTSP_USERNAME = "camera-user"\n'
+    'RTSP_PASSWORD = "camera-pass"\n'
+    'MQTT_USERNAME = "mqtt-user"\n'
+    'MQTT_PASSWORD = "mqtt-pass"\n'
+    'MINIO_ACCESS_KEY = "minio-access"\n'
+    'MINIO_SECRET_KEY = "minio-secret"\n'
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -24,6 +35,7 @@ class ConfigTests(unittest.TestCase):
     def test_hp01_identity_derives_mqtt_fields_after_local_override(self):
         config = self.load_config(
             'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'
+            + _CREDENTIALS
         )
 
         self.assertEqual(config.MQTT_WEIGHBRIDGE_TOPIC_ID, config.WEIGHBRIDGE_ID)
@@ -41,6 +53,7 @@ class ConfigTests(unittest.TestCase):
     def test_hp02_identity_derives_mqtt_fields_after_local_override(self):
         config = self.load_config(
             'WEIGHBRIDGE_ID = "9aa29a10-6605-47dd-9460-970d66c3d1c3"\n'
+            + _CREDENTIALS
         )
 
         self.assertEqual(config.MQTT_WEIGHBRIDGE_TOPIC_ID, config.WEIGHBRIDGE_ID)
@@ -61,6 +74,7 @@ class ConfigTests(unittest.TestCase):
             'MQTT_WEIGHBRIDGE_TOPIC_ID = "bridge-id"\n'
             'MQTT_CLIENT_ID = "custom-client-bridge-id"\n'
             'MQTT_TOPIC = "custom/bridge-id/topic"\n'
+            + _CREDENTIALS
         )
 
         self.assertEqual(config.MQTT_WEIGHBRIDGE_TOPIC_ID, "bridge-id")
@@ -105,6 +119,34 @@ class ConfigTests(unittest.TestCase):
 
     def test_minio_fields_are_required(self):
         config = self.load_config('MINIO_SECRET_KEY = ""\n')
+
+        with self.assertRaisesRegex(ValueError, "MINIO_SECRET_KEY"):
+            config.validate_runtime_config()
+
+    def test_environment_overrides_local_secrets(self):
+        with mock.patch.dict(os.environ, {"WEIGHING_MQTT_PASSWORD": "env-pass"}):
+            config = self.load_config(
+                'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'
+                + _CREDENTIALS
+                + 'MQTT_PASSWORD = "local-pass"\n'
+            )
+
+        self.assertEqual(config.MQTT_PASSWORD, "env-pass")
+
+    def test_incomplete_rtsp_credentials_are_rejected(self):
+        config = self.load_config(
+            'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'
+            + _CREDENTIALS
+            + 'RTSP_PASSWORD = ""\n'
+        )
+
+        with self.assertRaisesRegex(ValueError, "RTSP_URL.*incomplete"):
+            config.validate_runtime_config()
+
+    def test_defaults_without_secrets_fail_validation(self):
+        config = self.load_config(
+            'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'
+        )
 
         with self.assertRaisesRegex(ValueError, "MINIO_SECRET_KEY"):
             config.validate_runtime_config()
