@@ -143,6 +143,27 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
                 self.deferred_metadata("local-only"), Mock(), Mock(),
             ))
 
+    def test_scale_reader_stalled_session_without_weight_is_not_published(self):
+        manager = session_module.SessionManager(Mock())
+        metadata = self.deferred_metadata("reader-gap-no-weight")
+        metadata.update({
+            "stable_weight": None,
+            "raw_peak_weight": None,
+            "filtered_peak_weight": None,
+            "end_reason": "scale_reader_stalled",
+            "scale_data_gap": True,
+        })
+
+        with patch.object(manager, "_load_diagnostic_frames", return_value={}), patch.object(
+            manager, "_save_diagnostic_frames", return_value=0,
+        ) as save_diagnostics:
+            self.assertTrue(manager.finalize_deferred_session(metadata, Mock(), Mock()))
+
+        self.assertEqual(session_module.getSessionFinalization("reader-gap-no-weight")[0], "no_weight")
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+        self.assertEqual(save_diagnostics.call_args.args[0], session_module.NO_STABLE_DIR)
+        self.assertEqual(save_diagnostics.call_args.args[3]["reason"], "no_usable_weight")
+
     def test_completed_ledger_satisfies_finalized_retry(self):
         PublishOutbox._mark_completed("completed")
         session_module.markSessionFinalized("completed", "published", {

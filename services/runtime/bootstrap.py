@@ -312,6 +312,7 @@ def construct_service(log, res=None) -> ServiceResources:
     res.reader.on_weight = lambda frame: res.session_manager.on_weight(frame, log)
     res.reader.on_frame = lambda frame: res.session_manager.on_frame(frame, log)
     res.reader.on_status_change = lambda frame, old, new: res.session_manager.on_status_change(frame, old, new, log)
+    res.reader.on_health = lambda event, details: res.session_manager.on_scale_reader_health(event, details, log)
     res.reader.start()
     return res
 

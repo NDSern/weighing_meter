@@ -65,6 +65,100 @@ class WeightStabilityTests(unittest.TestCase):
         self.reader.on_frame.assert_not_called()
         self.assertEqual(list(self.reader._recent_weights), [])
 
+    def test_reader_reconnects_after_valid_frame_stall(self):
+        class SilentSerial:
+            is_open = True
+            in_waiting = 0
+
+            def read(self, _size):
+                return b""
+
+            def close(self):
+                self.is_open = False
+
+        health = []
+        self.reader.stall_seconds = 0.01
+        self.reader.reconnect_initial_seconds = 0.001
+        self.reader.reconnect_max_seconds = 0.001
+        def on_health(event, details):
+            health.append((event, details))
+            if event == "stalled":
+                self.reader._running = False
+
+        self.reader.on_health = on_health
+        self.reader._running = True
+
+        with unittest.mock.patch("d2008_scale_reader.serial.Serial", return_value=SilentSerial()):
+            self.reader._run()
+
+        self.assertEqual([event for event, _ in health], ["stalled"])
+        self.assertEqual(self.reader.state, "stopped")
+
+    def test_reader_reports_recovery_after_valid_frame(self):
+        def valid_frame(weight=1000):
+            body = b"+" + f"{weight:06d}".encode() + b"0"
+            xor_value = 0
+            for byte in body:
+                xor_value ^= byte
+            encode = lambda nibble: nibble + (0x30 if nibble <= 9 else 0x37)
+            return b"\x02" + body + bytes((encode(xor_value >> 4), encode(xor_value & 0x0F))) + b"\x03"
+
+        class SilentSerial:
+            is_open = True
+            in_waiting = 0
+
+            def read(self, _size):
+                return b""
+
+            def close(self):
+                self.is_open = False
+
+        class ValidSerial(SilentSerial):
+            def __init__(self):
+                self.sent = False
+
+            def read(self, _size):
+                if not self.sent:
+                    self.sent = True
+                    return valid_frame()
+                return b""
+
+        health = []
+        self.reader.stall_seconds = 0.01
+        self.reader.reconnect_initial_seconds = 0.001
+        self.reader.reconnect_max_seconds = 0.001
+
+        def on_health(event, details):
+            health.append((event, details))
+            if event == "recovered":
+                self.reader._running = False
+
+        self.reader.on_health = on_health
+        self.reader._running = True
+        with unittest.mock.patch(
+            "d2008_scale_reader.serial.Serial", side_effect=[SilentSerial(), ValidSerial()],
+        ):
+            self.reader._run()
+
+        self.assertEqual([event for event, _ in health], ["stalled", "recovered"])
+        self.assertIsNotNone(self.reader.latest)
+        self.assertEqual(self.reader.latest.weight, 1000)
+        self.assertIsNotNone(health[-1][1]["last_valid_timestamp"])
+
+    def test_stop_signals_reconnect_backoff(self):
+        self.reader._running = True
+        self.reader.state = "reconnecting"
+        self.reader._stop_event.clear()
+        self.reader._thread = unittest.mock.Mock()
+        self.reader._thread.is_alive.return_value = False
+
+        with unittest.mock.patch.object(self.reader._stop_event, "wait") as wait:
+            self.reader.stop()
+
+        self.assertTrue(self.reader._stop_event.is_set())
+        self.reader._thread.join.assert_called_once_with(timeout=3)
+        wait.assert_not_called()
+
     def test_db_persists_at_five_hz_while_display_remains_one_hz(self):
         self.reader.log_interval = 0.2
         self.reader.on_frame = Mock()
@@ -1536,6 +1630,45 @@ class SessionWeightTests(unittest.TestCase):
         metadata = manager._snapshot_session("scale_empty")
 
         self.assertEqual(metadata["weight_observed_at"], "2026-07-24T00:01:02.345+00:00")
+
+    def test_scale_reader_stall_finalizes_loaded_session_once(self):
+        spool = Mock()
+        manager = SessionManager(Mock(), frame_spool=spool)
+        manager.session.session_active = True
+        manager.session.spool_active = True
+        manager.session.scale_owned = True
+        manager.session.session_id = "session-1"
+        manager.session.started_at_iso = "2026-07-24T00:00:00+00:00"
+        manager.session.started_at = 1.0
+        manager.session.stable_weight = 30630
+        manager.session.stable_weight_observed_at = "2026-07-24T00:01:00+00:00"
+        log = Mock()
+
+        manager.on_scale_reader_health("stalled", {"last_valid_age_seconds": 31, "reconnect_count": 0}, log)
+        manager.on_scale_reader_health("stalled", {"last_valid_age_seconds": 32, "reconnect_count": 1}, log)
+
+        spool.end_session.assert_called_once()
+        metadata = spool.end_session.call_args.args[1]
+        self.assertEqual(metadata["end_reason"], "scale_reader_stalled")
+        self.assertEqual(metadata["stable_weight"], 30630)
+        self.assertTrue(metadata["scale_data_gap"])
+        self.assertTrue(manager._scale_recovery_blocked)
+
+    def test_scale_reader_stall_blocks_plate_until_fresh_empty_dwell(self):
+        manager = SessionManager(Mock())
+        log = Mock()
+        manager.on_scale_reader_health("stalled", {"last_valid_age_seconds": 31, "reconnect_count": 0}, log)
+        manager.on_plate_presence("cam3", {"cam3": True}, log, revision=1)
+        self.assertFalse(manager.session.session_active)
+
+        empty = make_frame(0)
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time", side_effect=[1.0, 3.1],
+        ):
+            manager.on_frame(empty, log)
+            manager.on_frame(empty, log)
+
+        self.assertFalse(manager._scale_recovery_blocked)
 
     def test_cam2_fallback_runs_once_two_seconds_after_failed_primary(self):
         rear = Mock()

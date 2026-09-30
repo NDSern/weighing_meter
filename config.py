@@ -8,6 +8,9 @@ LPR_DIR = os.path.join(SERVICE_DIR, "yolov5lpr")
 
 SERIAL_PORT = "/dev/ttyS6"
 BAUD_RATE = 9600
+SCALE_READER_STALL_SECONDS = 30.0
+SCALE_READER_RECONNECT_INITIAL_SECONDS = 1.0
+SCALE_READER_RECONNECT_MAX_SECONDS = 30.0
 # Camera addressing is not secret; credentials come from the host environment
 # or config.local.py and are never stored in tracked code.
 RTSP_HOST_CAM1 = "192.168.1.181"

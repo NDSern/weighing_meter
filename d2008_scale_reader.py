@@ -26,6 +26,9 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 from config import (
+    SCALE_READER_RECONNECT_INITIAL_SECONDS,
+    SCALE_READER_RECONNECT_MAX_SECONDS,
+    SCALE_READER_STALL_SECONDS,
     SCALE_DATA_RETENTION_DAYS,
     SQLITE_PASSIVE_CHECKPOINT_SECONDS,
     SQLITE_TRUNCATE_CHECKPOINT_SECONDS,
@@ -351,19 +354,29 @@ class D2008Reader:
         db_file: str = DB_FILE,
         dump_file: Optional[str] = SERIAL_DUMP_FILE,
         log_interval: float = LOG_INTERVAL,
+        stall_seconds: float = SCALE_READER_STALL_SECONDS,
+        reconnect_initial_seconds: float = SCALE_READER_RECONNECT_INITIAL_SECONDS,
+        reconnect_max_seconds: float = SCALE_READER_RECONNECT_MAX_SECONDS,
     ):
         self.port         = port
         self.baud         = baud
         self.dump_file    = dump_file
         self.log_interval = log_interval
+        self.stall_seconds = stall_seconds
+        self.reconnect_initial_seconds = reconnect_initial_seconds
+        self.reconnect_max_seconds = reconnect_max_seconds
 
         self._parser   = D2008Parser()
         self._db       = ScaleDatabase(db_file)
         self._serial   = None
         self._running  = False
+        self._stop_event = threading.Event()
         self.state = "stopped"
         self.last_error = None
         self._thread   = None
+        self._last_valid_monotonic = None
+        self._outage_started_monotonic = None
+        self._reconnect_count = 0
         self._last_log   = 0.0
         self._last_print = 0.0
         self._recent_weights = deque(maxlen=STABLE_COUNT)
@@ -377,12 +390,15 @@ class D2008Reader:
         self.on_frame: Optional[Callable[[WeightFrame], None]] = None
         # Callback — fires only on status transitions (STABLE↔UNSTABLE, OVERLOAD)
         self.on_status_change: Optional[Callable[[WeightFrame, str, str], None]] = None
+        # Callback — fires for serial reader stalls and recoveries.
+        self.on_health: Optional[Callable[[str, dict], None]] = None
 
         # Giá trị cân mới nhất (thread-safe read)
         self.latest: Optional[WeightFrame] = None
 
     def start(self):
         """Bắt đầu đọc (non-blocking, chạy background thread)."""
+        self._stop_event.clear()
         self._running = True
         self.state = "starting"
         self._thread  = threading.Thread(target=self._run, daemon=True)
@@ -392,6 +408,7 @@ class D2008Reader:
     def stop(self):
         """Dừng đọc."""
         self._running = False
+        self._stop_event.set()
         if self._serial and self._serial.is_open:
             self._serial.close()
         if self._thread:
@@ -403,42 +420,99 @@ class D2008Reader:
         print("[READER] Đã dừng.")
 
     def _run(self):
-        try:
-            if self.dump_file:
+        if self.dump_file:
+            try:
                 self._run_from_dump_file(self.dump_file)
-                return
+            finally:
+                self._running = False
+                self.state = "stopped"
+            return
 
-            self._serial = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=2,
-            )
-            print(f"[READER] Kết nối thành công: {self.port}")
-            self.state = "running"
-
+        delay = self.reconnect_initial_seconds
+        try:
             while self._running:
-                raw = self._serial.read(self._serial.in_waiting or 1)
-                if not raw:
-                    continue
+                try:
+                    self._serial = serial.Serial(
+                        port=self.port,
+                        baudrate=self.baud,
+                        bytesize=serial.EIGHTBITS,
+                        parity=serial.PARITY_NONE,
+                        stopbits=serial.STOPBITS_ONE,
+                        timeout=2,
+                    )
+                    print(f"[READER] Kết nối thành công: {self.port}")
+                    self.state = "running"
+                    self._last_valid_monotonic = time.monotonic()
+                    while self._running:
+                        raw = self._serial.read(self._serial.in_waiting or 1)
+                        now = time.monotonic()
+                        if raw:
+                            frames = self._parser.feed(raw)
+                            valid_frame = False
+                            for frame in frames:
+                                if frame.checksum_ok:
+                                    valid_frame = True
+                                self._handle_frame(frame)
+                            if valid_frame:
+                                self._last_valid_monotonic = now
+                                if self._outage_started_monotonic is not None:
+                                    outage_s = now - self._outage_started_monotonic
+                                    self._emit_health("recovered", outage_seconds=outage_s)
+                                    self._outage_started_monotonic = None
+                                    self._reconnect_count = 0
+                                delay = self.reconnect_initial_seconds
+                                continue
+                        if now - self._last_valid_monotonic >= self.stall_seconds:
+                            self._mark_stalled("no checksum-valid frames")
+                            break
+                except (serial.SerialException, TypeError, OSError) as exc:
+                    self.last_error = str(exc)
+                    self._mark_stalled(str(exc))
+                finally:
+                    if self._serial and self._serial.is_open:
+                        self._serial.close()
+                    self._serial = None
 
-                frames = self._parser.feed(raw)
-                for frame in frames:
-                    self._handle_frame(frame)
-
-        except (serial.SerialException, TypeError, OSError) as e:
-            self.last_error = str(e)
-            self.state = "failed"
-            if self._running:
-                print(f"[ERROR] Lỗi cổng serial: {e}")
+                if self._running:
+                    self.state = "reconnecting"
+                    self._reconnect_count += 1
+                    self._stop_event.wait(delay)
+                    delay = min(delay * 2, self.reconnect_max_seconds)
         finally:
             self._running = False
-            if self.state != "failed":
-                self.state = "stopped"
+            self.state = "stopped"
             if self._serial and self._serial.is_open:
                 self._serial.close()
+
+    def _mark_stalled(self, reason):
+        now = time.monotonic()
+        self.last_error = reason
+        self.state = "stalled"
+        if self._outage_started_monotonic is None:
+            self._outage_started_monotonic = now
+            self._emit_health("stalled", reason=reason)
+
+    def _emit_health(self, event, **details):
+        if not self.on_health:
+            return
+        payload = {
+            "event": event,
+            "port": self.port,
+            "last_valid_age_seconds": (
+                None if self._last_valid_monotonic is None
+                else max(0.0, time.monotonic() - self._last_valid_monotonic)
+            ),
+            "last_valid_timestamp": (
+                self.latest.timestamp.isoformat(timespec="milliseconds")
+                if self.latest is not None else None
+            ),
+            "reconnect_count": self._reconnect_count,
+            **details,
+        }
+        try:
+            self.on_health(event, payload)
+        except Exception as exc:
+            print(f"[ERROR] Reader health callback failed: {exc}")
 
     def _run_from_dump_file(self, file_path: str):
         """Giả lập đọc serial bằng dữ liệu dump từ file nhị phân."""

@@ -182,6 +182,8 @@ class SessionManager:
         self._attempt_wait_reference = None
         self._post_session_low = None
         self._waiting_for_empty = False
+        self._scale_recovery_blocked = False
+        self._scale_data_gap_details = None
         self._post_session_empty_since = None
         self._peak_candidate = None
         self._peak_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
@@ -224,6 +226,8 @@ class SessionManager:
             any_valid = any(valid_by_camera.values())
             now = time.monotonic()
             if any_valid:
+                if self._scale_recovery_blocked:
+                    return
                 self._plate_absent_since = None
                 if not self.session.session_active:
                     if self._plate_rearm_blocked:
@@ -336,9 +340,40 @@ class SessionManager:
         with self._lifecycle_lock:
             return self._on_frame_locked(frame, log_fn)
 
+    def on_scale_reader_health(self, event, details, log_fn):
+        """Contain a scale-input gap without restarting unrelated workers."""
+        if event == "recovered":
+            log_metric(log_fn, "scale_reader_recovered", **details)
+            return
+        if event != "stalled":
+            return
+        with self._lifecycle_lock:
+            if self._scale_recovery_blocked:
+                return
+            self._scale_recovery_blocked = True
+            self._waiting_for_empty = True
+            self._post_session_empty_since = None
+            self._scale_data_gap_details = {
+                "scale_data_gap": True,
+                "scale_reader_stalled_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "scale_reader_last_valid_age_seconds": details.get("last_valid_age_seconds"),
+                "scale_reader_last_valid_at": details.get("last_valid_timestamp"),
+                "scale_reader_reconnect_count": details.get("reconnect_count"),
+            }
+            log_metric(log_fn, "scale_reader_stalled", **details)
+            if self.session.session_active:
+                self._end_session("scale_reader_stalled", log_fn)
+            log_fn("WARNING", "Scale lifecycle blocked until fresh empty dwell after reader stall")
+
     def _on_frame_locked(self, frame, log_fn):
         if self.fatal_error:
             return
+        if self._scale_recovery_blocked:
+            if self._wait_for_empty_cycle(frame, log_fn):
+                return
+            self._scale_recovery_blocked = False
+            self._scale_data_gap_details = None
+            log_fn("EVENT", "Scale lifecycle unblocked after reader recovery empty dwell")
         if (
             self.session.session_active
             and not self.session.scale_owned
@@ -795,6 +830,8 @@ class SessionManager:
             self.session.stable_weight = frame.weight
 
     def _can_start_session(self, log_fn):
+        if self._scale_recovery_blocked:
+            return False
         if self.session.rearm_block_until <= 0:
             return True
         if time.time() < self.session.rearm_block_until:
@@ -1374,6 +1411,7 @@ class SessionManager:
             "ended_at": ended_at,
             "duration_s": max(0.0, time.time() - (self.session.started_at or time.time())),
             "end_reason": reason,
+            **(self._scale_data_gap_details or {}),
             "stable_weight": assigned,
             "weight_source": source,
             "raw_peak_weight": self._session_raw_peak,
