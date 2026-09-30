@@ -12,6 +12,8 @@ from config import (
     YOLO26_DETECT_FPS,
 )
 
+TIMING_LOG_INTERVAL_SECONDS = 60.0
+
 
 def bbox_iou(left, right):
     x1, y1 = max(left[0], right[0]), max(left[1], right[1])
@@ -186,6 +188,7 @@ class DetectCoordinator:
         self._detect_locks = {}
         self._last_submitted_frame_ids = {}
         self._ocr_threads = []
+        self._last_timing_logs = {}
 
     def configure_split_pipeline(
         self, detect_regions_fn, recognize_regions_fn, charset, fallback_detect_regions_fn=None,
@@ -228,6 +231,15 @@ class DetectCoordinator:
             )
             return [fallback]
         return plates
+
+    def _log_timing(self, camera_name, operation, message, now=None):
+        now = time.monotonic() if now is None else now
+        key = (camera_name, operation)
+        last_logged_at = self._last_timing_logs.get(key)
+        if last_logged_at is not None and now - last_logged_at < TIMING_LOG_INTERVAL_SECONDS:
+            return
+        self._last_timing_logs[key] = now
+        log("TIMING", message)
 
     def start(self):
         if self._running:
@@ -328,7 +340,7 @@ class DetectCoordinator:
                 self._tracker.add_observation(plate_text, p["det_conf"], cw, ch, source="selected")
                 for alt_plate, _ in p.get("valid_candidates", [])[1:]:
                     self._tracker.add_observation(alt_plate, p["det_conf"] * 0.5, cw, ch, source="candidate")
-                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.5, full_frame, cam.name)
+                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.5, full_frame, cam.name, debug=p)
                 if p["det_conf"] > best_conf:
                     best_conf = p["det_conf"]
                     best_plate = plate_text
@@ -343,15 +355,16 @@ class DetectCoordinator:
                 cw, ch = int(crop_parts[0]), int(crop_parts[1])
                 for alt_plate, _ in p.get("valid_candidates", []):
                     self._tracker.add_observation(alt_plate, p["det_conf"] * 0.75, cw, ch, source="candidate")
-                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.75, full_frame, cam.name)
+                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.75, full_frame, cam.name, debug=p)
                     if best_plate is None:
                         best_plate = alt_plate
                         best_conf = p["det_conf"] * 0.75
-        del plates
         if has_unknown and best_plate is None and self._tracker.needs_undetectable():
             self._tracker.save_undetectable(full_frame.copy())
         if best_plate is not None:
-            self._tracker.update_image(best_plate, best_conf, full_frame, cam.name)
+            debug = next((plate for plate in plates if plate["plate"] == best_plate), None)
+            self._tracker.update_image(best_plate, best_conf, full_frame, cam.name, debug=debug)
+        del plates
 
     def _submit_ocr_job(self, cam, full_frame, regions, detect_started_at):
         lock = self._ocr_locks.get(cam.name)
@@ -406,14 +419,19 @@ class DetectCoordinator:
                     if len(plates) == 1:
                         p = plates[0]
                         candidates = ",".join(p.get("candidates", [])[:5])
-                        log(
-                            "TIMING",
+                        self._log_timing(
+                            cam.name,
+                            "ocr",
                             f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates=1 age={age_ms:.0f}ms "
                             f"plate={p.get('plate')} status={p.get('ocr_status')} candidates={candidates}",
                         )
                     else:
                         summary = ",".join(p.get("plate", "unknown") for p in plates[:5])
-                        log("TIMING", f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates={len(plates)} age={age_ms:.0f}ms plate={summary}")
+                        self._log_timing(
+                            cam.name,
+                            "ocr",
+                            f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates={len(plates)} age={age_ms:.0f}ms plate={summary}",
+                        )
                 self._process_plate_detections(cam, plates, full_frame)
             except Exception as exc:
                 log("ERROR", f"OCR worker error [{cam.name}]: {exc}")
@@ -439,16 +457,24 @@ class DetectCoordinator:
             if self._presence_callback:
                 self._presence_callback(cam.name, valid, revision)
             elapsed_ms = (time.time() - t0) * 1000
-            log("TIMING", f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
-                           f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
-                           f"input={lpr_frame.shape[1]}x{lpr_frame.shape[0]}")
+            self._log_timing(
+                cam.name,
+                "detect",
+                f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
+                f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
+                f"input={lpr_frame.shape[1]}x{lpr_frame.shape[0]}",
+            )
             if submit_ocr and ocr_region is not None:
                 self._submit_ocr_job(cam, full_frame, [ocr_region], t0)
             return
         plates = self._detect_plates_fn(full_frame, detector=cam.detector, ocr=cam.ocr)
         elapsed_ms = (time.time() - t0) * 1000
         if plates:
-            log("TIMING", f"[{cam.name}] Frame inference: {elapsed_ms:.0f}ms  plates={len(plates)}")
+            self._log_timing(
+                cam.name,
+                "frame_inference",
+                f"[{cam.name}] Frame inference: {elapsed_ms:.0f}ms  plates={len(plates)}",
+            )
         self._process_plate_detections(cam, plates, full_frame)
 
     def _expire_stale_tracks(self):

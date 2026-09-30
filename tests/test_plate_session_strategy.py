@@ -178,6 +178,28 @@ class PlateTrackTests(unittest.TestCase):
 
         self.assertEqual(plates, [production])
 
+    def test_process_plate_detections_passes_debug_to_tracker_images(self):
+        tracker = Mock()
+        coordinator = DetectCoordinator([Mock()], tracker)
+        coordinator._enabled = True
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        camera.inference_lock = unittest.mock.MagicMock()
+        best = {"plate": "14C-017.80", "det_conf": 0.95, "crop_size": "100x40",
+                "votes": 3, "valid_candidates": [("14C-017.80", 0.95), ("15C-017.80", 0.5)]}
+        alt = {"plate": "unknown", "det_conf": 0.6, "crop_size": "80x30",
+               "ocr_status": "no_plate", "candidates": [], "valid_candidates": [("16N-6554", 0.4)]}
+        plates = [best, alt]
+        frame = Mock()
+
+        coordinator._process_plate_detections(camera, plates, frame)
+
+        debug_calls = [c.kwargs["debug"] for c in tracker.update_image.call_args_list if "debug" in c.kwargs]
+        self.assertEqual(len(debug_calls), 3)
+        self.assertEqual(debug_calls[0], best)   # alt candidate (0.5)
+        self.assertEqual(debug_calls[1], alt)    # alt candidate (0.75)
+        self.assertEqual(debug_calls[2], best)   # final best-plate debug
+
     def test_detect_loop_does_not_resubmit_same_frame_generation(self):
         camera = Mock(name="camera")
         camera.name = "cam1"
