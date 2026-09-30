@@ -9,6 +9,7 @@ class RknnHandles:
     cam1_ocr: object
     cam3_detector: object
     cam3_ocr: object
+    fallback_detector: object | None
     vehicle: object | None
 
 
@@ -28,7 +29,10 @@ class RknnModelSet:
         vehicle_enabled,
         rknn_class,
         log_fn=None,
+        fallback_detector_path=None,
     ):
+        if fallback_detector_path and vehicle_enabled:
+            raise ValueError("LPR fallback and vehicle detector cannot both own NPU core 2")
         specs = [
             ("cam1_detector", detector_path, "lpr_detector_cam1", rknn_class.NPU_CORE_0),
             ("cam1_ocr", ocr_path, "lpr_recognizer_cam1", rknn_class.NPU_CORE_0),
@@ -37,6 +41,8 @@ class RknnModelSet:
         ]
         if vehicle_enabled:
             specs.append(("vehicle", vehicle_path, "YOLO26_vehicle", rknn_class.NPU_CORE_2))
+        elif fallback_detector_path:
+            specs.append(("fallback_detector", fallback_detector_path, "lpr_fallback_detector", rknn_class.NPU_CORE_2))
 
         opened = {}
         release_order = []
@@ -53,6 +59,7 @@ class RknnModelSet:
             cam1_ocr=opened["cam1_ocr"],
             cam3_detector=opened["cam3_detector"],
             cam3_ocr=opened["cam3_ocr"],
+            fallback_detector=opened.get("fallback_detector"),
             vehicle=opened.get("vehicle"),
         )
         return cls(handles, release_order, log_fn)

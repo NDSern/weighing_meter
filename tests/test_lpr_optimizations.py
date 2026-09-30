@@ -75,6 +75,47 @@ class OcrInferenceTests(unittest.TestCase):
                 np.zeros((1, 1, 18900), dtype=np.float32),
             ])
 
+    def test_axis_nms_suppresses_overlap_and_keeps_score_order(self):
+        output = np.array([[[10, 10, 30], [10, 10, 30], [10, 10, 4], [10, 10, 4], [0.9, 0.8, 0.7]]])
+
+        detections = lpr._axis_nms(output, 0.25, 0.45)
+
+        self.assertEqual(detections.shape, (2, 5))
+        np.testing.assert_allclose(detections[:, 4], [0.9, 0.7])
+        np.testing.assert_allclose(detections[:, :4], [[5, 5, 15, 15], [28, 28, 32, 32]])
+
+    def test_axis_detector_builds_production_ocr_region(self):
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        detector = mock.Mock()
+        detector.inference.return_value = [
+            np.array([[[320], [320], [320], [128], [0.9]]], dtype=np.float32)
+        ]
+        with mock.patch.object(
+            lpr,
+            "_preprocess_axis_detector",
+            return_value=(np.zeros((1, 640, 640, 3)), 3.2, 0, 160),
+        ):
+            regions = lpr.detect_axis_plate_regions(frame, detector=detector)
+
+        self.assertEqual(regions[0]["bbox"], [50, 30, 150, 70])
+        self.assertEqual(regions[0]["crop_size"], "100x40")
+        self.assertEqual(regions[0]["class"], "BSD")
+        self.assertFalse(regions[0]["two_row"])
+        self.assertEqual(regions[0]["detector_backend"], "yolov9_axis_rknn")
+
+    def test_fallback_runtime_rejects_wrong_output_shape(self):
+        fallback = mock.Mock()
+        fallback.inference.return_value = [np.zeros((1, 5, 3024), dtype=np.float32)]
+        charset = ["[blank]", *list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"), " "]
+
+        with self.assertRaisesRegex(ValueError, "fallback detector output shape"):
+            lpr.validate_lpr_runtime(
+                [],
+                [],
+                charset,
+                fallback_detectors=[("fallback", fallback)],
+            )
+
     def test_restricted_probabilities_are_renormalized_without_softmax(self):
         values = np.zeros((2, 38), dtype=np.float32)
         values[:, 0] = 0.2

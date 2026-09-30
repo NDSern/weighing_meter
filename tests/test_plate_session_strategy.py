@@ -107,6 +107,77 @@ class PlateTrackTests(unittest.TestCase):
         coordinator._submit_ocr_job.assert_called_once()
         self.assertEqual(coordinator._submit_ocr_job.call_args.args[2], [best])
 
+    def test_high_confidence_ocr_skips_fallback(self):
+        camera = Mock(name="camera")
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        recognize = Mock(return_value=[{"plate": "14C-017.80", "ocr_confidence": 0.99}])
+        fallback_detect = Mock()
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(Mock(), recognize, ["charset"], fallback_detect)
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates[0]["plate"], "14C-017.80")
+        fallback_detect.assert_not_called()
+
+    def test_low_confidence_ocr_selects_stronger_fallback(self):
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        production = {"plate": "15H-172.90", "ocr_confidence": 0.91}
+        fallback = {"plate": "15C-172.90", "ocr_confidence": 0.99}
+        recognize = Mock(side_effect=[[production], [fallback]])
+        fallback_detect = Mock(return_value=[{"fallback": True}])
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(Mock(), recognize, ["charset"], fallback_detect)
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates, [fallback])
+        fallback_detect.assert_called_once_with(
+            unittest.mock.ANY,
+            detector=camera.fallback_detector,
+            imgsz=640,
+        )
+
+    def test_low_confidence_ocr_keeps_stronger_primary(self):
+        camera = Mock(name="camera")
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        production = {"plate": "14C-017.80", "ocr_confidence": 0.97}
+        fallback = {"plate": "14C-017.88", "ocr_confidence": 0.90}
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(
+            Mock(),
+            Mock(side_effect=[[production], [fallback]]),
+            ["charset"],
+            Mock(return_value=[{"fallback": True}]),
+        )
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates, [production])
+
+    def test_same_fallback_text_keeps_primary_detector_confidence(self):
+        camera = Mock(name="camera")
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        production = {"plate": "15C-326.77", "ocr_confidence": 0.94, "det_conf": 0.96}
+        fallback = {"plate": "15C-326.77", "ocr_confidence": 0.99, "det_conf": 0.60}
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(
+            Mock(),
+            Mock(side_effect=[[production], [fallback]]),
+            ["charset"],
+            Mock(return_value=[{"fallback": True}]),
+        )
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates, [production])
+
     def test_detect_loop_does_not_resubmit_same_frame_generation(self):
         camera = Mock(name="camera")
         camera.name = "cam1"

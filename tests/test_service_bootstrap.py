@@ -27,13 +27,18 @@ class BootstrapSmokeTests(unittest.TestCase):
         for attr in ("session_manager", "reader", "mqtt_svc", "frame_spool", "deferred_lpr"):
             self.assertTrue(hasattr(res, attr), attr)
 
-    def test_excluded_lpr_fallback_is_absent(self):
+    def test_lpr_bundle_paths_leave_fallback_disabled_by_default(self):
         from services.runtime import bootstrap
 
-        with open(bootstrap.__file__.replace(".pyc", ".py"), encoding="utf-8") as handle:
-            source = handle.read()
-        self.assertNotIn("fallback_detector", source)
-        self.assertNotIn("detect_axis_plate_regions", source)
+        self.assertNotIn("fallback_detector", bootstrap._lpr_bundle_paths(""))
+
+    def test_lpr_bundle_paths_include_configured_fallback(self):
+        from services.runtime import bootstrap
+
+        self.assertEqual(
+            bootstrap._lpr_bundle_paths("/models/fallback.rknn")["fallback_detector"],
+            "/models/fallback.rknn",
+        )
 
 
 if __name__ == "__main__":

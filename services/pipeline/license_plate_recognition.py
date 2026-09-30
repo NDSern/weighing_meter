@@ -368,6 +368,64 @@ def _preprocess_detector(img, size):
     return blob, scale, dx, dy
 
 
+def _preprocess_axis_detector(img, size):
+    h, w = img.shape[:2]
+    scale = min(size / h, size / w)
+    new_w, new_h = int(round(w * scale)), int(round(h * scale))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    pad_x, pad_y = (size - new_w) / 2, (size - new_h) / 2
+    left, top = round(pad_x - 0.1), round(pad_y - 0.1)
+    blob = _input_buffer((1, size, size, 3))
+    blob.fill(114.0 / 255.0)
+    target = blob[0, top:top + new_h, left:left + new_w]
+    np.multiply(resized[..., ::-1], 1.0 / 255.0, out=target)
+    return blob, scale, pad_x, pad_y
+
+
+def _axis_nms(raw_output, score_threshold, iou_threshold):
+    output = np.asarray(raw_output)
+    if output.ndim != 3 or output.shape[0] != 1:
+        raise ValueError(f"Expected axis detector output [1,5,N] or [1,N,5], got {output.shape}")
+    if output.shape[1] == 5:
+        predictions = output[0].T
+    elif output.shape[2] == 5:
+        predictions = output[0]
+    else:
+        raise ValueError(f"Expected axis detector field dimension 5, got {output.shape}")
+    if not np.isfinite(predictions).all():
+        raise ValueError("Axis detector output contains non-finite values")
+
+    boxes = predictions[:, :4].copy()
+    scores = predictions[:, 4]
+    boxes[:, 0] = predictions[:, 0] - predictions[:, 2] / 2
+    boxes[:, 1] = predictions[:, 1] - predictions[:, 3] / 2
+    boxes[:, 2] = predictions[:, 0] + predictions[:, 2] / 2
+    boxes[:, 3] = predictions[:, 1] + predictions[:, 3] / 2
+    candidates = np.flatnonzero(scores > score_threshold)
+    order = candidates[np.argsort(-scores[candidates], kind="stable")]
+    selected = []
+    while order.size and len(selected) < 100:
+        current = order[0]
+        selected.append(current)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        top_left = np.maximum(boxes[current, :2], boxes[rest, :2])
+        bottom_right = np.minimum(boxes[current, 2:], boxes[rest, 2:])
+        intersection = np.prod(np.maximum(bottom_right - top_left, 0), axis=1)
+        area_current = np.prod(np.maximum(boxes[current, 2:] - boxes[current, :2], 0))
+        area_rest = np.prod(np.maximum(boxes[rest, 2:] - boxes[rest, :2], 0), axis=1)
+        iou = intersection / np.maximum(
+            area_current + area_rest - intersection,
+            np.finfo(np.float32).eps,
+        )
+        order = rest[iou <= iou_threshold]
+    if not selected:
+        return np.empty((0, 5), dtype=np.float32)
+    selected = np.asarray(selected)
+    return np.column_stack((boxes[selected], scores[selected])).astype(np.float32)
+
+
 def _decode_obb(output, num_classes, conf_thres):
     out = output[0].transpose(1, 0)
     boxes = out[:, :4]
@@ -512,6 +570,47 @@ def detect_plate_regions(frame, detector=None, imgsz=960, conf_thres=None, iou_t
     return regions
 
 
+def detect_axis_plate_regions(frame, detector=None, imgsz=640, conf_thres=None, iou_thres=None):
+    if detector is None:
+        raise ValueError("detector is required for axis plate detection")
+    conf = DET_CONF_THRES if conf_thres is None else conf_thres
+    iou = DET_IOU_THRES if iou_thres is None else iou_thres
+    blob, scale, pad_x, pad_y = _preprocess_axis_detector(frame, imgsz)
+    outputs = detector.inference(inputs=[blob], data_format=["nhwc"])
+    if len(outputs) != 1:
+        raise ValueError(f"Expected one axis detector output, got {len(outputs)}")
+    detections = _axis_nms(outputs[0], conf, iou)
+    if not len(detections):
+        return []
+    detections[:, [0, 2]] = (detections[:, [0, 2]] - pad_x) / scale
+    detections[:, [1, 3]] = (detections[:, [1, 3]] - pad_y) / scale
+
+    frame_h, frame_w = frame.shape[:2]
+    regions = []
+    for x1, y1, x2, y2, score in detections:
+        x1 = max(0, min(frame_w, int(x1)))
+        y1 = max(0, min(frame_h, int(y1)))
+        x2 = max(0, min(frame_w, int(x2)))
+        y2 = max(0, min(frame_h, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = frame[y1:y2, x1:x2]
+        crop_h, crop_w = crop.shape[:2]
+        two_row = crop_w / max(crop_h, 1) < 2.2
+        regions.append({
+            "bbox": [x1, y1, x2, y2],
+            "obb": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            "det_conf": float(score),
+            "class": "BSV" if two_row else "BSD",
+            "crop_size": f"{crop_w}x{crop_h}",
+            "crop_img": crop,
+            "two_row": two_row,
+            "ocr_status": None,
+            "detector_backend": "yolov9_axis_rknn",
+        })
+    return regions
+
+
 def recognize_plate_regions(regions, ocr=None, charset=None):
     if ocr is None:
         raise ValueError("ocr is required for PP-OCR recognition")
@@ -571,7 +670,7 @@ def recognize_plate_regions(regions, ocr=None, charset=None):
             "bbox": region["bbox"],
             "obb": region["obb"],
             "coord_space": "input_frame",
-            "detector_backend": "yolov8_obb_rknn",
+            "detector_backend": region.get("detector_backend", "yolov8_obb_rknn"),
             "ocr_backend": "ppocr_rknn",
             "det_conf": region["det_conf"],
             "class": region["class"],
@@ -588,7 +687,7 @@ def recognize_plate_regions(regions, ocr=None, charset=None):
     return plates
 
 
-def validate_lpr_runtime(detectors, recognizers, charset, model_paths=None, log_fn=None):
+def validate_lpr_runtime(detectors, recognizers, charset, model_paths=None, log_fn=None, fallback_detectors=()):
     validate_lpr_charset(charset)
     detector_input = np.zeros((1, 960, 960, 3), dtype=np.float32)
     for name, detector in detectors:
@@ -598,6 +697,14 @@ def validate_lpr_runtime(detectors, recognizers, charset, model_paths=None, log_
         decoded = decode_detector_outputs(outputs)
         if decoded.shape != (1, 7, 18900) or not np.isfinite(decoded).all():
             raise ValueError(f"{name} decoded detector shape is {decoded.shape}")
+    fallback_input = np.zeros((1, 640, 640, 3), dtype=np.float32)
+    for name, detector in fallback_detectors:
+        outputs = detector.inference(inputs=[fallback_input], data_format=["nhwc"])
+        if len(outputs) != 1:
+            raise ValueError(f"{name} expected one fallback detector output, got {len(outputs)}")
+        output = np.asarray(outputs[0])
+        if output.shape != (1, 5, 8400) or not np.isfinite(output).all():
+            raise ValueError(f"{name} unexpected fallback detector output shape: {output.shape}")
     for name, recognizer in recognizers:
         for width in REC_WIDTH_BUCKETS:
             blob = np.full((1, REC_HEIGHT, width, 3), -1.0, dtype=np.float32)

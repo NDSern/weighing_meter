@@ -82,6 +82,22 @@ class RknnModelSetTests(unittest.TestCase):
         releases = [call for call in FakeRknn.calls if call == ("release", 3)]
         self.assertEqual(len(releases), 2)
 
+    def test_fallback_detector_uses_core_two_and_releases_with_lpr(self):
+        models = RknnModelSet.open(
+            "detector", "ocr", None, False, FakeRknn, fallback_detector_path="fallback",
+        )
+
+        self.assertIs(models.handles.fallback_detector, FakeRknn.instances[4])
+        self.assertIn(("init", 4, FakeRknn.NPU_CORE_2), FakeRknn.calls)
+        models.close(release_lpr=True, release_vehicle=False)
+        self.assertIn(("release", 4), FakeRknn.calls)
+
+    def test_fallback_and_vehicle_cannot_share_core_two(self):
+        with self.assertRaisesRegex(ValueError, "cannot both own NPU core 2"):
+            RknnModelSet.open(
+                "detector", "ocr", "vehicle", True, FakeRknn, fallback_detector_path="fallback",
+            )
+
 
 class PriorityInferenceLockTests(unittest.TestCase):
     def test_waiting_live_work_runs_before_next_deferred_call(self):

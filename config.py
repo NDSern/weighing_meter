@@ -117,6 +117,9 @@ LPR_DETECTOR_MODEL = os.path.join(SERVICE_DIR, "models", "lpr", "license_plate_d
 LPR_RECOGNIZER_MODEL = os.path.join(SERVICE_DIR, "models", "lpr", "license_plate_recognizer.rknn")
 LPR_CHARSET = os.path.join(SERVICE_DIR, "models", "lpr", "charset.txt")
 LPR_IMAGE_SIZE = 960
+LPR_FALLBACK_DETECTOR_MODEL = ""
+LPR_FALLBACK_IMAGE_SIZE = 640
+LPR_FALLBACK_OCR_CONFIDENCE = 0.98
 LPR_OCR_TOPK = 10
 LPR_OCR_BEAM_WIDTH = 50
 LPR_OCR_MIN_CONFIDENCE = None
@@ -287,6 +290,8 @@ def validate_runtime_config():
         errors.append("SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT must be a boolean")
     if IMAGE_STORAGE_TARGET_FREE_BYTES < SESSION_FRAME_MIN_FREE_BYTES:
         errors.append("IMAGE_STORAGE_TARGET_FREE_BYTES must be >= SESSION_FRAME_MIN_FREE_BYTES")
+    if LPR_FALLBACK_DETECTOR_MODEL and not os.path.isfile(LPR_FALLBACK_DETECTOR_MODEL):
+        errors.append("LPR_FALLBACK_DETECTOR_MODEL must be an existing file when configured")
     if _HOST_POLICY:
         for name, expected in _HOST_POLICY.items():
             if globals().get(name) != expected:

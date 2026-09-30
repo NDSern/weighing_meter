@@ -3,7 +3,14 @@
 import threading
 import time
 
-from config import DETECT_FPS, LPR_LIVE_OCR_INTERVAL_SECONDS, PLATE_TRACK_STALE_SECONDS, YOLO26_DETECT_FPS
+from config import (
+    DETECT_FPS,
+    LPR_FALLBACK_IMAGE_SIZE,
+    LPR_FALLBACK_OCR_CONFIDENCE,
+    LPR_LIVE_OCR_INTERVAL_SECONDS,
+    PLATE_TRACK_STALE_SECONDS,
+    YOLO26_DETECT_FPS,
+)
 
 
 def bbox_iou(left, right):
@@ -160,9 +167,11 @@ class DetectCoordinator:
         self._session_context = session_context or (lambda: (None, None))
         self._tracks = {cam.name: CameraPlateTrack(cam.name) for cam in cameras}
         self._track_lock = threading.Lock()
+        self._fallback_lock = threading.Lock()
         self._presence_revision = 0
         self._detect_regions_fn = None
         self._recognize_regions_fn = None
+        self._fallback_detect_regions_fn = None
         self._charset = None
         self._running = False
         self._enabled = False
@@ -178,10 +187,47 @@ class DetectCoordinator:
         self._last_submitted_frame_ids = {}
         self._ocr_threads = []
 
-    def configure_split_pipeline(self, detect_regions_fn, recognize_regions_fn, charset):
+    def configure_split_pipeline(
+        self, detect_regions_fn, recognize_regions_fn, charset, fallback_detect_regions_fn=None,
+    ):
         self._detect_regions_fn = detect_regions_fn
         self._recognize_regions_fn = recognize_regions_fn
         self._charset = charset
+        self._fallback_detect_regions_fn = fallback_detect_regions_fn
+
+    def _recognize_with_fallback(self, cam, frame, regions):
+        plates = self._recognize_regions_fn(regions, ocr=cam.ocr, charset=self._charset)
+        valid = [plate for plate in plates if plate["plate"] != "unknown"]
+        primary = max(valid, key=lambda plate: plate.get("ocr_confidence", 0.0), default=None)
+        if (
+            primary is None
+            or primary.get("ocr_confidence", 0.0) >= LPR_FALLBACK_OCR_CONFIDENCE
+            or self._fallback_detect_regions_fn is None
+            or getattr(cam, "fallback_detector", None) is None
+        ):
+            return plates
+        with self._fallback_lock:
+            fallback_regions = self._fallback_detect_regions_fn(
+                frame, detector=cam.fallback_detector, imgsz=LPR_FALLBACK_IMAGE_SIZE,
+            )
+        fallback_plates = self._recognize_regions_fn(
+            fallback_regions, ocr=cam.ocr, charset=self._charset,
+        )
+        fallback_valid = [plate for plate in fallback_plates if plate["plate"] != "unknown"]
+        fallback = max(fallback_valid, key=lambda plate: plate.get("ocr_confidence", 0.0), default=None)
+        if (
+            fallback
+            and fallback["plate"] != primary["plate"]
+            and fallback.get("ocr_confidence", 0.0) > primary.get("ocr_confidence", 0.0)
+        ):
+            log(
+                "PLATE",
+                f"[{cam.name}] fallback selected {fallback['plate']} "
+                f"ocr={fallback['ocr_confidence']:.3f} over "
+                f"{primary['plate']} ocr={primary['ocr_confidence']:.3f}",
+            )
+            return [fallback]
+        return plates
 
     def start(self):
         if self._running:
@@ -348,7 +394,7 @@ class DetectCoordinator:
                     continue
                 t0 = time.time()
                 with cam.inference_lock:
-                    plates = self._recognize_regions_fn(regions, ocr=cam.ocr, charset=self._charset)
+                    plates = self._recognize_with_fallback(cam, full_frame, regions)
                 if not self.is_enabled():
                     continue
                 if job["session_context"] != self._session_context():

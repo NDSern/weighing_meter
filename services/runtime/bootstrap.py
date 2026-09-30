@@ -28,6 +28,7 @@ from config import (
     LPR_CHARSET,
     LPR_DEFERRED_MAX_FRAMES_PER_CAMERA,
     LPR_DETECTOR_MODEL,
+    LPR_FALLBACK_DETECTOR_MODEL,
     LPR_RECOGNIZER_MODEL,
     LPR_SPOOL_DIR,
     MQTT_ENABLED,
@@ -50,12 +51,19 @@ from config import (
 )
 from services.runtime.lpr_bundle import verify_lpr_bundle
 
-_LPR_BUNDLE_PATHS = {
-    "detector": LPR_DETECTOR_MODEL,
-    "recognizer": LPR_RECOGNIZER_MODEL,
-    "charset": LPR_CHARSET,
-    "decoder": os.path.join(SERVICE_DIR, "services", "pipeline", "detector_obb_decode.py"),
-}
+def _lpr_bundle_paths(fallback_detector_model=LPR_FALLBACK_DETECTOR_MODEL):
+    paths = {
+        "detector": LPR_DETECTOR_MODEL,
+        "recognizer": LPR_RECOGNIZER_MODEL,
+        "charset": LPR_CHARSET,
+        "decoder": os.path.join(SERVICE_DIR, "services", "pipeline", "detector_obb_decode.py"),
+    }
+    if fallback_detector_model:
+        paths["fallback_detector"] = fallback_detector_model
+    return paths
+
+
+_LPR_BUNDLE_PATHS = _lpr_bundle_paths()
 verify_lpr_bundle(_LPR_BUNDLE_PATHS)
 
 try:
@@ -132,6 +140,7 @@ def construct_service(log, res=None) -> ServiceResources:
     from mqtt_service import MqttService
 
     from services.pipeline.license_plate_recognition import (
+        detect_axis_plate_regions,
         detect_plate_regions,
         load_lpr_charset,
         recognize_plate_regions,
@@ -176,6 +185,7 @@ def construct_service(log, res=None) -> ServiceResources:
         False,
         RKNN,
         log_fn=log,
+        fallback_detector_path=LPR_FALLBACK_DETECTOR_MODEL or None,
     )
     handles = res.models.handles
     validate_lpr_runtime(
@@ -184,6 +194,9 @@ def construct_service(log, res=None) -> ServiceResources:
         lpr_charset,
         model_paths=_LPR_BUNDLE_PATHS,
         log_fn=log,
+        fallback_detectors=(
+            [("fallback", handles.fallback_detector)] if handles.fallback_detector else []
+        ),
     )
 
     res.plate_tracker = PlateTracker()
@@ -197,11 +210,12 @@ def construct_service(log, res=None) -> ServiceResources:
     res.cam1 = CameraGrabber(
         RTSP_URL, "cam1", handles.cam1_detector, handles.cam1_ocr,
         CAM1_LPR_CROP, expected_resolution=CAM1_EXPECTED_RESOLUTION,
+        fallback_detector=handles.fallback_detector,
     )
     res.cam1.start()
     res.cam3 = CameraGrabber(
         RTSP_URL_3, "cam3", handles.cam3_detector, handles.cam3_ocr,
-        CAM3_LPR_CROP,
+        CAM3_LPR_CROP, fallback_detector=handles.fallback_detector,
     )
     res.cam3.start()
     res.grabber2 = FrameGrabber(RTSP_URL_2)
@@ -272,6 +286,7 @@ def construct_service(log, res=None) -> ServiceResources:
         detect_plate_regions,
         recognize_plate_regions,
         lpr_charset,
+        fallback_detect_regions_fn=detect_axis_plate_regions if handles.fallback_detector else None,
     )
     res.frame_spool = SessionFrameSpool(
         LPR_SPOOL_DIR,

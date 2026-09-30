@@ -220,11 +220,12 @@ class CameraGrabber(_LatestFrameSource):
 
     def __init__(
         self, url: str, name: str = "cam1", detector=None, ocr=None,
-        lpr_crop: str = "full", expected_resolution=None,
+        lpr_crop: str = "full", expected_resolution=None, fallback_detector=None,
     ):
         self.name = name
         self.detector = detector
         self.ocr = ocr
+        self.fallback_detector = fallback_detector
         self.lpr_crop = lpr_crop
         self.inference_lock = PriorityInferenceLock()
         super().__init__(

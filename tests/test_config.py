@@ -123,6 +123,15 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MINIO_SECRET_KEY"):
             config.validate_runtime_config()
 
+    def test_configured_fallback_model_must_exist(self):
+        config = self.load_config(
+            'LPR_FALLBACK_DETECTOR_MODEL = "/missing/fallback.rknn"\n'
+            + _CREDENTIALS
+        )
+
+        with self.assertRaisesRegex(ValueError, "LPR_FALLBACK_DETECTOR_MODEL"):
+            config.validate_runtime_config()
+
     def test_environment_overrides_local_secrets(self):
         with mock.patch.dict(os.environ, {"WEIGHING_MQTT_PASSWORD": "env-pass"}):
             config = self.load_config(
