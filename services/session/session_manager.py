@@ -342,8 +342,9 @@ class SessionManager:
 
     def on_scale_reader_health(self, event, details, log_fn):
         """Contain a scale-input gap without restarting unrelated workers."""
+        metric_details = {key: value for key, value in details.items() if key != "event"}
         if event == "recovered":
-            log_metric(log_fn, "scale_reader_recovered", **details)
+            log_metric(log_fn, "scale_reader_recovered", **metric_details)
             return
         if event != "stalled":
             return
@@ -360,7 +361,7 @@ class SessionManager:
                 "scale_reader_last_valid_at": details.get("last_valid_timestamp"),
                 "scale_reader_reconnect_count": details.get("reconnect_count"),
             }
-            log_metric(log_fn, "scale_reader_stalled", **details)
+            log_metric(log_fn, "scale_reader_stalled", **metric_details)
             if self.session.session_active:
                 self._end_session("scale_reader_stalled", log_fn)
             log_fn("WARNING", "Scale lifecycle blocked until fresh empty dwell after reader stall")

@@ -1654,6 +1654,21 @@ class SessionWeightTests(unittest.TestCase):
         self.assertTrue(metadata["scale_data_gap"])
         self.assertTrue(manager._scale_recovery_blocked)
 
+    def test_scale_reader_health_payload_event_does_not_break_metric(self):
+        manager = SessionManager(Mock())
+        log = Mock()
+
+        manager.on_scale_reader_health(
+            "stalled",
+            {"event": "stalled", "last_valid_age_seconds": 31, "reconnect_count": 0},
+            log,
+        )
+
+        self.assertTrue(any(
+            call.args[0] == "METRIC" and '"event":"scale_reader_stalled"' in call.args[1]
+            for call in log.call_args_list
+        ))
+
     def test_scale_reader_stall_blocks_plate_until_fresh_empty_dwell(self):
         manager = SessionManager(Mock())
         log = Mock()
