@@ -1,5 +1,6 @@
 import unittest
 import sys
+import numpy as np
 from types import SimpleNamespace
 from unittest import mock
 
@@ -7,6 +8,7 @@ sys.modules.setdefault("cv2", mock.Mock())
 sys.modules.setdefault("minio", mock.Mock())
 sys.modules.setdefault("minio.error", mock.Mock())
 
+from services.capture import frame_source
 from services.capture.frame_source import CameraGrabber, set_log_fn
 from services.session.session_manager import classify_lpr_failure
 
@@ -54,6 +56,24 @@ class RtspResolutionTests(unittest.TestCase):
         self.assertEqual(resolution, (800, 448))
         self.assertFalse(accepted)
         self.assertTrue(any("resolution rejected" in message for _, message in self.logs))
+
+    def test_gst_unavailable_uses_opencv_capture_backend(self):
+        source = CameraGrabber("rtsp://camera/main")
+        source._grab_with_opencv = mock.Mock()
+
+        with mock.patch.object(frame_source, "_GST_AVAILABLE", False):
+            source._grab_loop()
+
+        source._grab_with_opencv.assert_called_once()
+
+    def test_green_frame_guard_rejects_decoder_corruption(self):
+        corrupt = np.zeros((128, 128, 3), dtype=np.uint8)
+        corrupt[:, :, 1] = 64
+        valid = np.zeros((128, 128, 3), dtype=np.uint8)
+        valid[:, :, 2] = 10
+
+        self.assertTrue(CameraGrabber._is_corrupt_green_frame(corrupt))
+        self.assertFalse(CameraGrabber._is_corrupt_green_frame(valid))
 
 
 if __name__ == "__main__":

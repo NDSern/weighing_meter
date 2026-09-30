@@ -166,6 +166,18 @@ class PlateTrackerResourceTests(unittest.TestCase):
         self.assertIs(tracker._image_frame, copied)
         frame.copy.assert_called_once()
 
+    def test_image_frame_returns_debug_metadata_without_changing_prefix(self):
+        frame = mock.Mock()
+        frame.copy.return_value = object()
+        tracker = PlateTracker()
+        debug = {"bbox": [1, 2, 3, 4]}
+
+        tracker.update_image("30A-12345", 0.9, frame, "cam1", observed_at=12.5, debug=debug)
+
+        image = tracker.get_image_frame("30A-12345")
+        self.assertEqual(image[1:4], ("30A-12345", "cam1", 12.5))
+        self.assertIs(image[4], debug)
+
     def test_confirmation_diagnostics_explain_missing_time_span(self):
         tracker = PlateTracker()
         tracker.add_observation("30A-123.45", 0.9, 200, 60, observed_at=10.0)

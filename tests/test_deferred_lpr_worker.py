@@ -65,8 +65,8 @@ class Tracker:
     def add_observation(self, *args, **kwargs):
         self.observations.append((args, kwargs))
 
-    def update_image(self, *args):
-        self.images.append(args)
+    def update_image(self, *args, **kwargs):
+        self.images.append((args, kwargs))
 
     def needs_undetectable(self):
         return self.unknown is None
@@ -198,6 +198,38 @@ class DeferredLprWorkerTests(unittest.TestCase):
             diagnostics["evidence"]["cam1"]["plate_detected_ocr_invalid_format"],
             "cam1-000001.jpg",
         )
+
+    def test_diagnostics_keep_detected_box_first_timing_and_tracker_debug(self):
+        diagnostics = DeferredLprWorker._new_diagnostics(["cam1-000001.jpg"])
+        camera = SimpleNamespace(name="cam1", detector="detector", ocr="ocr", lpr_crop="full")
+        region = {
+            "bbox": [1, 2, 10, 8], "obb": None, "det_conf": 0.9,
+            "class": "BSD", "crop_size": "9x6", "crop_img": Frame(),
+            "ocr_status": None,
+        }
+        tracker = Tracker()
+        worker = DeferredLprWorker(
+            FakeSpool([]), [camera], "chars", lambda *_args: True,
+            detect_regions_fn=mock.Mock(return_value=[region]),
+            recognize_regions_fn=mock.Mock(return_value=[{
+                "plate": "30A-12345", "crop_size": "9x6", "det_conf": 0.9,
+                "valid_candidates": [("30A-12345", 0.99)], "ocr_outcome": "valid",
+            }]),
+            tracker_factory=Tracker,
+            cv2_module=FakeCv2({"cam1-000001.jpg": Frame()}),
+        )
+
+        worker._process_frame(
+            "/tmp", "cam1-000001.jpg", tracker, 12.5, diagnostics=diagnostics,
+            session_started_at=10.0,
+        )
+
+        self.assertEqual(diagnostics["detected_boxes"]["cam1-000001.jpg"], [
+            {"bbox": [1, 2, 10, 8], "confidence": 0.9},
+        ])
+        self.assertEqual(diagnostics["first_plate_detected_delay_seconds"], 2.5)
+        self.assertEqual(diagnostics["first_valid_ocr_frame"], "cam1-000001.jpg")
+        self.assertEqual(tracker.images[-1][1]["debug"]["plate"], "30A-12345")
 
     def test_all_detector_failures_retry_then_dead_letter_with_classification(self):
         with tempfile.TemporaryDirectory() as root:

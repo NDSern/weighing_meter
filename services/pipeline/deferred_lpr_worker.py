@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timezone
 
 import cv2 as _cv2
 
@@ -255,6 +255,7 @@ class DeferredLprWorker:
     ):
         successful_frames = 0
         started_at = datetime.fromisoformat(job["started_at"]).timestamp()
+        session_started_at = started_at
         interval = float(job.get("capture_interval_seconds", 0.2))
         camera_indexes = {"cam1": 0, "cam3": 0}
         fallback_observed_at = {}
@@ -270,6 +271,11 @@ class DeferredLprWorker:
         diagnostics = self._new_diagnostics(selected_files)
         diagnostics["available_lpr_frames"] = sum(
             path.startswith(("cam1-", "cam3-")) for path in files
+        )
+        diagnostics["tracked_plate_frames"] = sum(
+            bool((frame_metadata.get(path) or {}).get("tracks"))
+            for path in files
+            if path.startswith(("cam1-", "cam3-"))
         )
         if not selected_files:
             for relative_path in files:
@@ -288,7 +294,7 @@ class DeferredLprWorker:
                     observed_at = datetime.fromisoformat(item_metadata["captured_at"]).timestamp()
                 if self._process_frame(
                     session_dir, relative_path, tracker, observed_at,
-                    item_metadata, diagnostics,
+                    item_metadata, diagnostics, session_started_at,
                 ):
                     successful_frames += 1
             except Exception as exc:
@@ -312,7 +318,7 @@ class DeferredLprWorker:
 
     def _process_frame(
         self, session_dir, relative_path, tracker, observed_at, metadata=None,
-        diagnostics=None,
+        diagnostics=None, session_started_at=None,
     ):
         if not isinstance(relative_path, str):
             raise ValueError("frame path is not a string")
@@ -358,6 +364,16 @@ class DeferredLprWorker:
                 self._count(diagnostics, camera_name, "crop_failures")
                 self._evidence(diagnostics, camera_name, "crop_failed", relative_path)
         self._count(diagnostics, camera_name, "detected_regions", len(regions))
+        if regions:
+            diagnostics.setdefault("detected_boxes", {})[relative_path] = [
+                {"bbox": region["bbox"], "confidence": region.get("det_conf", 0.0)}
+                for region in regions if len(region.get("bbox") or []) == 4
+            ]
+            self._evidence(diagnostics, camera_name, "plate_detected", relative_path)
+            self._record_first_timing(
+                diagnostics, "plate_detected", camera_name, relative_path,
+                observed_at, session_started_at,
+            )
         usable_regions = 0
         for region in regions:
             status = region.get("ocr_status")
@@ -385,6 +401,10 @@ class DeferredLprWorker:
                 count = max(1, len(plate.get("valid_candidates") or []))
                 self._count(diagnostics, camera_name, "ocr_valid_candidates", count)
                 self._evidence(diagnostics, camera_name, "valid", relative_path)
+                self._record_first_timing(
+                    diagnostics, "valid_ocr", camera_name, relative_path,
+                    observed_at, session_started_at,
+                )
             elif outcome == "blank":
                 self._count(diagnostics, camera_name, "ocr_blank")
                 self._evidence(diagnostics, camera_name, "plate_detected_ocr_blank", relative_path)
@@ -416,6 +436,7 @@ class DeferredLprWorker:
             "detector_miss_frames": 0,
             "detected_regions": 0,
             "tracked_regions": 0,
+            "tracked_plate_frames": 0,
             "crop_failures": 0,
             "crop_too_small": 0,
             "ocr_attempts": 0,
@@ -444,6 +465,26 @@ class DeferredLprWorker:
     def _evidence(diagnostics, camera_name, classification, relative_path):
         camera = diagnostics["evidence"].setdefault(camera_name, {})
         camera.setdefault(classification, relative_path)
+
+    @staticmethod
+    def _record_first_timing(
+        diagnostics, event, camera_name, relative_path, observed_at, session_started_at,
+    ):
+        if observed_at is None or session_started_at is None:
+            return
+        captured_at = datetime.fromtimestamp(observed_at, timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        key = "first_%s_captured_at" % event
+        current = diagnostics.get(key)
+        if current and datetime.fromisoformat(current).timestamp() <= observed_at:
+            return
+        diagnostics[key] = captured_at
+        diagnostics["first_%s_delay_seconds" % event] = round(
+            max(0.0, observed_at - session_started_at), 3,
+        )
+        diagnostics["first_%s_camera" % event] = camera_name
+        diagnostics["first_%s_frame" % event] = relative_path
 
     @staticmethod
     def _processing_failure_classification(diagnostics):
@@ -565,13 +606,13 @@ class DeferredLprWorker:
                     candidate, confidence, width, height,
                     source="candidate", observed_at=observed_at,
                 )
-                tracker.update_image(candidate, confidence, frame, camera_name, observed_at)
+                tracker.update_image(candidate, confidence, frame, camera_name, observed_at, debug=plate)
                 if best_plate is None:
                     best_plate, best_conf = candidate, confidence
         if has_unknown and best_plate is None and tracker.needs_undetectable():
             tracker.save_undetectable(frame.copy())
         if best_plate is not None:
-            tracker.update_image(best_plate, best_conf, frame, camera_name, observed_at)
+            tracker.update_image(best_plate, best_conf, frame, camera_name, observed_at, debug=plate)
 
     def _log(self, level, message):
         if self._log_fn:

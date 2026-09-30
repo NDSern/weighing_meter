@@ -39,7 +39,7 @@ class PlateTracker:
         self._image_camera = None  # camera name associated with saved frame
         self._image_conf = 0.0  # best det_conf for saved frame
         self._image_observed_at = None
-        self._plate_images = {}  # plate_text -> (frame, camera_name, det_conf, observed_at)
+        self._plate_images = {}  # plate_text -> (frame, camera_name, det_conf, observed_at, debug)
         self._max_plate_images = max_plate_images
         self._undetectable_frame = None  # first "unknown" frame for undetectable save
         self._undetectable_saved = False  # only save once per session
@@ -54,7 +54,7 @@ class PlateTracker:
         with self._lock:
             self._observations.append((plate_text, weight, source, ts))
 
-    def update_image(self, plate_text: str, det_conf: float, frame, camera_name: str, observed_at=None):
+    def update_image(self, plate_text: str, det_conf: float, frame, camera_name: str, observed_at=None, debug=None):
         """Store the best-confidence frame. Caller transfers ownership (no copy made)."""
         with self._lock:
             old = self._plate_images.get(plate_text)
@@ -67,6 +67,7 @@ class PlateTracker:
                 self._plate_images[plate_text] = (
                     stored_frame, camera_name, det_conf,
                     time.time() if observed_at is None else observed_at,
+                    debug,
                 )
             if det_conf > self._image_conf:
                 self._image_frame = stored_frame if stored_frame is not None else frame.copy()
@@ -179,7 +180,7 @@ class PlateTracker:
             return frame
 
     def get_image_frame(self, plate_text=None, aliases=None):
-        """Returns (frame, plate_text, camera_name). Transfers ownership — clears internal ref."""
+        """Returns frame, plate, camera, timestamp, and optional diagnostic metadata."""
         with self._lock:
             lookup_plates = []
             for candidate in [plate_text, *(aliases or [])]:
@@ -188,20 +189,21 @@ class PlateTracker:
 
             matched_plate = next((candidate for candidate in lookup_plates if candidate in self._plate_images), None)
             if matched_plate is not None:
-                frame, camera_name, _conf, observed_at = self._plate_images.pop(matched_plate)
+                frame, camera_name, _conf, observed_at, debug = self._plate_images.pop(matched_plate)
                 plate = matched_plate
             else:
                 frame = self._image_frame
                 plate = self._image_plate
                 camera_name = self._image_camera
                 observed_at = self._image_observed_at
+                debug = None
             self._image_frame = None
             self._image_plate = None
             self._image_camera = None
             self._image_conf = 0.0
             self._image_observed_at = None
             self._plate_images.clear()
-            return frame, plate, camera_name, observed_at
+            return frame, plate, camera_name, observed_at, debug
 
     def clear(self):
         with self._lock:

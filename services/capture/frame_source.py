@@ -6,11 +6,26 @@ import re
 from datetime import datetime, timezone
 
 import cv2
+import numpy as np
+
+try:
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    gi.require_version("GstVideo", "1.0")
+    from gi.repository import Gst, GstVideo
+
+    Gst.init(None)
+    _GST_AVAILABLE = True
+except (ImportError, ValueError):
+    Gst = GstVideo = None
+    _GST_AVAILABLE = False
 
 from config import DETECT_FPS, FRAME_GRAB_DRAIN_MAX, FRAME_GRAB_DRAIN_SECONDS, RECONNECT_DELAY
 from services.runtime.inference_lock import PriorityInferenceLock
 
 _log_fn = None
+_FRAME_PULL_INTERVAL_SECONDS = 0.2
 
 
 def set_log_fn(log_fn):
@@ -49,6 +64,7 @@ class _LatestFrameSource:
         if self._expected_resolution is not None and len(self._expected_resolution) != 2:
             raise ValueError("expected_resolution must contain width and height")
         self._running = False
+        self._stop_event = threading.Event()
         self._latest_frame = None
         self._latest_frame_id = 0
         self._latest_frame_captured_at = None
@@ -61,12 +77,14 @@ class _LatestFrameSource:
         if self._thread and self._thread.is_alive():
             return
         self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._grab_loop, daemon=True)
         self._thread.start()
         log("INFO", self._start_log)
 
     def stop(self, timeout=3.0):
         self._running = False
+        self._stop_event.set()
         with self._capture_lock:
             if self._capture is not None:
                 self._capture.release()
@@ -115,6 +133,12 @@ class _LatestFrameSource:
             self._latest_frame_captured_at = None
 
     def _grab_loop(self):
+        if _GST_AVAILABLE:
+            self._grab_with_gst()
+        else:
+            self._grab_with_opencv()
+
+    def _grab_with_opencv(self):
         interval = 1.0 / DETECT_FPS
         cam_frame_time = 1.0 / 25
         while self._running:
@@ -130,7 +154,7 @@ class _LatestFrameSource:
                 with self._capture_lock:
                     if self._capture is cap:
                         self._capture = None
-                time.sleep(RECONNECT_DELAY)
+                self._stop_event.wait(RECONNECT_DELAY)
                 continue
 
             log("INFO", self._connect_log)
@@ -174,7 +198,115 @@ class _LatestFrameSource:
                     self._capture = None
             self._clear_latest_frame()
             if self._running:
-                time.sleep(RECONNECT_DELAY)
+                self._stop_event.wait(RECONNECT_DELAY)
+
+    def _grab_with_gst(self):
+        while self._running:
+            self._clear_latest_frame()
+            try:
+                pipeline = self._create_gst_pipeline()
+            except Exception as exc:
+                log("WARNING", f"{self._open_fail_log} error={exc}")
+                self._stop_event.wait(RECONNECT_DELAY)
+                continue
+            sink = pipeline.get_by_name("sink")
+            bus = pipeline.get_bus()
+            try:
+                state = pipeline.set_state(Gst.State.PLAYING)
+                if state == Gst.StateChangeReturn.FAILURE:
+                    log("WARNING", f"{self._open_fail_log} Retry in {RECONNECT_DELAY}s...")
+                else:
+                    decoded_resolution = None
+                    connected = False
+                    next_pull = time.monotonic()
+                    while self._running:
+                        delay = next_pull - time.monotonic()
+                        if delay > 0 and self._stop_event.wait(delay):
+                            break
+                        sample = sink.emit("try-pull-sample", 100 * Gst.MSECOND)
+                        next_pull = max(next_pull + _FRAME_PULL_INTERVAL_SECONDS, time.monotonic())
+                        message = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+                        if message is not None:
+                            if message.type == Gst.MessageType.ERROR:
+                                error, _debug = message.parse_error()
+                                log("WARNING", f"{self._grab_fail_log} error={error.message}")
+                            else:
+                                log("WARNING", self._grab_fail_log)
+                            break
+                        if sample is None:
+                            continue
+                        frame = self._sample_to_frame(sample)
+                        if frame is None or self._is_corrupt_green_frame(frame):
+                            continue
+                        decoded_resolution, accepted = self._check_resolution(frame, decoded_resolution)
+                        if not accepted:
+                            break
+                        if not connected:
+                            log("INFO", self._connect_log)
+                            connected = True
+                        with self._frame_lock:
+                            self._latest_frame = frame
+                            self._latest_frame_id += 1
+                            self._latest_frame_captured_at = datetime.now(timezone.utc).isoformat(
+                                timespec="milliseconds"
+                            )
+            finally:
+                pipeline.set_state(Gst.State.NULL)
+            self._clear_latest_frame()
+            if self._running:
+                self._stop_event.wait(RECONNECT_DELAY)
+
+    def _create_gst_pipeline(self):
+        if Gst.ElementFactory.find("mppvideodec") is not None:
+            decoder = "mppvideodec format=NV12 discard-corrupted-frames=true ! video/x-raw,format=NV12 ! "
+        else:
+            decoder = (
+                "avdec_h265 max-threads=2 output-corrupt=false discard-corrupted-frames=true ! "
+                "videoconvert n-threads=2 ! video/x-raw,format=BGR ! "
+            )
+        pipeline = Gst.parse_launch(
+            "rtspsrc name=src protocols=tcp latency=500 drop-on-latency=true "
+            "buffer-mode=slave tcp-timeout=5000000 ! "
+            "application/x-rtp,media=video,encoding-name=H265 ! "
+            "rtph265depay ! h265parse ! " + decoder +
+            "appsink name=sink max-buffers=1 drop=true sync=false wait-on-eos=false"
+        )
+        pipeline.get_by_name("src").set_property("location", self._url)
+        return pipeline
+
+    @staticmethod
+    def _sample_to_frame(sample):
+        caps = sample.get_caps().get_structure(0)
+        width = caps.get_value("width")
+        height = caps.get_value("height")
+        pixel_format = caps.get_value("format")
+        buffer = sample.get_buffer()
+        data = buffer.extract_dup(0, buffer.get_size())
+        if pixel_format == "NV12":
+            metadata = GstVideo.buffer_get_video_meta(buffer)
+            if metadata is None or metadata.n_planes != 2:
+                return None
+            y_offset, uv_offset = metadata.offset[:2]
+            y_stride, uv_stride = metadata.stride[:2]
+            y_end = y_offset + (height - 1) * y_stride + width
+            uv_end = uv_offset + (height // 2 - 1) * uv_stride + width
+            if min(y_offset, uv_offset, y_stride, uv_stride) < 0 or max(y_end, uv_end) > len(data):
+                return None
+            y_plane = np.ndarray((height, width), dtype=np.uint8, buffer=data, offset=y_offset, strides=(y_stride, 1))
+            uv_plane = np.ndarray(
+                (height // 2, width // 2, 2), dtype=np.uint8, buffer=data,
+                offset=uv_offset, strides=(uv_stride, 2, 1),
+            )
+            return cv2.cvtColorTwoPlane(y_plane, uv_plane, cv2.COLOR_YUV2BGR_NV12)
+        if len(data) != width * height * 3:
+            return None
+        return np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3)).copy()
+
+    @staticmethod
+    def _is_corrupt_green_frame(frame):
+        sample = frame[::64, ::64]
+        blue, green, red = sample.mean(axis=(0, 1))
+        return blue < 2 and red < 2 and green > 20
 
     def _check_resolution(self, frame, previous):
         resolution = (int(frame.shape[1]), int(frame.shape[0]))
