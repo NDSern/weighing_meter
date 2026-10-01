@@ -305,8 +305,9 @@ class SessionManager:
         if self.session.session_active and frame.weight > WEIGHT_THRESHOLD:
             tracker_plate, tracker_score, _ = self.plate_tracker.get_confirmed_plate()
         plates_info = ""
-        if self.session.stable_weight is not None:
-            plates_info += f"  stable_wt={self.session.stable_weight:.{frame.decimal_pos}f}"
+        stable_weight = self.session.stable_weight
+        if stable_weight is not None:
+            plates_info += f"  stable_wt={stable_weight:.{frame.decimal_pos}f}"
         if tracker_plate:
             plates_info += f"  plate={tracker_plate}({tracker_score:.2f})"
         if self.session.stable_count > 0:
@@ -806,12 +807,13 @@ class SessionManager:
         if frame.weight > WEIGHT_THRESHOLD:
             log_fn("SIGNAL", f"{old_status} → {new_status}  wt={frame.weight:.{frame.decimal_pos}f} kg")
 
-        if (
-            not self.session.session_active
-            and new_status == "STABLE"
-            and frame.weight <= WEIGHT_THRESHOLD
-        ):
-            self.session.stable_weight = frame.weight
+        with self._lifecycle_lock:
+            if (
+                not self.session.session_active
+                and new_status == "STABLE"
+                and frame.weight <= WEIGHT_THRESHOLD
+            ):
+                self.session.stable_weight = frame.weight
 
     def _can_start_session(self, log_fn):
         if self._scale_recovery_blocked:

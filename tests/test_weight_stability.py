@@ -405,6 +405,56 @@ class SessionWeightTests(unittest.TestCase):
 
         self.assertEqual(manager.session.stable_weight, 105960)
 
+    def test_on_status_change_write_takes_the_lifecycle_lock(self):
+        entries = []
+        real_lock = self.manager._lifecycle_lock
+
+        class CountingRLock:
+            def __enter__(inner):
+                entries.append(1)
+                real_lock.acquire()
+                return inner
+
+            def __exit__(inner, *exc):
+                real_lock.release()
+                return False
+
+        self.manager.session.session_active = False
+        self.manager._lifecycle_lock = CountingRLock()
+        frame = self.stable_frame(50)
+
+        self.manager.on_status_change(frame, "UNSTABLE", "STABLE", Mock())
+
+        self.assertEqual(self.manager.session.stable_weight, 50)
+        self.assertGreaterEqual(len(entries), 1)
+
+    def test_on_weight_snapshots_stable_weight_once(self):
+        class FlakySession:
+            session_active = True
+            stable_count = 0
+
+            def __init__(self):
+                self.calls = 0
+
+            @property
+            def stable_weight(self):
+                # A concurrent session reset could clear the value between two
+                # reads; the callback must only read it once.
+                self.calls += 1
+                return 12.5 if self.calls == 1 else None
+
+        self.manager.vehicle_tracker = None
+        self.manager.plate_tracker.get_confirmed_plate = Mock(return_value=(None, 0.0, None))
+        self.manager.session = FlakySession()
+        frame = make_frame(39120)
+        log_fn = Mock()
+
+        self.manager.on_weight(frame, log_fn)  # must not raise
+
+        rendered = " ".join(str(call.args) for call in log_fn.call_args_list)
+        self.assertIn("stable_wt=12", rendered)
+        self.assertEqual(self.manager.session.calls, 1)
+
     def test_snapshot_rejects_sub_threshold_stable_candidate(self):
         manager = SessionManager(Mock())
         manager.session.session_active = True
