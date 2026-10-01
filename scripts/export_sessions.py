@@ -20,7 +20,6 @@ import argparse
 import json
 import sqlite3
 import sys
-from contextlib import closing
 
 # Minimal columns per user feedback: timestamp + plate + weight are the key
 # values; the rest are kept small but useful for sorting/filtering.
