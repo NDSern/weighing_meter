@@ -513,6 +513,30 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         self.assertEqual(human, [(">>> SENT <<<", "plate=14C-017.80 wt=34780kg id=12345678")])
         self.assertEqual(len([entry for entry in logs if entry[0] == "METRIC"]), 1)
 
+    def test_publish_success_survives_non_numeric_weight(self):
+        event_id = "abcdef1234567890"
+        module._pending_events[event_id] = {
+            "id": event_id,
+            "created_at": module.datetime.now().isoformat(timespec="seconds"),
+            "image_paths": [],
+            "session_result": {
+                "official_plate": "14C-017.80",
+                "stable_weight": None,
+            },
+        }
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = True
+        logs = []
+
+        with patch.object(module, "_mqtt_svc", mqtt), patch.object(
+            module, "_log_fn", lambda level, message: logs.append((level, message))
+        ):
+            PublishOutbox._publish_event(event_id)
+
+        human = [entry for entry in logs if entry[0] != "METRIC"]
+        self.assertEqual(human, [(">>> SENT <<<", "plate=14C-017.80 wt=?kg id=abcdef12")])
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+
     def test_publish_failure_keeps_pending_event_and_requeues(self):
         event_id = PublishOutbox.enqueue({
             "offline_event_id": "mqtt-failure",

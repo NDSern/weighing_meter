@@ -253,10 +253,12 @@ class PublishOutbox:
                 log("CRITICAL", f"Publish ack received but completion write failed id={event_id}: {exc}")
             PublishOutbox._mark_published(event_id)
             result = event["session_result"]
+            weight = result.get("stable_weight")
+            weight_text = f"{weight:g}" if isinstance(weight, (int, float)) else "?"
             log(
                 ">>> SENT <<<",
                 f"plate={result.get('official_plate')} "
-                f"wt={result.get('stable_weight'):g}kg id={event_id[:8]}",
+                f"wt={weight_text}kg id={event_id[:8]}",
             )
             log("METRIC", json.dumps(
                 {"event": "session_publish_acknowledged", "id": event_id},
