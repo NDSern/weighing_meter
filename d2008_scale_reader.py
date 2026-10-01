@@ -468,6 +468,13 @@ class D2008Reader:
                 except (serial.SerialException, TypeError, OSError) as exc:
                     self.last_error = str(exc)
                     self._mark_stalled(str(exc))
+                except Exception as exc:
+                    # An unexpected error must never kill the reader silently:
+                    # surface it as a failure and let the out/ health path see it.
+                    self.last_error = f"unexpected: {exc}"
+                    self.state = "failed"
+                    self._emit_health("failed", reason=str(exc))
+                    print(f"[ERROR] Scale reader failed: {exc}")
                 finally:
                     if self._serial and self._serial.is_open:
                         self._serial.close()
@@ -595,7 +602,10 @@ class D2008Reader:
 
         # Fire on every frame for session logic (stable counting etc.)
         if self.on_frame:
-            self.on_frame(frame)
+            try:
+                self.on_frame(frame)
+            except Exception as exc:
+                print(f"[ERROR] Frame callback failed: {exc}")
 
         # Detect status transitions — fires on every change
         if frame.status != self._prev_status:
@@ -620,8 +630,11 @@ class D2008Reader:
 
         # Ghi DB theo interval
         if frame.checksum_ok and (now - self._last_log + 1e-9 >= self.log_interval):
-            self._db.save(frame)
-            self._last_log = now
+            try:
+                self._db.save(frame)
+                self._last_log = now
+            except Exception as exc:
+                print(f"[ERROR] Scale DB save failed: {exc}")
 
 
 # ─────────────────────────────────────────────

@@ -262,6 +262,28 @@ class WeightStabilityTests(unittest.TestCase):
         self.assertEqual(next_frame.status, "UNSTABLE")
         self.assertEqual(next_frame.same_weight_count, 1)
 
+    def test_frame_callback_error_does_not_escape_handle_frame(self):
+        # A raising session callback must not propagate out of _handle_frame:
+        # an escaped exception kills the reader thread permanently.
+        self.reader.on_frame = Mock(side_effect=RuntimeError("session callback boom"))
+
+        frame = make_frame(39120)
+        frame.status = self.reader._get_status(frame)
+
+        self.reader._handle_frame(frame)  # must not raise
+
+        self.reader.on_frame.assert_called_once_with(frame)
+        self.assertEqual(self.reader.latest, frame)
+
+    def test_db_save_error_does_not_escape_handle_frame(self):
+        self.reader._db.save = Mock(side_effect=RuntimeError("db locked"))
+        self.reader.log_interval = 0
+
+        frame = make_frame(39120)
+        frame.status = self.reader._get_status(frame)
+
+        self.reader._handle_frame(frame)  # must not raise
+
 
 class SessionWeightTests(unittest.TestCase):
     def setUp(self):
