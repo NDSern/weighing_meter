@@ -12,6 +12,7 @@ from datetime import datetime
 import cv2
 from minio import Minio
 from minio.error import S3Error
+from urllib3 import PoolManager, Timeout
 
 from config import (
     MINIO_ACCESS_KEY,
@@ -29,6 +30,8 @@ from services.storage.dead_letter import append_dead_letter, is_expired
 UPLOAD_QUEUE_SIZE = 100
 MAX_RETRY_DELAY_SECONDS = 300.0
 MAX_RETRY_EXPONENT = 8
+MINIO_CONNECT_TIMEOUT_SECONDS = 5.0
+MINIO_READ_TIMEOUT_SECONDS = 30.0
 
 _log_fn = None
 
@@ -148,6 +151,12 @@ class ImageSaveWorker:
                     secret_key=MINIO_SECRET_KEY,
                     secure=MINIO_SECURE,
                     region=MINIO_REGION,
+                    http_client=PoolManager(
+                        timeout=Timeout(
+                            connect=MINIO_CONNECT_TIMEOUT_SECONDS,
+                            read=MINIO_READ_TIMEOUT_SECONDS,
+                        )
+                    ),
                 )
             return _minio
 

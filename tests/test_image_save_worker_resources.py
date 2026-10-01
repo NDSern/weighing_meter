@@ -92,16 +92,22 @@ class ImageSaveWorkerResourceTests(unittest.TestCase):
         client = mock.Mock()
         with mock.patch.object(module, "_minio", None), mock.patch.object(
             module, "Minio", return_value=client,
-        ) as constructor:
+        ) as constructor, mock.patch.object(module, "PoolManager") as pool:
             self.assertIs(ImageSaveWorker._get_minio(), client)
             self.assertIs(ImageSaveWorker._get_minio(), client)
 
+        http_client = constructor.call_args.kwargs["http_client"]
+        self.assertIs(http_client, pool.return_value)
+        timeout = pool.call_args.kwargs["timeout"]
+        self.assertEqual(timeout.connect_timeout, module.MINIO_CONNECT_TIMEOUT_SECONDS)
+        self.assertEqual(timeout.read_timeout, module.MINIO_READ_TIMEOUT_SECONDS)
         constructor.assert_called_once_with(
             module.MINIO_ENDPOINT,
             access_key=module.MINIO_ACCESS_KEY,
             secret_key=module.MINIO_SECRET_KEY,
             secure=module.MINIO_SECURE,
             region=module.MINIO_REGION,
+            http_client=http_client,
         )
 
 
