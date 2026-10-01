@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import subprocess
-import threading
 import time
 from datetime import date, datetime, timedelta
 
@@ -24,6 +23,7 @@ from config import (
     MQTT_DEAD_LETTER_RETENTION_DAYS,
     SERVICE_DIR,
 )
+from services.runtime.background_worker import BackgroundWorker
 
 CLEANED_SUFFIX = "--Cleaned"
 PRESSURE_CLEANUP_GRACE_SECONDS = 60 * 60
@@ -31,45 +31,21 @@ COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[_-]")
 SEPARATED_DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_](\d{2})[-_](\d{2})(?!\d)")
 
 
-class ImageRetentionCleaner:
+class ImageRetentionCleaner(BackgroundWorker):
     """Deletes old image files from configured roots on a low-frequency schedule."""
+
+    worker_name = "ImageRetentionCleaner"
+    error_label = "Image retention failed"
 
     def __init__(
         self, roots, retention_days, check_interval_seconds, extensions, log_fn=None,
         pressure_free_bytes=None,
     ):
+        super().__init__(check_interval_seconds, log_fn)
         self.roots = list(roots)
         self.retention_days = retention_days
-        self.check_interval_seconds = check_interval_seconds
         self.extensions = {ext.lower() for ext in extensions}
-        self.log_fn = log_fn
         self.pressure_free_bytes = pressure_free_bytes
-        self._stop_event = threading.Event()
-        self._thread = None
-
-    def _log(self, level, msg):
-        if self.log_fn:
-            self.log_fn(level, msg)
-
-    def start(self):
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self._log("INFO", "ImageRetentionCleaner started")
-
-    def stop(self, timeout=3.0):
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-        self._log("INFO", "ImageRetentionCleaner stopped")
-
-    def _run_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception as exc:
-                self._log("ERROR", f"Image retention failed: {exc}")
-            self._stop_event.wait(self.check_interval_seconds)
 
     def _is_image_name(self, filename):
         return os.path.splitext(filename)[1].lower() in self.extensions
@@ -323,41 +299,17 @@ class ImageRetentionCleaner:
         }
 
 
-class VerifiedMinioCacheCleaner:
+class VerifiedMinioCacheCleaner(BackgroundWorker):
     """Evict published local images only after exact MinIO verification."""
 
+    worker_name = "VerifiedMinioCacheCleaner"
+    error_label = "MinIO cache cleanup failed"
+
     def __init__(self, root, retention_days, check_interval_seconds, client_factory, log_fn=None):
+        super().__init__(check_interval_seconds, log_fn)
         self.root = os.path.abspath(root)
         self.retention_days = retention_days
-        self.check_interval_seconds = check_interval_seconds
         self.client_factory = client_factory
-        self.log_fn = log_fn
-        self._stop_event = threading.Event()
-        self._thread = None
-
-    def _log(self, level, msg):
-        if self.log_fn:
-            self.log_fn(level, msg)
-
-    def start(self):
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self._log("INFO", "VerifiedMinioCacheCleaner started")
-
-    def stop(self, timeout=3.0):
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-        self._log("INFO", "VerifiedMinioCacheCleaner stopped")
-
-    def _run_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception as exc:
-                self._log("ERROR", f"MinIO cache cleanup failed: {exc}")
-            self._stop_event.wait(self.check_interval_seconds)
 
     @staticmethod
     def _md5(path):
@@ -436,41 +388,17 @@ class VerifiedMinioCacheCleaner:
                 "remote_mismatch": remote_mismatch, "reclaimed": reclaimed}
 
 
-class DiagnosticArchiveCleaner:
+class DiagnosticArchiveCleaner(BackgroundWorker):
     """Archive completed diagnostic days, then expire their archives."""
 
+    worker_name = "DiagnosticArchiveCleaner"
+    error_label = "Diagnostic archive cleanup failed"
+
     def __init__(self, roots, archive_after_days, retention_days, check_interval_seconds, log_fn=None):
+        super().__init__(check_interval_seconds, log_fn)
         self.roots = list(roots)
         self.archive_after_days = archive_after_days
         self.retention_days = retention_days
-        self.check_interval_seconds = check_interval_seconds
-        self.log_fn = log_fn
-        self._stop_event = threading.Event()
-        self._thread = None
-
-    def _log(self, level, msg):
-        if self.log_fn:
-            self.log_fn(level, msg)
-
-    def start(self):
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self._log("INFO", "DiagnosticArchiveCleaner started")
-
-    def stop(self, timeout=3.0):
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-        self._log("INFO", "DiagnosticArchiveCleaner stopped")
-
-    def _run_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception as exc:
-                self._log("ERROR", f"Diagnostic archive cleanup failed: {exc}")
-            self._stop_event.wait(self.check_interval_seconds)
 
     @staticmethod
     def _day_paths(root):
@@ -556,36 +484,15 @@ class DiagnosticArchiveCleaner:
         return {"archived": archived, "archive_deleted": archive_deleted, "failed": failed}
 
 
-class StorageMaintenance:
+class StorageMaintenance(BackgroundWorker):
     """Apply age retention to logs and dead-letter records."""
 
+    worker_name = "StorageMaintenance"
+    error_label = "Storage maintenance failed"
+    announce_lifecycle = False
+
     def __init__(self, check_interval_seconds, log_fn=None):
-        self.check_interval_seconds = check_interval_seconds
-        self.log_fn = log_fn
-        self._stop_event = threading.Event()
-        self._thread = None
-
-    def _log(self, level, msg):
-        if self.log_fn:
-            self.log_fn(level, msg)
-
-    def start(self):
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self, timeout=3.0):
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-
-    def _run_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception as exc:
-                self._log("ERROR", f"Storage maintenance failed: {exc}")
-            self._stop_event.wait(self.check_interval_seconds)
+        super().__init__(check_interval_seconds, log_fn)
 
     @staticmethod
     def _remove_older_than(root, retention_days, predicate, now):
