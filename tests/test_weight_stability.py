@@ -2097,6 +2097,45 @@ class ReaderFailureTests(unittest.TestCase):
         self.assertNotEqual(reader.state, "failed")
         self.assertEqual(reader._open_failures, 0)
 
+    def test_stop_closes_database_even_when_thread_will_not_join(self):
+        reader = self._reader()
+        thread = Mock()
+        thread.is_alive.return_value = True
+        reader._thread = thread
+        reader._db = Mock()
+
+        reader.stop()
+
+        reader._db.close.assert_called_once_with()
+        thread.join.assert_called_once_with(timeout=3)
+
+    def test_reconnect_resets_stability_history_and_parser(self):
+        import d2008_scale_reader as module
+
+        reader = self._reader(max_open_attempts=1)
+        stale_parser = reader._parser
+        reader._recent_weights.append(1000)
+        reader._same_weight = 1000
+        reader._same_weight_count = 4
+        fake = Mock()
+        fake.is_open = True
+        fake.in_waiting = 0
+
+        def boom(*_args, **_kwargs):
+            reader._running = False
+            raise OSError("read failed")
+
+        fake.read.side_effect = boom
+
+        with unittest.mock.patch.object(module.serial, "SerialException", OSError), \
+                unittest.mock.patch.object(module.serial, "Serial", return_value=fake):
+            reader._run()
+
+        self.assertIsNot(reader._parser, stale_parser)
+        self.assertEqual(len(reader._recent_weights), 0)
+        self.assertIsNone(reader._same_weight)
+        self.assertEqual(reader._same_weight_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

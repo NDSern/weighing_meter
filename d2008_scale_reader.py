@@ -415,14 +415,15 @@ class D2008Reader:
         """Dừng đọc."""
         self._running = False
         self._stop_event.set()
-        if self._serial and self._serial.is_open:
-            self._serial.close()
-        if self._thread:
-            self._thread.join(timeout=3)
-            if self._thread.is_alive():
-                print("[WARNING] Reader thread did not stop; database left open")
-                return
-        self._db.close()
+        try:
+            if self._serial and self._serial.is_open:
+                self._serial.close()
+            if self._thread:
+                self._thread.join(timeout=3)
+                if self._thread.is_alive():
+                    print("[WARNING] Reader thread did not stop within 3s")
+        finally:
+            self._db.close()
         print("[READER] Đã dừng.")
 
     def _run(self):
@@ -449,6 +450,10 @@ class D2008Reader:
                     )
                     opened = True
                     self._open_failures = 0
+                    # Discard pre-gap samples so a reconnect cannot splice
+                    # stale weights onto the new serial stream.
+                    self._reset_stability_history()
+                    self._parser = D2008Parser()
                     print(f"[READER] Kết nối thành công: {self.port}")
                     self.state = "running"
                     self._last_valid_monotonic = time.monotonic()
