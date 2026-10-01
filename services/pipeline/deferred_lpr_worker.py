@@ -298,6 +298,9 @@ class DeferredLprWorker:
                 ):
                     successful_frames += 1
             except Exception as exc:
+                camera_name = relative_path.split("-", 1)[0]
+                self._count(diagnostics, camera_name, "frame_errors")
+                self._evidence(diagnostics, camera_name, "frame_error", relative_path)
                 self._log(
                     "ERROR",
                     "Deferred LPR frame failed [%s/%s]: %s"
@@ -430,6 +433,7 @@ class DeferredLprWorker:
             "selected_frames": len(selected_files),
             "processed_frames": 0,
             "jpeg_decode_errors": 0,
+            "frame_errors": 0,
             "detector_attempts": 0,
             "detector_successes": 0,
             "detector_errors": 0,
@@ -494,6 +498,8 @@ class DeferredLprWorker:
             return "detector_inference_error"
         if diagnostics.get("jpeg_decode_errors", 0):
             return "jpeg_decode_error"
+        if diagnostics.get("frame_errors", 0):
+            return "frame_processing_error"
         return "session_processing_error"
 
     @staticmethod

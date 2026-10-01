@@ -11,6 +11,20 @@ from datetime import datetime, timezone
 
 import cv2
 
+_log_fn = None
+
+
+def set_log_fn(log_fn):
+    """Set the logging function used by the sampler loop."""
+    global _log_fn
+    _log_fn = log_fn
+
+
+def log(level, message):
+    """Log using the configured log function."""
+    if _log_fn:
+        _log_fn(level, message)
+
 
 class SessionFrameSpool:
     """Periodically persist latest camera frames and queue finalized sessions."""
@@ -272,17 +286,20 @@ class SessionFrameSpool:
             delay = max(0.0, next_capture - time.monotonic())
             if self._stop_event.wait(delay):
                 break
-            with self._lock:
-                if self._active is not None:
-                    for camera, grabber in self._grabbers.items():
-                        frame, frame_id, captured_at = self._read_frame(grabber)
-                        if frame is not None:
-                            self._save_frame_locked(
-                                camera, frame, "sample", frame_id, captured_at,
-                            )
-            if time.monotonic() >= next_cleanup:
-                self._resume_cleanup()
-                next_cleanup = time.monotonic() + 10.0
+            try:
+                with self._lock:
+                    if self._active is not None:
+                        for camera, grabber in self._grabbers.items():
+                            frame, frame_id, captured_at = self._read_frame(grabber)
+                            if frame is not None:
+                                self._save_frame_locked(
+                                    camera, frame, "sample", frame_id, captured_at,
+                                )
+                if time.monotonic() >= next_cleanup:
+                    self._resume_cleanup()
+                    next_cleanup = time.monotonic() + 10.0
+            except Exception as exc:
+                log("ERROR", "Frame spool capture loop failed: %s" % exc)
             next_capture = max(next_capture + self._interval, time.monotonic())
 
     def _resume_cleanup(self):

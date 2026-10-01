@@ -18,7 +18,7 @@ except ModuleNotFoundError:
     sys.modules.setdefault("cv2", cv2)
     np = None
 
-from services.capture.session_frame_spool import SessionFrameSpool
+from services.capture.session_frame_spool import SessionFrameSpool, set_log_fn
 
 
 class Grabber:
@@ -217,6 +217,24 @@ class SessionFrameSpoolTests(unittest.TestCase):
             for call in advise.call_args_list:
                 _fd, offset, length, advice = call.args
                 self.assertEqual((offset, length, advice), (0, 0, os.POSIX_FADV_DONTNEED))
+
+    def test_capture_loop_survives_read_errors(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            errors = []
+            set_log_fn(lambda level, message: errors.append((level, message)))
+            self.addCleanup(set_log_fn, None)
+            spool._read_frame = mock.Mock(side_effect=RuntimeError("read boom"))
+            spool.start()
+            spool.begin_session("resilient")
+            deadline = time.monotonic() + 2.0
+            while not errors and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(errors, "capture loop did not log its read error")
+            self.assertEqual(errors[0][0], "ERROR")
+            self.assertIn("read boom", errors[0][1])
+            self.assertTrue(spool._thread.is_alive())
+            self.assertTrue(spool.stop(1))
 
     def test_rejects_overlapping_or_unsafe_sessions(self):
         with tempfile.TemporaryDirectory() as root:

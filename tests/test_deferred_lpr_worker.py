@@ -410,6 +410,36 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertEqual(seen, [good])
             self.assertEqual(len(callbacks), 1)
 
+    def test_frame_failure_is_counted_in_diagnostics(self):
+        with tempfile.TemporaryDirectory() as root:
+            files = ["cam1-bad.jpg", "cam1-good.jpg"]
+            path = self.make_manifest(root, "counters", files)
+            captured = []
+            worker = DeferredLprWorker(
+                FakeSpool([path]),
+                [SimpleNamespace(name="cam1", detector=1, ocr=2, lpr_crop="full")],
+                [], lambda metadata, tracker: captured.append(metadata),
+                detect_regions_fn=lambda frame, detector: [],
+                recognize_regions_fn=lambda *args, **kwargs: [],
+                tracker_factory=Tracker,
+                cv2_module=FakeCv2({"cam1-good.jpg": Frame()}),
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: captured))
+            self.assertTrue(worker.stop())
+            diagnostics = captured[0]["lpr_diagnostics"]
+            self.assertEqual(diagnostics["frame_errors"], 1)
+            self.assertEqual(diagnostics["cameras"]["cam1"]["frame_errors"], 1)
+            self.assertEqual(
+                diagnostics["evidence"]["cam1"]["frame_error"], "cam1-bad.jpg"
+            )
+
+    def test_frame_processing_failure_classification(self):
+        self.assertEqual(
+            DeferredLprWorker._processing_failure_classification({"frame_errors": 1}),
+            "frame_processing_error",
+        )
+
     def test_callback_failure_blocks_later_jobs_to_preserve_fifo(self):
         with tempfile.TemporaryDirectory() as root:
             first = self.make_manifest(root, "first", [], {"id": 1})

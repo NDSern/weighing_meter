@@ -104,6 +104,7 @@ def configure_module_logging(log):
     """Install the process log function into the imported service modules."""
     from services.capture.detect_coordinator import set_log_fn as set_detect_coordinator_log
     from services.capture.frame_source import set_log_fn as set_frame_source_log
+    from services.capture.session_frame_spool import set_log_fn as set_frame_spool_log
     from services.storage.image_save_worker import set_log_fn as set_image_save_log
     from services.session.session_manager import set_log_fn as set_session_log
 
@@ -111,6 +112,7 @@ def configure_module_logging(log):
     set_image_save_log(log)
     set_session_log(log)
     set_frame_source_log(log)
+    set_frame_spool_log(log)
 
 
 class ServiceResources:
