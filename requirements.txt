@@ -1,7 +1,7 @@
 minio
 numpy
 opencv-python-headless
-paho-mqtt
+paho-mqtt==2.1.0
 pyserial
 python-dotenv
 requests

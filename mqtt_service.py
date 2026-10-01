@@ -108,6 +108,7 @@ class MqttService:
         self._lock = threading.Lock()
 
         self._client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=MQTT_CLIENT_ID,
             protocol=mqtt.MQTTv311,
             clean_session=True,
@@ -117,20 +118,25 @@ class MqttService:
         self._client.on_disconnect = self._on_disconnect
         self._client.on_publish = self._on_publish
 
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
+    @staticmethod
+    def _is_success(reason_code) -> bool:
+        """True when a paho v2 reason code reports success (0)."""
+        return getattr(reason_code, "value", reason_code) == 0
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if self._is_success(reason_code):
             self._connected = True
             self._log("INFO", f"Connected to MQTT broker {MQTT_HOST}:{MQTT_PORT}")
         else:
             self._connected = False
-            self._log("ERROR", f"MQTT connect failed (rc={rc})")
+            self._log("ERROR", f"MQTT connect failed (rc={reason_code})")
 
-    def _on_disconnect(self, client, userdata, rc):
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         self._connected = False
-        if rc != 0:
-            self._log("WARNING", f"MQTT disconnected unexpectedly (rc={rc}), will reconnect...")
+        if not self._is_success(reason_code):
+            self._log("WARNING", f"MQTT disconnected unexpectedly (rc={reason_code}), will reconnect...")
 
-    def _on_publish(self, client, userdata, mid):
+    def _on_publish(self, client, userdata, mid, reason_code, properties):
         pass
 
     def start(self):

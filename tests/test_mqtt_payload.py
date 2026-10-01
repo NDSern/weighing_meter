@@ -208,5 +208,37 @@ class MqttPayloadTests(unittest.TestCase):
             })
 
 
+class MqttCallbackApiTests(unittest.TestCase):
+    def _service(self):
+        with patch("mqtt_service.mqtt") as fake:
+            fake.CallbackAPIVersion.VERSION2 = "v2"
+            service = MqttService()
+        return service, fake
+
+    def test_client_is_built_with_callback_api_v2(self):
+        _, fake = self._service()
+        self.assertEqual(fake.Client.call_args.kwargs["callback_api_version"], "v2")
+
+    def test_v2_connect_callback_marks_connected_only_on_success(self):
+        service, _ = self._service()
+        service._on_connect(Mock(), None, {}, 0, Mock())
+        self.assertTrue(service.connected)
+        service._on_connect(Mock(), None, {}, 5, Mock())
+        self.assertFalse(service.connected)
+
+    def test_v2_disconnect_callback_clears_connected(self):
+        service, _ = self._service()
+        service._connected = True
+        service._on_disconnect(Mock(), None, Mock(), 0, Mock())
+        self.assertFalse(service.connected)
+
+    def test_reason_code_objects_are_understood(self):
+        service, _ = self._service()
+        reason = Mock()
+        reason.value = 0
+        service._on_connect(Mock(), None, {}, reason, Mock())
+        self.assertTrue(service.connected)
+
+
 if __name__ == "__main__":
     unittest.main()
