@@ -24,11 +24,15 @@ from config import (
     SERVICE_DIR,
 )
 from services.runtime.background_worker import BackgroundWorker
+from services.storage.dated_tree import (
+    date_from_filename,
+    date_from_relative_path,
+    iter_dirs_deepest_first,
+    make_date,
+)
 
 CLEANED_SUFFIX = "--Cleaned"
 PRESSURE_CLEANUP_GRACE_SECONDS = 60 * 60
-COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[_-]")
-SEPARATED_DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_](\d{2})[-_](\d{2})(?!\d)")
 
 
 class ImageRetentionCleaner(BackgroundWorker):
@@ -58,40 +62,17 @@ class ImageRetentionCleaner(BackgroundWorker):
         return False
 
     def _iter_dirs_deepest_first(self, root):
-        dirs = []
-        for dirpath, dirnames, _ in os.walk(root, followlinks=False):
-            dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
-            for dirname in dirnames:
-                dirs.append(os.path.join(dirpath, dirname))
-        dirs.sort(key=lambda path: path.count(os.sep), reverse=True)
-        return dirs
+        return iter_dirs_deepest_first(root)
 
     @staticmethod
     def _make_date(year, month, day):
-        try:
-            return date(int(year), int(month), int(day))
-        except ValueError:
-            return None
+        return make_date(year, month, day)
 
     def _date_from_path(self, fpath, root):
-        rel = os.path.relpath(fpath, root)
-        parts = rel.split(os.sep)
-        if len(parts) < 4:
-            return None
-        year, month, day = parts[:3]
-        if not (year.isdigit() and month.isdigit() and day.isdigit()):
-            return None
-        return self._make_date(year, month, day)
+        return date_from_relative_path(os.path.relpath(fpath, root))
 
     def _date_from_filename(self, filename):
-        for regex in (COMPACT_DATE_RE, SEPARATED_DATE_RE):
-            match = regex.search(filename)
-            if not match:
-                continue
-            parsed = self._make_date(*match.groups())
-            if parsed:
-                return parsed
-        return None
+        return date_from_filename(filename)
 
     def _image_age_source(self, fpath, root, filename, stat):
         parsed = self._date_from_path(fpath, root)
@@ -321,10 +302,7 @@ class VerifiedMinioCacheCleaner(BackgroundWorker):
 
     @staticmethod
     def _date_from_relative_path(relative_path):
-        parts = relative_path.split(os.sep)
-        if len(parts) < 4:
-            return None
-        return ImageRetentionCleaner._make_date(*parts[:3])
+        return date_from_relative_path(relative_path)
 
     @staticmethod
     def _pending_image_paths():
@@ -413,11 +391,11 @@ class DiagnosticArchiveCleaner(BackgroundWorker):
                 for name in os.listdir(month_path):
                     path = os.path.join(month_path, name)
                     if name.endswith(".tar.zst"):
-                        day = ImageRetentionCleaner._make_date(year, month, name[:-8])
+                        day = make_date(year, month, name[:-8])
                         if day is not None and os.path.isfile(path) and not os.path.islink(path):
                             yield day, path, True
                     elif os.path.isdir(path) and not os.path.islink(path):
-                        day = ImageRetentionCleaner._make_date(year, month, name)
+                        day = make_date(year, month, name)
                         if day is not None:
                             yield day, path, False
 
