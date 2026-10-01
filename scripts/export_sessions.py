@@ -125,7 +125,7 @@ def _record_to_row(entry):
             if local.tzinfo is None:
                 local = local.replace(tzinfo=timezone.utc)
             local = local.astimezone(LOCAL_TZ)
-            day = local.strftime("%d/%m")
+            day = local.strftime("%d/%m/%Y")
             clock = local.strftime("%H:%M:%S")
         except ValueError:
             day = started[:10]
