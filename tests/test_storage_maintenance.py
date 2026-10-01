@@ -6,7 +6,7 @@ import threading
 import unittest
 import tarfile
 import importlib.util
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from services.runtime.background_worker import BackgroundWorker
@@ -31,6 +31,16 @@ class DeadLetterTests(unittest.TestCase):
 
         self.assertTrue(is_expired(created, 30, now=now))
         self.assertFalse(is_expired((now - timedelta(days=29)).isoformat(), 30, now=now))
+
+    def test_expiry_tolerates_aware_and_naive_timestamps(self):
+        now = datetime(2026, 7, 14, 12, 0, 0)
+
+        aware_old = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        aware_recent = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertTrue(is_expired(aware_old.isoformat(), 30, now=now))
+        self.assertFalse(is_expired(aware_recent.isoformat(), 30, now=now))
+        self.assertTrue(is_expired(aware_old.isoformat(), 30, now=now.replace(tzinfo=timezone.utc)))
+        self.assertFalse(is_expired(aware_recent.isoformat(), 30, now=now.replace(tzinfo=timezone.utc)))
 
 
 class StorageMaintenanceTests(unittest.TestCase):

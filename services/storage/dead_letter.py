@@ -32,6 +32,12 @@ def is_expired(created_at, retention_days, now=None):
         return False
     try:
         created = datetime.fromisoformat(created_at)
+        reference = now or datetime.now()
+        # Tolerate mixed aware/naive timestamps instead of letting the
+        # subtraction raise (which would keep the entry alive forever).
+        if (created.tzinfo is None) != (reference.tzinfo is None):
+            created = created.replace(tzinfo=None)
+            reference = reference.replace(tzinfo=None)
+        return reference - created >= timedelta(days=retention_days)
     except (TypeError, ValueError):
         return False
-    return (now or datetime.now()) - created >= timedelta(days=retention_days)
