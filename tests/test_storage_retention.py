@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import unittest
@@ -50,6 +51,18 @@ class CapturePathTests(unittest.TestCase):
         self.assertIn("cam1", paths)
         self.assertIn("cam3", paths)
         self.assertEqual([key for key in paths if key.startswith("unchosen")], [])
+
+    def test_plate_is_sanitized_in_capture_filenames(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            result_builder, "CAPTURE_DIR", tmp
+        ):
+            paths = result_builder.prepare_capture_paths(
+                datetime.now(), "../../etc/passwd", "sid", capture_dir=tmp
+            )
+        fpath = paths["front"][0]
+        self.assertTrue(fpath.startswith(tmp + os.sep))
+        self.assertNotIn("..", os.path.basename(fpath))
+        self.assertNotIn("/", os.path.basename(fpath))
 
 
 if __name__ == "__main__":

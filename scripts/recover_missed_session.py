@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -39,6 +40,14 @@ from config import (  # noqa: E402
 HP1_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"
 HP2_ID = "9aa29a10-6605-47dd-9460-970d66c3d1c3"
 HP2_CASE_ID = "9c3dfb52707d4344a7baee4fdaf6ffed"
+
+_UNSAFE_PLATE_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _safe_plate(plate):
+    """Return a filesystem-safe token for a case plate read from the allowlist."""
+    return _UNSAFE_PLATE_CHARS.sub("_", str(plate or "none"))
+
 
 RECOVERY_CASES = {
     "c9f95576942341a28ee7e93812f26061": {
@@ -351,7 +360,7 @@ class MissedSessionRecovery:
             object_key = None
             photos = []
         else:
-            filename = f"{session_id}_{case['plate']}_photo-{camera}.jpg"
+            filename = f"{session_id}_{_safe_plate(case['plate'])}_photo-{camera}.jpg"
             destination = self.capture_dir / local_time.strftime(
                 "%Y"
             ) / local_time.strftime("%m") / local_time.strftime("%d") / filename

@@ -207,6 +207,15 @@ class MqttPayloadTests(unittest.TestCase):
                 "stable_weight": 0,
             })
 
+    def test_rejects_blank_plate(self):
+        for plate in ("", "   ", "none", "NONE"):
+            with self.subTest(plate=plate), self.assertRaises(ValueError):
+                build_weighbridge_payload({
+                    "offline_event_id": "session-004",
+                    "official_plate": plate,
+                    "stable_weight": 28500,
+                })
+
 
 class MqttCallbackApiTests(unittest.TestCase):
     def _service(self):

@@ -51,10 +51,10 @@ def _normalize_event_timestamp(value) -> str:
 
 def build_weighbridge_payload(session_result: dict,
                               transaction_type: str = DEFAULT_TRANSACTION_TYPE) -> dict:
-    plate = session_result.get("official_plate", "none")
+    plate = str(session_result.get("official_plate", "none")).strip()
     weight = session_result.get("stable_weight")
 
-    if plate == "none" or weight is None or weight <= 0:
+    if not plate or plate.lower() == "none" or weight is None or weight <= 0:
         raise ValueError(f"invalid weighbridge payload plate={plate}, weight={weight}")
 
     payload = {

@@ -6,7 +6,7 @@ import threading
 import unittest
 import tarfile
 import importlib.util
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from services.runtime.background_worker import BackgroundWorker
@@ -22,6 +22,14 @@ def load_archive_script():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class DatedTreeTests(unittest.TestCase):
+    def test_compact_date_matches_trailing_dot_and_end_of_string(self):
+        from services.storage.dated_tree import date_from_filename
+
+        self.assertEqual(date_from_filename("img_20260922.jpg"), date(2026, 9, 22))
+        self.assertEqual(date_from_filename("20260922"), date(2026, 9, 22))
 
 
 class DeadLetterTests(unittest.TestCase):

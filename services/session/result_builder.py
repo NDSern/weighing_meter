@@ -1,6 +1,7 @@
 """Publication payload and result-image construction helpers."""
 
 import os
+import re
 from datetime import datetime, timezone
 
 import cv2
@@ -9,15 +10,24 @@ import numpy as np
 from config import CAPTURE_DIR
 
 
+_UNSAFE_PLATE_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _safe_plate(plate):
+    """Return a filesystem-safe token for a plate read from the registry."""
+    return _UNSAFE_PLATE_CHARS.sub("_", str(plate or "none"))
+
+
 def prepare_capture_paths(now, plate, session_id=None, capture_dir=CAPTURE_DIR):
     """Build local paths plus object keys/URLs for every result image role."""
     date_path = now.strftime("%Y/%m/%d")
     day_dir = os.path.join(capture_dir, now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
     os.makedirs(day_dir, exist_ok=True)
     ts = session_id or now.strftime("%Y%m%d_%H%M%S_%f")
+    plate_token = _safe_plate(plate)
 
     def _make(suffix):
-        fname = f"{ts}_{plate}_{suffix}.jpg"
+        fname = f"{ts}_{plate_token}_{suffix}.jpg"
         fpath = os.path.join(day_dir, fname)
         key = f"storage/weighbridge/{date_path}/{fname}"
         url = f"/storage/weighbridge/{date_path}/{fname}"
