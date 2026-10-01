@@ -1313,14 +1313,18 @@ class SessionManager:
         spool_started_at = metadata.pop("_spool_started_at", None)
         finalization = getSessionFinalization(session_id)
         if finalization:
-            outcome, record = finalization
+            record = finalization[1]
             outbox_event_id = record.get("outbox_event_id") if record else None
-            expected_outbox_id = outbox_event_id or (session_id if outcome == "published" else None)
-            if MQTT_ENABLED and expected_outbox_id and not PublishOutbox.activate(expected_outbox_id):
+            # Only re-activate publication when the outbox id was actually
+            # recorded. A finalized session with no outbox id (legacy record,
+            # or MQTT disabled at publish time) has nothing to activate; a
+            # fabricated session-id lookup would fail and dead-letter an
+            # already-published session on crash re-entry.
+            if MQTT_ENABLED and outbox_event_id and not PublishOutbox.activate(outbox_event_id):
                 log_fn(
                     "ERROR",
                     f"Finalized session missing publication evidence id={session_id} "
-                    f"outbox_id={expected_outbox_id}",
+                    f"outbox_id={outbox_event_id}",
                 )
                 return False
             log_fn("EVENT", f"Deferred session already finalized id={session_id}")

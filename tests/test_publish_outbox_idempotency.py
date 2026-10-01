@@ -126,14 +126,27 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
                 self.deferred_metadata("missing"), Mock(), Mock(),
             ))
 
-    def test_legacy_published_finalization_requires_session_id_evidence(self):
+    def test_legacy_published_finalization_without_outbox_id_is_accepted(self):
         session_module.markSessionFinalized("legacy", "published")
         manager = session_module.SessionManager(Mock())
 
         with patch.object(session_module, "MQTT_ENABLED", True):
-            self.assertFalse(manager.finalize_deferred_session(
+            self.assertTrue(manager.finalize_deferred_session(
                 self.deferred_metadata("legacy"), Mock(), Mock(),
             ))
+
+    def test_legacy_published_finalization_does_not_activate_outbox(self):
+        session_module.markSessionFinalized("legacy-reentry", "published")
+        manager = session_module.SessionManager(Mock())
+
+        with patch.object(session_module, "MQTT_ENABLED", True), patch.object(
+            session_module.PublishOutbox, "activate", return_value=False,
+        ) as activate:
+            self.assertTrue(manager.finalize_deferred_session(
+                self.deferred_metadata("legacy-reentry"), Mock(), Mock(),
+            ))
+
+        activate.assert_not_called()
 
     def test_mqtt_disabled_finalization_needs_no_outbox_evidence(self):
         session_module.markSessionFinalized("local-only", "published")
