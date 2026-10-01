@@ -14,6 +14,7 @@ class AsyncLogger:
         self._lock = threading.Lock()
         self._queue = queue.Queue(maxsize=queue_size)
         self._dropped = 0
+        self._drop_warned = False
         self._sentinel = object()
         self._thread = None
         self._file = None
@@ -66,6 +67,8 @@ class AsyncLogger:
 
     def _ensure_thread(self):
         with self._lock:
+            if self._closing:
+                return
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
                     target=self._run,
@@ -73,6 +76,16 @@ class AsyncLogger:
                     daemon=True,
                 )
                 self._thread.start()
+
+    def _note_drop(self):
+        if self._drop_warned:
+            return
+        self._drop_warned = True
+        try:
+            self.stderr.write("AsyncLogger queue overflow: dropping oldest log records\n")
+            self.stderr.flush()
+        except OSError:
+            pass
 
     def log(self, level, message):
         with self._lock:
@@ -100,26 +113,34 @@ class AsyncLogger:
                 self._queue.get_nowait()
                 self._queue.task_done()
                 self._dropped += 1
+                self._note_drop()
             except queue.Empty:
                 pass
             try:
                 self._queue.put_nowait(record)
             except queue.Full:
                 self._dropped += 1
+                self._note_drop()
 
     def close(self, timeout=10.0):
         with self._lock:
             self._closing = True
             thread = self._thread
+        stopped = True
         if thread and thread.is_alive():
             self._enqueue(self._sentinel)
             thread.join(timeout=timeout)
-            if thread.is_alive():
-                return False
+            stopped = not thread.is_alive()
         with self._lock:
             if self._file is not None:
                 self._file.close()
                 self._file = None
                 self._date = None
             self._thread = None
-        return True
+        if self._dropped:
+            try:
+                self.stderr.write(f"AsyncLogger dropped {self._dropped} log records\n")
+                self.stderr.flush()
+            except OSError:
+                pass
+        return stopped

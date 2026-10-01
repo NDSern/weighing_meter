@@ -52,7 +52,9 @@ class AsyncLoggingTests(unittest.TestCase):
 
     def test_full_queue_drops_oldest_record(self):
         with tempfile.TemporaryDirectory() as directory:
-            logger = AsyncLogger(directory, "test", stdout=io.StringIO(), queue_size=2)
+            logger = AsyncLogger(
+                directory, "test", stdout=io.StringIO(), stderr=io.StringIO(), queue_size=2
+            )
             logger._ensure_thread = lambda: None
 
             logger.log("INFO", "one")
@@ -64,6 +66,35 @@ class AsyncLoggingTests(unittest.TestCase):
             self.assertIn("two", records[0][1][0])
             self.assertIn("three", records[1][1][0])
             self.assertEqual(logger._dropped, 1)
+
+    def test_queue_overflow_warns_once_and_reports_dropped_on_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stderr = io.StringIO()
+            logger = AsyncLogger(
+                directory, "test", stdout=io.StringIO(), stderr=stderr, queue_size=1
+            )
+            logger._ensure_thread = lambda: None
+
+            logger.log("INFO", "one")
+            logger.log("INFO", "two")
+            logger.log("INFO", "three")
+
+            self.assertEqual(logger._dropped, 2)
+            self.assertEqual(stderr.getvalue().count("queue overflow"), 1)
+            self.assertTrue(logger.close())
+            self.assertIn("dropped 2 log records", stderr.getvalue())
+
+    def test_close_clears_thread_and_prevents_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logger = AsyncLogger(directory, "test", stdout=io.StringIO())
+            self.assertTrue(logger.close())
+
+            logger._ensure_thread()
+            self.assertIsNone(logger._thread)
+
+            logger.log("INFO", "late")
+            self.assertIsNone(logger._thread)
+            self.assertTrue(logger._queue.empty())
 
     def test_close_can_enqueue_sentinel_when_queue_is_full(self):
         with tempfile.TemporaryDirectory() as directory:
