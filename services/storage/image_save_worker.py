@@ -165,10 +165,18 @@ class ImageSaveWorker:
         """Wait briefly for queued uploads during shutdown."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if _upload_queue.unfinished_tasks == 0:
+            with _pending_lock:
+                pending = len(_pending_tasks)
+            if _upload_queue.unfinished_tasks == 0 and pending == 0:
                 return True
             time.sleep(0.2)
-        log("WARNING", f"Image upload wait timed out with {_upload_queue.unfinished_tasks} task(s) pending")
+        with _pending_lock:
+            pending = len(_pending_tasks)
+        log(
+            "WARNING",
+            f"Image upload wait timed out with {_upload_queue.unfinished_tasks} queued task(s) "
+            f"and {pending} pending upload(s)",
+        )
         return False
 
     @staticmethod
@@ -350,6 +358,11 @@ class ImageSaveWorker:
             fp.flush()
             os.fsync(fp.fileno())
         os.replace(tmp_path, _pending_file)
+        directory_fd = os.open(os.path.dirname(_pending_file), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     @staticmethod
     def _normalize_upload_task(task):

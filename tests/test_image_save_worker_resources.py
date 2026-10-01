@@ -110,6 +110,29 @@ class ImageSaveWorkerResourceTests(unittest.TestCase):
             http_client=http_client,
         )
 
+    def test_wait_for_pending_counts_retry_backlog(self):
+        self.pending["key"] = {"object_key": "key", "fpath": "/tmp/x"}
+
+        self.assertFalse(ImageSaveWorker.wait_for_pending(timeout=0.1))
+
+        self.pending.clear()
+        self.assertTrue(ImageSaveWorker.wait_for_pending(timeout=0.1))
+
+    def test_persist_pending_fsyncs_parent_directory(self):
+        self.pending["key"] = {"object_key": "key", "fpath": "/tmp/x"}
+        sentinel = 4242
+        with mock.patch.object(module.os, "open", return_value=sentinel) as open_mock, mock.patch.object(
+            module.os, "fsync",
+        ) as fsync_mock, mock.patch.object(module.os, "close") as close_mock:
+            ImageSaveWorker._persist_pending_locked()
+
+        open_mock.assert_called_once_with(
+            module.os.path.dirname(self.pending_file),
+            module.os.O_RDONLY | module.os.O_DIRECTORY,
+        )
+        self.assertIn(mock.call(sentinel), fsync_mock.call_args_list)
+        close_mock.assert_called_once_with(sentinel)
+
 
     def test_upload_loop_survives_retry_persistence_failure(self):
         stop = threading.Event()
