@@ -1,6 +1,8 @@
 import queue
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from types import ModuleType
 from unittest import mock
@@ -101,6 +103,40 @@ class ImageSaveWorkerResourceTests(unittest.TestCase):
             secure=module.MINIO_SECURE,
             region=module.MINIO_REGION,
         )
+
+
+    def test_upload_loop_survives_retry_persistence_failure(self):
+        stop = threading.Event()
+        self.pending["key"] = {
+            "object_key": "key", "fpath": "/tmp/x", "attempts": 0,
+            "next_attempt_at": 0.0, "created_at": "2026-01-01T00:00:00",
+        }
+        calls = {"count": 0}
+
+        def failing_upload(task):
+            calls["count"] += 1
+            raise RuntimeError("upload boom")
+
+        def failing_retry(task, increment=True):
+            raise OSError("disk full")
+
+        original_started = module._worker_started
+        module._worker_started = True
+        self.addCleanup(setattr, module, "_worker_started", original_started)
+        with mock.patch.object(module, "_stop_event", stop), mock.patch.object(
+            ImageSaveWorker, "_upload_task", side_effect=failing_upload,
+        ), mock.patch.object(ImageSaveWorker, "_schedule_retry", side_effect=failing_retry):
+            worker = threading.Thread(target=ImageSaveWorker._upload_loop, daemon=True)
+            worker.start()
+            deadline = time.time() + 3
+            while calls["count"] < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            stop.set()
+            worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertGreaterEqual(calls["count"], 2)
+        self.assertFalse(module._worker_started)
 
 
 if __name__ == "__main__":

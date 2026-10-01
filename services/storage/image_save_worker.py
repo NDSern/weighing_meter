@@ -393,23 +393,38 @@ class ImageSaveWorker:
 
     @staticmethod
     def _upload_loop():
-        while not _stop_event.is_set():
-            try:
-                task = _upload_queue.get(timeout=0.5)
-            except queue.Empty:
-                with _pending_lock:
-                    ImageSaveWorker._fill_upload_queue_locked()
-                continue
-            try:
-                ImageSaveWorker._upload_task(task)
-            except Exception as exc:
-                log("ERROR", f"MinIO upload worker error: {exc}")
-                ImageSaveWorker._schedule_retry(task)
-            finally:
-                with _pending_lock:
-                    _queued_keys.discard(task.get("object_key"))
-                    ImageSaveWorker._fill_upload_queue_locked()
-                _upload_queue.task_done()
+        global _worker_started
+        try:
+            while not _stop_event.is_set():
+                try:
+                    task = _upload_queue.get(timeout=0.5)
+                except queue.Empty:
+                    try:
+                        with _pending_lock:
+                            ImageSaveWorker._fill_upload_queue_locked()
+                    except Exception as exc:
+                        log("ERROR", f"MinIO upload queue refill failed: {exc}")
+                    continue
+                try:
+                    ImageSaveWorker._upload_task(task)
+                except Exception as exc:
+                    log("ERROR", f"MinIO upload worker error: {exc}")
+                    try:
+                        ImageSaveWorker._schedule_retry(task)
+                    except Exception as retry_exc:
+                        log("ERROR", f"MinIO upload retry scheduling failed: {retry_exc}")
+                finally:
+                    try:
+                        with _pending_lock:
+                            _queued_keys.discard(task.get("object_key"))
+                            ImageSaveWorker._fill_upload_queue_locked()
+                    except Exception as exc:
+                        log("ERROR", f"MinIO upload queue refill failed: {exc}")
+                    _upload_queue.task_done()
+        finally:
+            # If the loop ever exits, allow a later call to restart the worker
+            # instead of leaving uploads queued with no consumer.
+            _worker_started = False
 
     @staticmethod
     def _upload_task(task):
