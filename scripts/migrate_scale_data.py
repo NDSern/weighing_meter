@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import sys
 import subprocess
+import tempfile
 from contextlib import closing
 from pathlib import Path
 
@@ -32,6 +33,11 @@ CREATE TABLE IF NOT EXISTS weight_log (
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT, help="Repository root.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be migrated without changing any files.",
+    )
     return parser.parse_args()
 
 
@@ -53,7 +59,7 @@ def migrate(source, destination_dir, source_conn=None, created_targets=None):
     )
     current_date = target = target_conn = None
     batch = []
-    source_count = target_count = migrated_count = existing_count = target_base_count = 0
+    source_count = target_count = migrated_count = target_base_count = 0
 
     def flush():
         nonlocal batch
@@ -92,8 +98,14 @@ def migrate(source, destination_dir, source_conn=None, created_targets=None):
             target_conn.execute("PRAGMA journal_mode=WAL")
             target_conn.execute(WEIGHT_LOG_SCHEMA)
             target_base_count = target_conn.execute("SELECT count(*) FROM weight_log").fetchone()[0]
-            existing_count += target_base_count
-            if target_base_count == 0 and created_targets is not None:
+            if target_base_count:
+                target_conn.close()
+                target_conn = None
+                raise RuntimeError(
+                    f"Target already contains {target_base_count} rows: {target}; "
+                    "refusing to append duplicate rows"
+                )
+            if created_targets is not None:
                 created_targets.add(target)
             target_count = 0
         batch.append(row)
@@ -103,9 +115,9 @@ def migrate(source, destination_dir, source_conn=None, created_targets=None):
             flush()
     close_target()
 
-    if migrated_count != source_count + existing_count:
+    if migrated_count != source_count:
         raise RuntimeError(
-            f"Row count mismatch source={source_count} existing={existing_count} target={migrated_count}"
+            f"Row count mismatch source={source_count} migrated={migrated_count}"
         )
 
 
@@ -142,6 +154,15 @@ def main():
 
     if not source.exists():
         raise SystemExit(f"Legacy database not found: {source}")
+
+    if args.dry_run:
+        with tempfile.TemporaryDirectory() as tmp:
+            dry_run_dir = Path(tmp)
+            with closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as conn:
+                migrate(source, dry_run_dir, conn)
+        print("Dry run complete: no files were changed")
+        return
+
     if archive.exists():
         raise SystemExit(f"Archive already exists: {archive}")
 

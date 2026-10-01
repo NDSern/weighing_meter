@@ -52,7 +52,7 @@ class ScaleDataMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(destination / "2026-07-15.db")) as conn:
                 self.assertEqual(conn.execute("SELECT weight_kg FROM weight_log ORDER BY timestamp").fetchall(), [(300.0,), (200.0,)])
 
-    def test_merges_rows_into_existing_daily_database(self):
+    def test_refuses_to_append_into_existing_daily_database(self):
         with tempfile.TemporaryDirectory() as root:
             source = self.make_legacy_database(root)
             destination = Path(root) / "scale_data"
@@ -66,10 +66,23 @@ class ScaleDataMigrationTests(unittest.TestCase):
                 )
                 conn.commit()
 
-            migration.migrate(source, destination)
+            with self.assertRaisesRegex(RuntimeError, "refusing to append duplicate rows"):
+                migration.migrate(source, destination)
 
             with closing(sqlite3.connect(target)) as conn:
-                self.assertEqual(conn.execute("SELECT count(*) FROM weight_log").fetchone()[0], 2)
+                self.assertEqual(conn.execute("SELECT count(*) FROM weight_log").fetchone()[0], 1)
+
+    def test_dry_run_leaves_source_and_destination_untouched(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = self.make_legacy_database(root)
+            with mock.patch.object(
+                migration,
+                "parse_args",
+                return_value=mock.Mock(root=Path(root), dry_run=True),
+            ):
+                migration.main()
+            self.assertTrue(source.exists())
+            self.assertFalse((Path(root) / "scale_data").exists())
 
     def test_rejects_database_owned_by_another_process(self):
         result = mock.Mock(returncode=0)
