@@ -1969,6 +1969,48 @@ class AttemptArchiveTests(unittest.TestCase):
         self.assertFalse(manager.session.session_active)
         manager._archive_no_stable.assert_not_called()
 
+    def test_no_stable_departure_arms_rearm_guard(self):
+        from config import SESSION_REARM_DELAY_SECONDS
+
+        manager = SessionManager(Mock(), lpr_grabbers={})
+        manager._save_diagnostic_frames = Mock(return_value=0)
+        manager._attempt = {
+            "id": "att-1",
+            "started_at": "2026-07-24T00:00:00+00:00",
+            "start_frames": {},
+            "max_weight": 1200,
+        }
+
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time", return_value=100.0,
+        ):
+            manager._archive_no_stable(Mock(), require_new_rise=True, current_weight=1200)
+
+        self.assertEqual(manager._attempt_rearm_low, 1200)
+        self.assertEqual(manager._attempt_wait_reference, 1200)
+        self.assertEqual(manager.session.rearm_reference_weight, 1200)
+        self.assertEqual(manager.session.rearm_block_reason, "no_stable_weight")
+        self.assertEqual(
+            manager.session.rearm_block_until, 100.0 + SESSION_REARM_DELAY_SECONDS,
+        )
+
+        # Same plateau within the delay must not start a chained session.
+        manager.session.stable_weight = 1200
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time", return_value=100.5,
+        ):
+            self.assertFalse(manager._can_start_session(Mock()))
+
+        # Once the weight departed and the delay elapsed the guard disarms.
+        manager.session.stable_weight = 500
+        with unittest.mock.patch(
+            "services.session.session_manager.time.time",
+            return_value=100.0 + SESSION_REARM_DELAY_SECONDS + 1.0,
+        ):
+            self.assertTrue(manager._can_start_session(Mock()))
+        self.assertEqual(manager.session.rearm_block_until, 0.0)
+        self.assertIsNone(manager.session.rearm_reference_weight)
+
     def test_spread_stability_alone_does_not_log_session_start(self):
         manager = SessionManager(Mock(), lpr_grabbers={})
         log = Mock()

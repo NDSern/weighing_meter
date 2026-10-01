@@ -44,6 +44,7 @@ from config import (
     SESSION_FINALIZATION_DB,
     SESSION_END_EMPTY_DWELL_SECONDS,
     SESSION_PLATE_ONLY_TIMEOUT_SECONDS,
+    SESSION_REARM_DELAY_SECONDS,
     SESSION_WEIGHT_DEPARTURE_DWELL_SECONDS,
     SESSION_WEIGHT_DEPARTURE_KG,
     SESSION_WEIGHT_TREND_DIRECTIONAL_STEPS,
@@ -711,8 +712,16 @@ class SessionManager:
             end_reason=end_reason,
         )
         self._clear_attempt()
-        if require_new_rise:
+        if require_new_rise and current_weight is not None:
+            # A no-stable attempt ended because the weight departed. Block a
+            # new session on the same plateau for a short grace period, using
+            # the departure weight as the re-arm reference. ``_can_start_session``
+            # and the blocked-tail branch in ``_on_frame_locked`` consume these.
             self._attempt_rearm_low = current_weight
+            self._attempt_wait_reference = current_weight
+            self.session.rearm_reference_weight = current_weight
+            self.session.rearm_block_reason = "no_stable_weight"
+            self.session.rearm_block_until = time.time() + SESSION_REARM_DELAY_SECONDS
 
     def _clear_attempt(self):
         self._attempt = None
