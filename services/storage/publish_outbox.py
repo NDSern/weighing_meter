@@ -127,14 +127,17 @@ class PublishOutbox:
 
     @staticmethod
     def _is_published(event_id):
-        try:
-            PublishOutbox._init_completed_db()
-            with closing(sqlite3.connect(_published_db)) as conn:
-                return conn.execute(
-                    "SELECT 1 FROM completed_events WHERE event_id = ?", (event_id,)
-                ).fetchone() is not None
-        except (OSError, sqlite3.Error):
-            return False
+        """Return True when the broker already acknowledged this event.
+
+        Raises on database read failure. Callers must fail closed: treating an
+        unreadable completion ledger as "not published" would republish an
+        already-acknowledged weighing event.
+        """
+        PublishOutbox._init_completed_db()
+        with closing(sqlite3.connect(_published_db)) as conn:
+            return conn.execute(
+                "SELECT 1 FROM completed_events WHERE event_id = ?", (event_id,)
+            ).fetchone() is not None
 
     @staticmethod
     def _mark_completed(event_id):
@@ -163,8 +166,13 @@ class PublishOutbox:
                     if not event_id or not event.get("session_result"):
                         append_dead_letter("malformed", event, "incomplete MQTT record", "malformed")
                         continue
-                    if PublishOutbox._is_published(event_id):
-                        continue
+                    try:
+                        if PublishOutbox._is_published(event_id):
+                            continue
+                    except (OSError, sqlite3.Error) as exc:
+                        # Cannot verify completion: keep the event pending instead
+                        # of dropping unverified work.
+                        log("ERROR", f"Completion check failed while loading id={event_id}: {exc}")
                     _pending_events[event_id] = event
             PublishOutbox._persist_locked()
             for event_id, event in _pending_events.items():
@@ -236,7 +244,13 @@ class PublishOutbox:
             timeout=10.0,
         )
         if ok:
-            PublishOutbox._mark_completed(event_id)
+            try:
+                PublishOutbox._mark_completed(event_id)
+            except (OSError, sqlite3.Error) as exc:
+                # The broker already acknowledged this event. Requeueing would
+                # publish it twice, so record the failure loudly and drop it
+                # from the pending queue only.
+                log("CRITICAL", f"Publish ack received but completion write failed id={event_id}: {exc}")
             PublishOutbox._mark_published(event_id)
             result = event["session_result"]
             log(

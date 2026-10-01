@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 import sys
@@ -544,6 +545,65 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         self.assertTrue(PublishOutbox._is_published(event_id))
         published_result = mqtt.publish_weighbridge_event.call_args.args[0]
         self.assertEqual(published_result["offline_event_id"], event_id)
+
+    def test_completion_check_failure_is_not_treated_as_unpublished(self):
+        with patch.object(
+            module.sqlite3, "connect", side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                PublishOutbox._is_published("completed-but-unreadable")
+            with self.assertRaises(sqlite3.OperationalError):
+                PublishOutbox.enqueue({"offline_event_id": "completed-but-unreadable"})
+
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+
+    def test_load_pending_keeps_event_when_completion_check_fails(self):
+        event = {
+            "id": "unreadable-check",
+            "created_at": "2026-07-15T00:00:00",
+            "image_object_keys": [],
+            "image_paths": [],
+            "session_result": {"offline_event_id": "unreadable-check"},
+            "activated": True,
+        }
+        with open(self.pending, "w") as fp:
+            fp.write(json.dumps(event) + "\n")
+
+        with patch.object(
+            module.PublishOutbox, "_is_published",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            PublishOutbox._load_pending()
+
+        self.assertEqual(PublishOutbox.pending_count(), 1)
+        self.assertEqual(module._publish_queue.get_nowait(), "unreadable-check")
+
+    def test_completion_write_failure_after_ack_does_not_requeue(self):
+        event_id = "1234567890abcdef"
+        module._pending_events[event_id] = {
+            "id": event_id,
+            "created_at": module.datetime.now().isoformat(timespec="seconds"),
+            "image_paths": [],
+            "session_result": {
+                "official_plate": "14C-017.80",
+                "stable_weight": 34780.0,
+            },
+        }
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = True
+        logs = []
+
+        with patch.object(module, "_mqtt_svc", mqtt), patch.object(
+            module, "_log_fn", lambda level, message: logs.append((level, message))
+        ), patch.object(
+            module.PublishOutbox, "_mark_completed",
+            side_effect=sqlite3.OperationalError("disk full"),
+        ):
+            PublishOutbox._publish_event(event_id)
+
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+        self.assertIn("CRITICAL", [level for level, _ in logs])
+        self.assertTrue(module._publish_queue.empty())
 
 
 if __name__ == "__main__":
