@@ -33,16 +33,30 @@ class BackgroundWorker:
             self.log_fn(level, msg)
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            raise RuntimeError(f"{self.worker_name} is already running")
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._announce("started")
 
     def stop(self, timeout=DEFAULT_STOP_TIMEOUT):
+        """Signal the loop to stop and join it.
+
+        Returns ``True`` when the worker is no longer running, ``False`` when a
+        thread outlived ``timeout`` (the caller may need to log or escalate).
+        """
+        thread = self._thread
+        if thread is None:
+            return True
         self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            self._log("WARNING", f"{self.worker_name} did not stop within {timeout}s")
+            return False
+        self._thread = None
         self._announce("stopped")
+        return True
 
     def _announce(self, verb):
         if self.announce_lifecycle:

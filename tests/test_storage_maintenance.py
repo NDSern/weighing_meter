@@ -2,12 +2,14 @@ import os
 import gzip
 import json
 import tempfile
+import threading
 import unittest
 import tarfile
 import importlib.util
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
+from services.runtime.background_worker import BackgroundWorker
 from services.storage.dead_letter import is_expired
 from services.storage.retention_cleaner import (
     DiagnosticArchiveCleaner, ImageRetentionCleaner, StorageMaintenance, VerifiedMinioCacheCleaner,
@@ -479,6 +481,45 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(os.path.exists(fresh_image))
             self.assertFalse(os.path.exists(old_image))
             self.assertFalse(os.path.exists(recent_image))
+
+
+class BackgroundWorkerLifecycleTests(unittest.TestCase):
+    def _worker(self):
+        release = threading.Event()
+
+        class _BlockingWorker(BackgroundWorker):
+            worker_name = "BlockingWorker"
+            announce_lifecycle = False
+
+            def run_once(self_inner):
+                release.wait(2.0)
+
+        return _BlockingWorker(check_interval_seconds=60.0), release
+
+    def test_stop_reports_failure_when_the_thread_outlives_the_timeout(self):
+        worker, release = self._worker()
+        worker.start()
+        try:
+            self.assertFalse(worker.stop(timeout=0.05))
+            self.assertTrue(worker._thread.is_alive())
+        finally:
+            release.set()
+        self.assertTrue(worker.stop(timeout=2.0))
+        self.assertIsNone(worker._thread)
+
+    def test_start_refuses_to_run_twice(self):
+        worker, release = self._worker()
+        worker.start()
+        try:
+            with self.assertRaises(RuntimeError):
+                worker.start()
+        finally:
+            release.set()
+            worker.stop(timeout=2.0)
+
+    def test_stop_without_start_is_a_noop(self):
+        worker = BackgroundWorker(check_interval_seconds=60.0)
+        self.assertTrue(worker.stop())
 
 
 if __name__ == "__main__":
