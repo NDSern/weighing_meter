@@ -1,6 +1,7 @@
 """Control camera white lights while a nighttime LPR session is active."""
 
 import base64
+import threading
 from datetime import time as clock_time
 from urllib.error import HTTPError
 from urllib.parse import unquote, urlsplit
@@ -15,6 +16,7 @@ class CameraLightController:
         self._targets = [self._parse_target(url, api_password) for url in rtsp_urls]
         self._now_fn = now_fn
         self._open = open_fn or build_opener(ProxyHandler({})).open
+        self._lock = threading.Lock()
         self._on_targets = set()
         self._unsupported_targets = set()
 
@@ -54,7 +56,10 @@ class CameraLightController:
             },
         )
         response = self._open(request, timeout=1.0)
-        return response.read()
+        try:
+            return response.read()
+        finally:
+            response.close()
 
     def _set_brightness(self, target, brightness):
         current = self._request(target, "GET")
@@ -79,20 +84,24 @@ class CameraLightController:
     def set_lpr_active(self, active, log_fn):
         if active and not self._is_night(self._now_fn()):
             return
+        with self._lock:
+            on_targets = set(self._on_targets)
         targets = self._targets if active else [
-            target for target in self._targets if target in self._on_targets
+            target for target in self._targets if target in on_targets
         ]
         brightness = 100 if active else 0
         for target in targets:
-            if target in self._unsupported_targets or (active and target in self._on_targets):
-                continue
+            with self._lock:
+                if target in self._unsupported_targets or (active and target in self._on_targets):
+                    continue
             host = target[0]
             try:
                 self._set_brightness(target, brightness)
             except HTTPError as exc:
                 exc.close()
                 if exc.code in (404, 500):
-                    self._unsupported_targets.add(target)
+                    with self._lock:
+                        self._unsupported_targets.add(target)
                     log_fn(
                         "WARNING",
                         f"LPR light control unsupported host={host} status={exc.code}",
@@ -103,8 +112,9 @@ class CameraLightController:
             except Exception as exc:
                 log_fn("ERROR", f"LPR light control failed host={host}: {exc}")
                 continue
-            if active:
-                self._on_targets.add(target)
-            else:
-                self._on_targets.discard(target)
+            with self._lock:
+                if active:
+                    self._on_targets.add(target)
+                else:
+                    self._on_targets.discard(target)
             log_fn("EVENT", f"LPR light {'on' if active else 'off'} host={host}")

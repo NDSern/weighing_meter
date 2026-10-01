@@ -9,7 +9,6 @@ from config import (
     LPR_FALLBACK_OCR_CONFIDENCE,
     LPR_LIVE_OCR_INTERVAL_SECONDS,
     PLATE_TRACK_STALE_SECONDS,
-    YOLO26_DETECT_FPS,
 )
 
 TIMING_LOG_INTERVAL_SECONDS = 60.0
@@ -339,7 +338,9 @@ class DetectCoordinator:
                 crop_parts = p["crop_size"].split("x")
                 cw, ch = int(crop_parts[0]), int(crop_parts[1])
                 self._tracker.add_observation(plate_text, p["det_conf"], cw, ch, source="selected")
-                for alt_plate, _ in p.get("valid_candidates", [])[1:]:
+                for alt_plate, _ in p.get("valid_candidates", []):
+                    if alt_plate == plate_text:
+                        continue
                     self._tracker.add_observation(alt_plate, p["det_conf"] * 0.5, cw, ch, source="candidate")
                     self._tracker.update_image(alt_plate, p["det_conf"] * 0.5, full_frame, cam.name, debug=p)
                 if p["det_conf"] > best_conf:
@@ -365,7 +366,6 @@ class DetectCoordinator:
         if best_plate is not None:
             debug = next((plate for plate in plates if plate["plate"] == best_plate), None)
             self._tracker.update_image(best_plate, best_conf, full_frame, cam.name, debug=debug)
-        del plates
 
     def _submit_ocr_job(self, cam, full_frame, regions, detect_started_at):
         lock = self._ocr_locks.get(cam.name)
@@ -436,9 +436,6 @@ class DetectCoordinator:
                 self._process_plate_detections(cam, plates, full_frame, job["session_context"])
             except Exception as exc:
                 log("ERROR", f"OCR worker error [{cam.name}]: {exc}")
-            finally:
-                del full_frame
-                del regions
 
     def _run_detection(self, cam, full_frame, frame_id=None):
         """Run detection for one camera. Feeds tracker directly."""
@@ -532,43 +529,3 @@ class DetectCoordinator:
 
             elapsed_total = time.time() - t0
             time.sleep(max(0.0, interval - elapsed_total))
-
-
-class VehicleDetectCoordinator:
-    def __init__(self, cameras: list, tracker, detector=None, detect_vehicles_fn=None):
-        self._cameras = cameras
-        self._tracker = tracker
-        self._detector = detector
-        self._detect_vehicles_fn = detect_vehicles_fn
-        self._running = False
-        self._thread = None
-
-    def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._detect_loop, daemon=True)
-        self._thread.start()
-        log("INFO", f"VehicleDetectCoordinator started with {len(self._cameras)} cameras")
-
-    def stop(self, timeout=3.0):
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-        return not self._thread or not self._thread.is_alive()
-
-    def _detect_loop(self):
-        interval = 1.0 / YOLO26_DETECT_FPS
-        while self._running:
-            t0 = time.time()
-            for cam in self._cameras:
-                full_frame = cam.peek_latest_frame(copy_frame=True)
-                if full_frame is None:
-                    continue
-                try:
-                    detections = self._detect_vehicles_fn(full_frame, detector=self._detector)
-                    self._tracker.update(cam.name, detections, full_frame.shape)
-                except Exception as exc:
-                    log("ERROR", f"Vehicle detection error [{cam.name}]: {exc}")
-                finally:
-                    del full_frame
-            elapsed = time.time() - t0
-            time.sleep(max(0.0, interval - elapsed))

@@ -96,7 +96,13 @@ def inventory(root):
             unsafe.append((metadata_path, reason))
     files = [path for record in candidates for path in record["images"]]
     files += [record["metadata"] for record in candidates]
-    bytes_total = sum(path.stat().st_size for path in files if path.exists())
+    bytes_total = 0
+    for path in files:
+        try:
+            bytes_total += path.stat().st_size
+        except OSError:
+            # File removed by a concurrent writer between listing and stat.
+            continue
     return {
         "root": root,
         "candidates": candidates,

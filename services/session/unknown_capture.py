@@ -188,9 +188,10 @@ def nearest_session_frame(metadata, camera, observed_at):
     """Return the spooled frame for ``camera`` closest to ``observed_at``."""
     session_dir = metadata.get("session_dir")
     files = metadata.get("session_files", [])
-    if not session_dir or observed_at is None:
+    started_at_raw = metadata.get("started_at")
+    if not session_dir or observed_at is None or not started_at_raw:
         return None
-    started_at = datetime.fromisoformat(metadata["started_at"]).timestamp()
+    started_at = datetime.fromisoformat(started_at_raw).timestamp()
     interval = float(metadata.get("capture_interval_seconds", 0.2))
     candidates = []
     for relative_path in files:
@@ -208,7 +209,10 @@ def nearest_session_frame(metadata, camera, observed_at):
 
 def load_diagnostic_frames(metadata, offset_seconds):
     """Load front-camera frames ``offset_seconds`` after session start."""
-    target = datetime.fromisoformat(metadata["started_at"]).timestamp() + offset_seconds
+    started_at_raw = metadata.get("started_at")
+    if not started_at_raw:
+        return load_start_frames(metadata)
+    target = datetime.fromisoformat(started_at_raw).timestamp() + offset_seconds
     frames = {}
     for camera in ("cam1", "cam3"):
         path = nearest_session_frame(metadata, camera, target)

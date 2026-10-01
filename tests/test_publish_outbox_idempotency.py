@@ -248,8 +248,6 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
 
     def test_registry_corrected_plate_session_is_published(self):
         manager = session_module.SessionManager(Mock())
-        manager._last_publish_plate = "CANON-1"
-        manager._last_publish_session_end = "2026-07-24T00:00:00+00:00"
         tracker = Mock()
         tracker.get_confirmed_plate.return_value = ("RAW-1", 0.9, 4)
         tracker.get_all_plates_summary.return_value = {"RAW-1": 4}
@@ -271,8 +269,6 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
 
     def test_detailed_candidate_plate_session_is_published(self):
         manager = session_module.SessionManager(Mock())
-        manager._last_publish_plate = "15C12340"
-        manager._last_publish_session_end = "2026-07-24T00:00:00+00:00"
         tracker = Mock()
         tracker.get_confirmed_plate.return_value = ("15C1234", 0.9, 4)
         tracker.get_all_plates_summary.return_value = {"15C1234": 4, "15C12340": 3}

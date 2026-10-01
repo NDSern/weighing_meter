@@ -144,7 +144,12 @@ class D2008Parser:
         """Parse 12 byte thành WeightFrame."""
         try:
             # Byte 2: dấu
-            sign = '+' if raw[1] == 0x2B else '-'
+            if raw[1] == 0x2B:
+                sign = '+'
+            elif raw[1] == 0x2D:
+                sign = '-'
+            else:
+                return None
 
             # Byte 3-8: 6 chữ số ASCII (không thập phân)
             digits_str = raw[2:8].decode('ascii')
@@ -223,7 +228,7 @@ class ScaleDatabase:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.db_file = path
         self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._date = None if self._fixed_db_file else os.path.basename(path)[:-3]
+        self._date = None if self._fixed_db_file else os.path.splitext(os.path.basename(path))[0]
         self._init_db()
 
     def _close_current_locked(self):
@@ -322,11 +327,13 @@ class ScaleDatabase:
                 return []
             old_row_factory = self._conn.row_factory
             self._conn.row_factory = sqlite3.Row
-            rows = self._conn.execute("""
-                SELECT * FROM weight_log
-                ORDER BY id DESC LIMIT ?
-            """, (limit,)).fetchall()
-            self._conn.row_factory = old_row_factory
+            try:
+                rows = self._conn.execute("""
+                    SELECT * FROM weight_log
+                    ORDER BY id DESC LIMIT ?
+                """, (limit,)).fetchall()
+            finally:
+                self._conn.row_factory = old_row_factory
         return [dict(r) for r in rows]
 
     def close(self):

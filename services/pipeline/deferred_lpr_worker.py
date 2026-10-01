@@ -598,7 +598,9 @@ class DeferredLprWorker:
                     text, plate["det_conf"], width, height,
                     source="selected", observed_at=observed_at,
                 )
-                candidates = plate.get("valid_candidates", [])[1:]
+                candidates = [
+                    item for item in plate.get("valid_candidates", []) if item[0] != text
+                ]
                 confidence_scale = 0.5
                 if plate["det_conf"] > best_conf:
                     best_plate, best_conf = text, plate["det_conf"]

@@ -8,6 +8,7 @@ Do not widen the allowlist or add unattended execution.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -524,19 +525,28 @@ class MissedSessionRecovery:
 
 
 def _service_running():
-    proc = Path("/proc")
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
+    """Return True when the scale reader still holds the shared data lock.
+
+    Uses the same flock the service holds on ``.scale_data.lock`` instead of
+    substring-scanning ``/proc`` command lines (which false-positives on
+    editors or grep and misses differently-invoked services).
+    """
+    lock_path = os.path.join(SCALE_DATA_DIR, ".scale_data.lock")
+    if not os.path.exists(lock_path):
+        return False
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
         try:
-            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
-                "utf-8", "replace"
-            )
-        except (OSError, PermissionError):
-            continue
-        if "weighing_service.py" in command:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
             return True
-    return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
 
 
 def _upload_image(bucket, object_key, path):

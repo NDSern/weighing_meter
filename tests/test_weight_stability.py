@@ -1156,13 +1156,6 @@ class SessionWeightTests(unittest.TestCase):
         with unittest.mock.patch("services.session.session_manager.time.time", return_value=12.0):
             self.assertTrue(self.manager._can_start_session(Mock()))
 
-    def test_recent_same_plate_is_not_a_transaction_identity(self):
-        self.manager._last_publish_plate = "15C-326.77"
-        self.manager._last_publish_weight = 8500
-        self.manager._last_publish_session_end = "2026-07-15T06:26:48+00:00"
-
-        self.assertFalse(hasattr(self.manager, "_should_skip_duplicate_publish"))
-
     def test_post_session_descent_does_not_start_chained_attempt(self):
         manager = SessionManager(Mock())
         manager._attempt_wait_reference = 10000

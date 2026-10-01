@@ -1,6 +1,5 @@
 """Session manager — orchestrates weighing session lifecycle."""
 
-import json
 import os
 import threading
 import time
@@ -39,7 +38,6 @@ from config import (
     PEAK_MOVEMENT_CANCEL_KG,
     PEAK_MOVEMENT_CONFIRM_FRAMES,
     SAVE_ABSORBED_PEAK_CANDIDATE_EVIDENCE,
-    SESSION_DEDUP_STATE_FILE,
     SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT,
     SESSION_FINALIZATION_DB,
     SESSION_END_EMPTY_DWELL_SECONDS,
@@ -153,10 +151,6 @@ class SessionManager:
         self.duplicate_reviewer = duplicate_reviewer
 
         self.session = WeighingSessionState()
-        self._last_publish_plate = None
-        self._last_publish_weight = None
-        self._last_publish_session_end = None
-        self._publish_lock = threading.Lock()
         self._vehicle_summary_cache = None
         self._vehicle_summary_ts = 0.0
         self._attempt = None
@@ -193,7 +187,6 @@ class SessionManager:
         self._spool_failure_logged_for = None
         self._pending_terminal_snapshot = None
         self._last_spool_weight_checkpoint = 0.0
-        self._load_dedup_state()
 
     def session_context(self):
         with self._lifecycle_lock:
@@ -247,29 +240,6 @@ class SessionManager:
             return
         self._end_session("both_plate_tracks_lost", log_fn)
 
-    def _load_dedup_state(self):
-        try:
-            with open(SESSION_DEDUP_STATE_FILE, encoding="utf-8") as handle:
-                state = json.load(handle)
-            self._last_publish_plate = state.get("plate")
-            self._last_publish_weight = state.get("weight")
-            self._last_publish_session_end = state.get("ended_at")
-        except (OSError, ValueError, TypeError):
-            pass
-
-    def _save_dedup_state(self):
-        os.makedirs(os.path.dirname(SESSION_DEDUP_STATE_FILE), exist_ok=True)
-        temp = SESSION_DEDUP_STATE_FILE + ".tmp"
-        with open(temp, "w", encoding="utf-8") as handle:
-            json.dump({
-                "plate": self._last_publish_plate,
-                "weight": self._last_publish_weight,
-                "ended_at": self._last_publish_session_end,
-            }, handle, separators=(",", ":"), sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, SESSION_DEDUP_STATE_FILE)
-
     def shutdown(self, log_fn):
         """Persist active capture state before sampler and inference workers stop."""
         with self._lifecycle_lock:
@@ -300,8 +270,8 @@ class SessionManager:
         """Logging callback (throttled ~1s by reader)."""
         vehicle_info = ""
         if self.vehicle_tracker and self.session.session_active:
-            summary = self._get_vehicle_summary()
-            if summary["vehicle_type"]:
+            summary = self._get_vehicle_summary() or {}
+            if summary.get("vehicle_type"):
                 vehicle_info = f"  vehicle={summary['vehicle_type']}"
         tracker_plate, tracker_score = None, 0.0
         if self.session.session_active and frame.weight > WEIGHT_THRESHOLD:
@@ -807,9 +777,10 @@ class SessionManager:
         if not self.session.session_active or not self.vehicle_tracker:
             return
 
-        summary = self._get_vehicle_summary()
-        if summary["vehicle_type"] and summary["vehicle_type"] != self.session.vehicle_type:
-            self.session.vehicle_type = summary["vehicle_type"]
+        summary = self._get_vehicle_summary() or {}
+        vehicle_type = summary.get("vehicle_type")
+        if vehicle_type and vehicle_type != self.session.vehicle_type:
+            self.session.vehicle_type = vehicle_type
             log_fn("VEHICLE", f"Session vehicle_type={self.session.vehicle_type}")
 
     def on_status_change(self, frame, old_status: str, new_status: str, log_fn):
@@ -875,6 +846,7 @@ class SessionManager:
             self.session.stable_weight = None
             self.session.last_publish_weight = None
             self.session.clear_stable_weight_history()
+            self._session_weight_window.clear()
             self._session_weight_window.extend(rising_window)
             if self._session_weight_window:
                 self._session_raw_peak = max(self._session_weight_window)
@@ -1167,8 +1139,8 @@ class SessionManager:
                 self.frame_spool.update_active_metadata(self.session.session_id, metadata)
                 self.frame_spool.end_session(self.session.session_id, metadata)
                 queued = True
-                self.fatal_error = None
                 if self._spool_failure_logged_for == metadata["session_id"]:
+                    self.fatal_error = None
                     log_metric(
                         log_fn, "session_spool_finalization_recovered",
                         id=metadata["session_id"], started_at=metadata["started_at"],
@@ -1233,6 +1205,8 @@ class SessionManager:
         self._session_local_peak_confirmed = False
         self._session_weight_window.clear()
         self.session.stable_count = 0
+        self.session.stable_weight = None
+        self.session.stable_decimal_pos = 0
         self.session.clear_stable_weight_history()
         self.session.last_publish_weight = None
         self.session.last_publish_decimal_pos = 0
@@ -1642,14 +1616,6 @@ class SessionManager:
             )
             log_fn("OFFLINE", f"Publish queued offline id={result.get('offline_event_id')} plate={plate}")
 
-        with self._publish_lock:
-            self._last_publish_plate = plate
-            self._last_publish_weight = stable_weight
-            self._last_publish_session_end = metadata.get("ended_at")
-            try:
-                self._save_dedup_state()
-            except OSError as exc:
-                log_fn("ERROR", f"Session dedup state save failed: {exc}")
         return {"status": "published", "plate": plate, "outbox_event_id": outbox_event_id,
                 "image_object_keys": image_object_keys}
 

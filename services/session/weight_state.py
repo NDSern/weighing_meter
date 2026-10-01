@@ -8,8 +8,6 @@ from config import (
     WEIGHT_THRESHOLD,
 )
 
-MAX_STABLE_WEIGHT_CANDIDATES = 256
-
 
 class WeighingSessionState:
     """Mutable state for one weighing session lifecycle."""
@@ -88,18 +86,6 @@ class WeighingSessionState:
         self.stable_weight_last_seen[weight] = self.stable_weight_sequence
         self.stable_weight_decimal_pos[weight] = decimal_pos
         self.stable_weight_observation_times[weight] = observed_at
-        if len(self.stable_weight_counts) > MAX_STABLE_WEIGHT_CANDIDATES:
-            oldest_weakest = min(
-                self.stable_weight_counts,
-                key=lambda value: (
-                    self.stable_weight_counts[value],
-                    self.stable_weight_last_seen[value],
-                ),
-            )
-            self.stable_weight_counts.pop(oldest_weakest)
-            self.stable_weight_last_seen.pop(oldest_weakest, None)
-            self.stable_weight_decimal_pos.pop(oldest_weakest, None)
-            self.stable_weight_observation_times.pop(oldest_weakest, None)
         self.stable_weight = max(
             self.stable_weight_counts,
             key=lambda value: (

@@ -18,9 +18,12 @@ to finalized_at when a record has no started_at. All times are UTC ISO.
 """
 import argparse
 import json
+import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 # Minimal columns per user feedback: timestamp + plate + weight are the key
 # values; the rest are kept small but useful for sorting/filtering.
@@ -59,8 +62,33 @@ def _to_iso(value):
     return str(value)
 
 
+_SHEET_TITLE_UNSAFE = re.compile(r"[\[\]:*?/\\]")
+
+
+def _safe_sheet_title(title):
+    """Return an Excel-safe sheet title (<=31 chars, no reserved characters)."""
+    cleaned = _SHEET_TITLE_UNSAFE.sub("_", str(title or "sessions"))
+    return cleaned[:31] or "sessions"
+
+
+def _parse_ts(value):
+    """Parse a stored timestamp into an aware UTC datetime, or None."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _rows_from_db(db_path, machine):
-    con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    con = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(db_path)), uri=True)
     try:
         cur = con.execute(
             "SELECT f.session_id, f.outcome, f.finalized_at, t.record_json "
@@ -86,12 +114,16 @@ def _rows_from_db(db_path, machine):
 
 
 def _in_window(rec, finalized_at, date, start, end):
-    ts = _to_iso(rec.get("started_at") or rec.get("ended_at") or finalized_at)
-    if date and not ts.startswith(date):
+    ts = _parse_ts(rec.get("started_at") or rec.get("ended_at") or finalized_at)
+    if ts is None:
         return False
-    if start and ts < start:
+    if date and ts.strftime("%Y-%m-%d") != date:
         return False
-    if end and ts > end:
+    start_ts = _parse_ts(start)
+    if start and start_ts and ts < start_ts:
+        return False
+    end_ts = _parse_ts(end)
+    if end and end_ts and ts > end_ts:
         return False
     return True
 
@@ -157,7 +189,7 @@ def export(dbs, out_path, combined, date, start, end, layout):
     headers = [h for _, h in cols]
 
     def write_sheet(title, rows):
-        ws = wb.create_sheet(title)
+        ws = wb.create_sheet(_safe_sheet_title(title))
         ws.append(headers)
         for c in ws[1]:
             c.font = Font(bold=True)

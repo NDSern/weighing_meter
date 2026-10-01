@@ -34,7 +34,7 @@ def saveConfirmedLicensePlate(license_plate, session_id=None):
     try:
         return plate_store.increment(db_file, license_plate, session_id)
     except Exception as exc:
-        print(f"[PLATE_DB] saveConfirmedLicensePlate failed: {exc}", flush=True)
+        log("ERROR", f"[PLATE_DB] saveConfirmedLicensePlate failed: {exc}")
         return None
 
 

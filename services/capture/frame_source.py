@@ -3,7 +3,6 @@
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit, urlunsplit
 
 import cv2
 import numpy as np
@@ -43,22 +42,12 @@ def log(level: str, msg: str):
 def mask_url_secret(url: str):
     """Mask a URL's password for logging.
 
-    Rebuilds from parsed parts so a password containing ``@`` or other
-    reserved characters cannot leak past the first ``@`` (a regex-based mask
-    stops there and prints the remainder).
+    Delegates to :func:`services.runtime.bootstrap.mask_url_secret` so the
+    masking logic lives in one place.
     """
-    text = str(url)
-    try:
-        parts = urlsplit(text)
-        if not parts.password:
-            return text
-        host = parts.hostname or ""
-        if parts.port:
-            host = f"{host}:{parts.port}"
-    except ValueError:
-        return text
-    credentials = f"{parts.username}:***" if parts.username else "***"
-    return urlunsplit((parts.scheme, f"{credentials}@{host}", parts.path, parts.query, parts.fragment))
+    from services.runtime.bootstrap import mask_url_secret as _mask
+
+    return _mask(url)
 
 
 class _LatestFrameSource:
@@ -109,12 +98,6 @@ class _LatestFrameSource:
         with self._frame_lock:
             self._latest_frame = None
         return not self._thread or not self._thread.is_alive()
-
-    def get_latest_frame(self):
-        with self._frame_lock:
-            frame = self._latest_frame
-            self._latest_frame = None
-            return frame
 
     def peek_latest_frame(self, copy_frame=False):
         with self._frame_lock:
