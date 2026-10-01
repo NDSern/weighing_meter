@@ -198,5 +198,53 @@ class OcrInferenceTests(unittest.TestCase):
         self.assertEqual(ocr.inference.call_count, 2)
 
 
+class CtcBeamDecodeTests(unittest.TestCase):
+    """Regression: top-K must be able to emit doubled adjacent characters."""
+
+    CHARSET = ["[blank]", *list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"), " "]
+
+    @classmethod
+    def _logits(cls, sequence, peak=0.98):
+        """Build [T, 38] restricted probabilities with `sequence` of classes."""
+        spread = (1.0 - peak) / max(len(cls.CHARSET) - 1, 1)
+        logits = np.full((len(sequence), len(cls.CHARSET)), spread, dtype=np.float64)
+        for t, index in enumerate(sequence):
+            logits[t, index] = peak
+        return logits
+
+    def _top1(self, sequence):
+        ranked = lpr._ctc_decode_topk(
+            self._logits(sequence), self.CHARSET, topk=5, beam_width=10
+        )
+        return ranked[0][0]
+
+    def _index(self, char):
+        return self.CHARSET.index(char)
+
+    def test_repeated_adjacent_character_is_decodable(self):
+        # two identical adjacent peaks with no blank -> "11" (not collapsed)
+        one = self._index("1")
+        self.assertEqual(self._top1([one, one]), "11")
+
+    def test_two_doubled_characters(self):
+        # "1", blank, "2", "2" -> "122"
+        one, two, blank = self._index("1"), self._index("2"), 0
+        self.assertEqual(self._top1([one, blank, two, two]), "122")
+
+    def test_blank_between_same_char_collapses(self):
+        # identical peaks separated by a blank collapse to one char
+        one, blank = self._index("1"), 0
+        self.assertEqual(self._top1([one, blank, one]), "1")
+
+    def test_triple_repeat(self):
+        # three identical adjacent peaks -> "444"
+        four = self._index("4")
+        self.assertEqual(self._top1([four, four, four]), "444")
+
+    def test_non_adjacent_repeats_unaffected(self):
+        one, two = self._index("1"), self._index("2")
+        self.assertEqual(self._top1([one, two, one]), "121")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -222,16 +222,20 @@ def _ctc_decode_topk(logits, charset, topk=None, beam_width=None, blank_idx=0):
                     continue
                 ch = charset[int(c)]
                 end = prefix[-1:] if prefix else ""
-                new_prefix = prefix if ch == end else prefix + ch
-                nb_b, nb_nb = next_beams.get(new_prefix, (-np.inf, -np.inf))
                 if ch == end:
-                    nb_nb = _logsumexp(nb_nb, p_b + p)
-                    old_b, old_nb = next_beams.get(prefix, (-np.inf, -np.inf))
-                    old_nb = _logsumexp(old_nb, p_nb + p)
-                    next_beams[prefix] = (old_b, old_nb)
+                    # ch repeats the prefix's last char.
+                    # p_nb (prefix ended in blank) extends to prefix + ch via the
+                    # p_nb path; p_b (prefix ended in that char) cannot repeat it
+                    # directly, so it stays on prefix.
+                    nb_b, nb_nb = next_beams.get(prefix + ch, (-np.inf, -np.inf))
+                    next_beams[prefix + ch] = (nb_b, _logsumexp(nb_nb, p_nb + p))
+                    nb_b, nb_nb = next_beams.get(prefix, (-np.inf, -np.inf))
+                    next_beams[prefix] = (_logsumexp(nb_b, p_b + p), nb_nb)
                 else:
+                    new_prefix = prefix + ch
+                    nb_b, nb_nb = next_beams.get(new_prefix, (-np.inf, -np.inf))
                     nb_nb = _logsumexp(nb_nb, _logsumexp(p_b, p_nb) + p)
-                next_beams[new_prefix] = (nb_b, nb_nb)
+                    next_beams[new_prefix] = (nb_b, nb_nb)
         beams = dict(sorted(next_beams.items(), key=lambda kv: _logsumexp(kv[1][0], kv[1][1]), reverse=True)[:beam_width])
     ranked = []
     for text, (p_b, p_nb) in beams.items():
