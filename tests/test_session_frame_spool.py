@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -284,6 +285,65 @@ class SessionFrameSpoolTests(unittest.TestCase):
 
             self.assertFalse(os.path.exists(path))
             self.assertFalse(os.path.exists(session_dir))
+
+    def test_acknowledge_job_holds_lock_for_byte_accounting(self):
+        class CountingLock:
+            def __init__(self):
+                self.entries = 0
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self.entries += 1
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self._lock.release()
+                return False
+
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("done", {"cam1": Frame(1)})
+            path = spool.end_session("done", {})
+            self.assertGreater(spool._bytes_written, 0)
+
+            counter = CountingLock()
+            spool._lock = counter
+            spool.acknowledge_job(path)
+
+            self.assertEqual(spool._bytes_written, 0)
+            self.assertGreaterEqual(counter.entries, 1)
+
+    def test_resume_cleanup_holds_lock_for_byte_accounting(self):
+        class CountingLock:
+            def __init__(self):
+                self.entries = 0
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self.entries += 1
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self._lock.release()
+                return False
+
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("cleanup", {"cam1": Frame(1)})
+            job = spool.end_session("cleanup", {})
+            self.assertGreater(spool._bytes_written, 0)
+            # Simulate a completed inference whose cleanup was interrupted.
+            os.replace(job, os.path.join(spool.cleanup_dir, os.path.basename(job)))
+
+            counter = CountingLock()
+            spool._lock = counter
+            spool._resume_cleanup()
+
+            self.assertFalse(os.path.exists(session_dir))
+            self.assertEqual(spool._bytes_written, 0)
+            self.assertGreaterEqual(counter.entries, 1)
 
     def test_abort_clears_partial_active_session(self):
         with tempfile.TemporaryDirectory() as root:

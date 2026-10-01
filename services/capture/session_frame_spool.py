@@ -200,7 +200,8 @@ class SessionFrameSpool:
                 try:
                     size = self._directory_size(session_dir)
                     shutil.rmtree(session_dir)
-                    self._bytes_written = max(0, self._bytes_written - size)
+                    with self._lock:
+                        self._bytes_written = max(0, self._bytes_written - size)
                 except OSError:
                     return
         self._unlink_durable(cleanup_path)
@@ -301,7 +302,8 @@ class SessionFrameSpool:
                 size = 0
             except OSError:
                 continue
-            self._bytes_written = max(0, self._bytes_written - size)
+            with self._lock:
+                self._bytes_written = max(0, self._bytes_written - size)
             self._unlink_durable(path)
         self._expire_quarantine()
 
@@ -322,7 +324,8 @@ class SessionFrameSpool:
                         removed_bytes += self._directory_size(session_dir)
                         shutil.rmtree(session_dir)
                     self._remove_path(path)
-                    self._bytes_written = max(0, self._bytes_written - removed_bytes)
+                    with self._lock:
+                        self._bytes_written = max(0, self._bytes_written - removed_bytes)
                 except OSError:
                     continue
 
