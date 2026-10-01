@@ -221,8 +221,10 @@ def construct_service(log, res=None) -> ServiceResources:
     res.plate_tracker = PlateTracker()
     if MQTT_ENABLED:
         res.mqtt_svc = MqttService(on_log=log)
-        res.mqtt_svc.start()
+        # Mark started before start() so shutdown still stops a half-started
+        # resource when start() raises after spawning its thread.
         res.mqtt_started = True
+        res.mqtt_svc.start()
     else:
         log("INFO", "MQTT disabled (MQTT_ENABLED=False)")
 
@@ -333,11 +335,11 @@ def construct_service(log, res=None) -> ServiceResources:
         memory_cleanup_fn=_malloc_trim,
         log_fn=log,
     )
-    ImageSaveWorker.start_upload_worker()
     res.image_worker_started = True
+    ImageSaveWorker.start_upload_worker()
     if MQTT_ENABLED and res.mqtt_svc:
-        PublishOutbox.start(res.mqtt_svc)
         res.outbox_started = True
+        PublishOutbox.start(res.mqtt_svc)
     res.frame_spool.start()
     res.deferred_lpr.start()
     res.detect_coord.start()
