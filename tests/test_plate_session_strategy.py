@@ -200,6 +200,35 @@ class PlateTrackTests(unittest.TestCase):
         self.assertEqual(debug_calls[1], alt)    # alt candidate (0.75)
         self.assertEqual(debug_calls[2], best)   # final best-plate debug
 
+    def test_stale_session_context_is_ignored_by_plate_processing(self):
+        tracker = Mock()
+        coordinator = DetectCoordinator([Mock()], tracker, session_context=lambda: ("new", 1))
+        coordinator._enabled = True
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        plates = [{"plate": "14C-017.80", "det_conf": 0.95, "crop_size": "100x40",
+                   "votes": 3, "valid_candidates": [("14C-017.80", 0.95)]}]
+        frame = Mock()
+
+        coordinator._process_plate_detections(camera, plates, frame, expected_context=("old", 0))
+
+        tracker.add_observation.assert_not_called()
+        tracker.update_image.assert_not_called()
+
+    def test_matching_session_context_processes_detections(self):
+        tracker = Mock()
+        coordinator = DetectCoordinator([Mock()], tracker, session_context=lambda: ("new", 1))
+        coordinator._enabled = True
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        plates = [{"plate": "14C-017.80", "det_conf": 0.95, "crop_size": "100x40",
+                   "votes": 3, "valid_candidates": [("14C-017.80", 0.95)]}]
+        frame = Mock()
+
+        coordinator._process_plate_detections(camera, plates, frame, expected_context=("new", 1))
+
+        tracker.add_observation.assert_called_once()
+
     def test_detect_loop_does_not_resubmit_same_frame_generation(self):
         camera = Mock(name="camera")
         camera.name = "cam1"

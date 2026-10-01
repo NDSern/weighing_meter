@@ -319,9 +319,15 @@ class DetectCoordinator:
                 return []
             return metadata
 
-    def _process_plate_detections(self, cam, plates, full_frame):
+    def _process_plate_detections(self, cam, plates, full_frame, expected_context=None):
         """Process plate detections: log, update tracker, capture best plate and unknown frame."""
         if not self.is_enabled():
+            return
+        if expected_context is not None and expected_context != self._session_context():
+            # The session may have started and cleared the shared tracker after
+            # this OCR job was queued; drop the stale detections rather than
+            # attributing them to the new session.
+            log("INFO", f"[{cam.name}] stale detections ignored context={expected_context}")
             return
         best_conf = 0.0
         best_plate = None
@@ -432,7 +438,7 @@ class DetectCoordinator:
                             "ocr",
                             f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates={len(plates)} age={age_ms:.0f}ms plate={summary}",
                         )
-                self._process_plate_detections(cam, plates, full_frame)
+                self._process_plate_detections(cam, plates, full_frame, job["session_context"])
             except Exception as exc:
                 log("ERROR", f"OCR worker error [{cam.name}]: {exc}")
             finally:
