@@ -2,8 +2,8 @@
 
 import threading
 import time
-import re
 from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
 
 import cv2
 import numpy as np
@@ -41,7 +41,24 @@ def log(level: str, msg: str):
 
 
 def mask_url_secret(url: str):
-    return re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", str(url))
+    """Mask a URL's password for logging.
+
+    Rebuilds from parsed parts so a password containing ``@`` or other
+    reserved characters cannot leak past the first ``@`` (a regex-based mask
+    stops there and prints the remainder).
+    """
+    text = str(url)
+    try:
+        parts = urlsplit(text)
+        if not parts.password:
+            return text
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+    except ValueError:
+        return text
+    credentials = f"{parts.username}:***" if parts.username else "***"
+    return urlunsplit((parts.scheme, f"{credentials}@{host}", parts.path, parts.query, parts.fragment))
 
 
 class _LatestFrameSource:
