@@ -1,5 +1,6 @@
 import unittest
 import sys
+import threading
 import numpy as np
 from types import SimpleNamespace
 from unittest import mock
@@ -74,6 +75,52 @@ class RtspResolutionTests(unittest.TestCase):
 
         self.assertTrue(CameraGrabber._is_corrupt_green_frame(corrupt))
         self.assertFalse(CameraGrabber._is_corrupt_green_frame(valid))
+
+
+class CaptureLifecycleTests(unittest.TestCase):
+    """The grab loop owns the VideoCapture lifetime; stop() must never release it."""
+
+    def setUp(self):
+        self.logs = []
+        set_log_fn(lambda level, message: self.logs.append((level, message)))
+        self.addCleanup(set_log_fn, None)
+
+    def test_opencv_capture_sets_finite_timeouts(self):
+        cap = mock.Mock()
+
+        with mock.patch.object(frame_source.cv2, "VideoCapture", return_value=cap):
+            source = CameraGrabber("rtsp://camera/main")
+            source._open_capture()
+
+        cap.set.assert_any_call(frame_source.cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        cap.set.assert_any_call(frame_source.cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+
+    def test_stop_does_not_release_an_in_flight_capture(self):
+        cap = mock.Mock()
+        cap.isOpened.return_value = True
+        in_flight = threading.Event()
+        release_block = threading.Event()
+
+        def fake_grab():
+            in_flight.set()
+            release_block.wait(2.0)
+            return True
+
+        cap.grab.side_effect = fake_grab
+        cap.retrieve.return_value = (True, np.zeros((8, 8, 3), dtype=np.uint8))
+
+        source = CameraGrabber("rtsp://camera/main")
+        source._opencv_capture = lambda: cap
+        with mock.patch.object(frame_source, "_GST_AVAILABLE", False):
+            source.start()
+            self.assertTrue(in_flight.wait(2.0), "grab loop never started")
+            # stop() while the loop is inside cap.grab() must not release the
+            # capture concurrently (undefined behaviour / FFmpeg crash).
+            self.assertFalse(source.stop(timeout=0.2))
+            cap.release.assert_not_called()
+            release_block.set()
+        source._thread.join(2.0)
+        self.assertEqual(cap.release.call_count, 1)
 
 
 if __name__ == "__main__":
