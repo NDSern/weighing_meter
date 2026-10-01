@@ -314,7 +314,10 @@ class SessionStrategyTests(unittest.TestCase):
         self.assertIsNone(self.manager._plate_absent_since)
 
     def test_both_camera_loss_waits_for_scale_callback(self):
-        with patch("services.session.session_manager.time.monotonic", side_effect=[0.0, 0.0, 1.1]):
+        with patch(
+            "services.session.session_manager.time.monotonic",
+            side_effect=[0.0, 0.0, 0.0, 1.1],
+        ):
             self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam3", {"cam1": False, "cam3": False}, self.log)

@@ -47,7 +47,24 @@ class PlateCandidateLifecycleTests(unittest.TestCase):
         empty = frame(0)
         log = Mock()
 
-        with patch("services.session.session_manager.time.time", side_effect=[10.0, 12.1]):
+        with patch("services.session.session_manager.time.monotonic", side_effect=[10.0, 12.1]):
+            self.assertFalse(manager._check_scale_empty(empty, log))
+            self.assertTrue(manager._check_scale_empty(empty, log))
+
+        manager._end_session.assert_called_once_with("scale_empty", log)
+
+    def test_scale_empty_dwell_uses_monotonic_not_wall_clock(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.scale_owned = True
+        manager._end_session = Mock(return_value=True)
+        empty = frame(0)
+        log = Mock()
+
+        with patch("services.session.session_manager.time.time", return_value=0.0), patch(
+            "services.session.session_manager.time.monotonic",
+            side_effect=[100.0, 102.1],
+        ):
             self.assertFalse(manager._check_scale_empty(empty, log))
             self.assertTrue(manager._check_scale_empty(empty, log))
 
@@ -107,8 +124,9 @@ class PlateCandidateLifecycleTests(unittest.TestCase):
         manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, log)
         manager._end_session = Mock(return_value=True)
         manager.session.started_at = 1.0
+        manager._session_started_monotonic = 1.0
 
-        with patch("services.session.session_manager.time.time", return_value=181.0):
+        with patch("services.session.session_manager.time.monotonic", return_value=181.0):
             self.assertTrue(manager._check_plate_only_timeout(log))
 
         self.assertTrue(manager._plate_rearm_blocked)

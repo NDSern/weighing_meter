@@ -169,6 +169,7 @@ class SessionManager:
         self._scale_recovery_blocked = False
         self._scale_data_gap_details = None
         self._post_session_empty_since = None
+        self._session_started_monotonic = None
         self._peak_candidate = None
         self._peak_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
         self._peak_movement_frames = []
@@ -601,7 +602,7 @@ class SessionManager:
         if frame.weight > WEIGHT_THRESHOLD:
             self._post_session_empty_since = None
             return True
-        now = time.time()
+        now = time.monotonic()
         if self._post_session_empty_since is None:
             self._post_session_empty_since = now
             return True
@@ -669,7 +670,7 @@ class SessionManager:
             return
 
         self._attempt["max_weight"] = max(self._attempt["max_weight"], frame.weight)
-        now = time.time()
+        now = time.monotonic()
         if frame.weight <= WEIGHT_THRESHOLD:
             self._attempt_empty_since = self._attempt_empty_since or now
             if now - self._attempt_empty_since >= SESSION_END_EMPTY_DWELL_SECONDS:
@@ -792,9 +793,9 @@ class SessionManager:
             self.session.empty_since = None
             return False
         if self.session.empty_since is None:
-            self.session.empty_since = time.time()
+            self.session.empty_since = time.monotonic()
             return False
-        if (time.time() - self.session.empty_since) < SESSION_END_EMPTY_DWELL_SECONDS:
+        if (time.monotonic() - self.session.empty_since) < SESSION_END_EMPTY_DWELL_SECONDS:
             return False
 
         if self._end_session("scale_empty", log_fn) is False:
@@ -896,6 +897,7 @@ class SessionManager:
                         ).isoformat(timespec="milliseconds")
         self.session.lpr_start_frames = self._attempt["start_frames"]
         self.session.started_at = time.time()
+        self._session_started_monotonic = time.monotonic()
         self.session.session_id = self._attempt["id"]
         self.session.started_at_iso = self._attempt["started_at"]
         if self.session.stable_weight is not None:
@@ -1013,8 +1015,8 @@ class SessionManager:
         if (
             not self.session.session_active
             or self.session.scale_owned
-            or self.session.started_at is None
-            or time.time() - self.session.started_at < SESSION_PLATE_ONLY_TIMEOUT_SECONDS
+            or self._session_started_monotonic is None
+            or time.monotonic() - self._session_started_monotonic < SESSION_PLATE_ONLY_TIMEOUT_SECONDS
         ):
             return False
         self._plate_rearm_blocked = True
@@ -1257,6 +1259,7 @@ class SessionManager:
         self.session.local_peak_drop_snapshot_captured_at = {}
         self.session.started_at = None
         self.session.started_at_iso = None
+        self._session_started_monotonic = None
         self.session.session_id = None
         self.session.rear_start_path = None
         self.session.spool_active = False

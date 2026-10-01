@@ -1206,7 +1206,7 @@ class SessionWeightTests(unittest.TestCase):
         frame.status = "UNSTABLE"
 
         with unittest.mock.patch(
-            "services.session.session_manager.time.time",
+            "services.session.session_manager.time.monotonic",
             side_effect=[10.0, 11.9, 12.0],
         ):
             manager.on_frame(frame, Mock())
@@ -1224,7 +1224,7 @@ class SessionWeightTests(unittest.TestCase):
         loaded.status = "UNSTABLE"
 
         with unittest.mock.patch(
-            "services.session.session_manager.time.time",
+            "services.session.session_manager.time.monotonic",
             side_effect=[10.0, 12.0, 14.0],
         ):
             manager.on_frame(empty, Mock())
@@ -1750,7 +1750,7 @@ class SessionWeightTests(unittest.TestCase):
 
         empty = make_frame(0)
         with unittest.mock.patch(
-            "services.session.session_manager.time.time", side_effect=[1.0, 3.1],
+            "services.session.session_manager.time.monotonic", side_effect=[1.0, 3.1],
         ):
             manager.on_frame(empty, log)
             manager.on_frame(empty, log)
@@ -1941,7 +1941,7 @@ class AttemptArchiveTests(unittest.TestCase):
         empty.status = "UNSTABLE"
 
         with unittest.mock.patch(
-            "services.session.session_manager.time.time",
+            "services.session.session_manager.time.monotonic",
             side_effect=[10.0, 11.0, 12.0, 14.0],
         ):
             manager.on_frame(unstable, Mock())
