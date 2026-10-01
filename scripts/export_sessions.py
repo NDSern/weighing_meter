@@ -20,6 +20,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 
 # Minimal columns per user feedback: timestamp + plate + weight are the key
 # values; the rest are kept small but useful for sorting/filtering.
@@ -37,6 +38,18 @@ COLUMNS = [
     ("end_reason", "End reason"),
     ("duration_s", "Duration (s)"),
 ]
+
+# Slim layout: start split into local day + time for shift-style review.
+COMPACT_COLUMNS = [
+    ("machine", "Machine"),
+    ("start_day", "Day (Start)"),
+    ("start_time", "Time (Start)"),
+    ("plate", "Plate"),
+    ("stable_weight_kg", "Weight (kg)"),
+    ("duration", "Duration"),
+]
+
+LOCAL_TZ = timezone(timedelta(hours=7))  # production hosts are UTC+7
 
 
 def _to_iso(value):
@@ -86,9 +99,11 @@ def _in_window(rec, finalized_at, date, start, end):
 def _record_to_row(entry):
     rec = entry["record"]
     stable = rec.get("stable_weight_kg", rec.get("stable_weight"))
-    return {
+    started = _to_iso(rec.get("started_at") or rec.get("session_start"))
+    duration_s = rec.get("duration_s")
+    row = {
         "machine": entry["machine"],
-        "started_at": _to_iso(rec.get("started_at") or rec.get("session_start")),
+        "started_at": started,
         "ended_at": _to_iso(rec.get("ended_at") or rec.get("session_end")),
         "plate": rec.get("plate") or "",
         "stable_weight_kg": stable if stable is not None else "",
@@ -98,11 +113,30 @@ def _record_to_row(entry):
         "weight_source": rec.get("weight_source") or "",
         "session_id": rec.get("id") or rec.get("session_id") or entry["session_id"],
         "end_reason": rec.get("end_reason") or "",
-        "duration_s": rec.get("duration_s") if rec.get("duration_s") is not None else "",
+        "duration_s": duration_s if duration_s is not None else "",
     }
+    # compact fields
+    day = ""
+    clock = ""
+    if started:
+        try:
+            ts = started.replace("Z", "+00:00")
+            local = datetime.fromisoformat(ts)
+            if local.tzinfo is None:
+                local = local.replace(tzinfo=timezone.utc)
+            local = local.astimezone(LOCAL_TZ)
+            day = local.strftime("%d/%m")
+            clock = local.strftime("%H:%M:%S")
+        except ValueError:
+            day = started[:10]
+            clock = started[11:19]
+    row["start_day"] = day
+    row["start_time"] = clock
+    row["duration"] = "" if duration_s is None else str(timedelta(seconds=int(duration_s)))
+    return row
 
 
-def export(dbs, out_path, combined, date, start, end):
+def export(dbs, out_path, combined, date, start, end, layout):
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font
@@ -114,12 +148,13 @@ def export(dbs, out_path, combined, date, start, end):
 
     wb = Workbook()
     wb.remove(wb.active)
-    headers = [h for _, h in COLUMNS]
-    if not combined:
-        headers = headers[1:]  # drop Machine column when one sheet per host
-        cols = COLUMNS[1:]
+    if layout == "compact":
+        cols = COMPACT_COLUMNS
     else:
         cols = COLUMNS
+        if not combined:
+            cols = cols[1:]  # drop Machine column when one sheet per host
+    headers = [h for _, h in cols]
 
     def write_sheet(title, rows):
         ws = wb.create_sheet(title)
@@ -184,10 +219,13 @@ def main():
     p.add_argument("--from", dest="start", help="keep sessions started >= this ISO timestamp")
     p.add_argument("--to", dest="end", help="keep sessions started <= this ISO timestamp")
     p.add_argument("--out", required=True, help="output .xlsx path")
+    p.add_argument("--layout", choices=("full", "compact"), default="full",
+                   help="full keeps all columns; compact = Machine, Day(Start), "
+                        "Time(Start), Plate, Weight(kg), Duration")
     a = p.parse_args()
 
     dbs = _parse_db_arg(a.db)
-    export(dbs, a.out, a.combined, a.date, a.start, a.end)
+    export(dbs, a.out, a.combined, a.date, a.start, a.end, a.layout)
 
 
 if __name__ == "__main__":
