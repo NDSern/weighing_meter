@@ -219,9 +219,9 @@ def main():
     p.add_argument("--from", dest="start", help="keep sessions started >= this ISO timestamp")
     p.add_argument("--to", dest="end", help="keep sessions started <= this ISO timestamp")
     p.add_argument("--out", required=True, help="output .xlsx path")
-    p.add_argument("--layout", choices=("full", "compact"), default="full",
-                   help="full keeps all columns; compact = Machine, Day(Start), "
-                        "Time(Start), Plate, Weight(kg), Duration")
+    p.add_argument("--layout", choices=("full", "compact"), default="compact",
+                   help="compact (default) = Machine, Day(Start), Time(Start), "
+                        "Plate, Weight(kg), Duration; full keeps all columns")
     a = p.parse_args()
 
     dbs = _parse_db_arg(a.db)
