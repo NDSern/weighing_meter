@@ -273,6 +273,25 @@ def validate_runtime_config():
     ):
         require_text(name)
 
+    def require_number(name, minimum=None):
+        value = globals().get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            errors.append(f"{name} must be a number")
+            return
+        if minimum is not None and value <= minimum:
+            errors.append(f"{name} must be greater than {minimum}")
+
+    require_text("SERIAL_PORT")
+    for name in (
+        "SCALE_READER_STALL_SECONDS",
+        "SCALE_READER_RECONNECT_INITIAL_SECONDS",
+        "SCALE_READER_RECONNECT_MAX_SECONDS",
+        "WEIGHT_THRESHOLD",
+        "BAUD_RATE",
+        "SCALE_DATA_RETENTION_DAYS",
+    ):
+        require_number(name, minimum=0)
+
     def require_rtsp(name):
         value = globals().get(name)
         if not isinstance(value, str) or not value.strip():

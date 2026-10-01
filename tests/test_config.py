@@ -123,6 +123,37 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MINIO_SECRET_KEY"):
             config.validate_runtime_config()
 
+    def test_scale_reader_numbers_must_be_positive(self):
+        config = self.load_config(
+            'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'
+            'SCALE_READER_STALL_SECONDS = 0\n'
+            'WEIGHT_THRESHOLD = -1\n'
+            + _CREDENTIALS
+        )
+
+        with self.assertRaisesRegex(ValueError, "SCALE_READER_STALL_SECONDS.*WEIGHT_THRESHOLD"):
+            config.validate_runtime_config()
+
+    def test_scale_reader_numbers_must_be_numeric(self):
+        config = self.load_config(
+            'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'
+            'WEIGHT_THRESHOLD = "heavy"\n'
+            + _CREDENTIALS
+        )
+
+        with self.assertRaisesRegex(ValueError, "WEIGHT_THRESHOLD must be a number"):
+            config.validate_runtime_config()
+
+    def test_serial_port_must_be_non_empty(self):
+        config = self.load_config(
+            'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'
+            'SERIAL_PORT = ""\n'
+            + _CREDENTIALS
+        )
+
+        with self.assertRaisesRegex(ValueError, "SERIAL_PORT"):
+            config.validate_runtime_config()
+
     def test_configured_fallback_model_must_exist(self):
         config = self.load_config(
             'LPR_FALLBACK_DETECTOR_MODEL = "/missing/fallback.rknn"\n'
