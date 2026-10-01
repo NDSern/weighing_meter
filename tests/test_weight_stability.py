@@ -2027,5 +2027,76 @@ class AttemptArchiveTests(unittest.TestCase):
             for call in log.call_args_list
         ))
 
+class ReaderFailureTests(unittest.TestCase):
+    def _reader(self, max_open_attempts=3):
+        db = tempfile.NamedTemporaryFile(suffix=".db")
+        self.addCleanup(db.close)
+        reader = D2008Reader(
+            port="/dev/null",
+            db_file=db.name,
+            dump_file=None,
+            reconnect_initial_seconds=0.0,
+            reconnect_max_seconds=0.0,
+            max_open_attempts=max_open_attempts,
+        )
+        self.addCleanup(reader._db.close)
+        reader.on_health = Mock()
+        reader._running = True
+        return reader
+
+    def test_unopenable_serial_port_marks_reader_failed(self):
+        import d2008_scale_reader as module
+
+        reader = self._reader(max_open_attempts=3)
+
+        with unittest.mock.patch.object(module.serial, "SerialException", OSError), \
+                unittest.mock.patch.object(module.serial, "Serial", side_effect=OSError("no port")):
+            reader._run()
+
+        self.assertEqual(reader.state, "failed")
+        self.assertEqual(reader._open_failures, 3)
+        self.assertFalse(reader._running)
+        self.assertTrue(any(call.args[0] == "failed" for call in reader.on_health.call_args_list))
+        self.assertIn("serial port unavailable", reader.last_error or "")
+
+    def test_unexpected_error_leaves_reader_failed(self):
+        import d2008_scale_reader as module
+
+        reader = self._reader()
+        fake = Mock()
+        fake.is_open = True
+        fake.in_waiting = 0
+        fake.read.side_effect = RuntimeError("boom")
+
+        with unittest.mock.patch.object(module.serial, "SerialException", OSError), \
+                unittest.mock.patch.object(module.serial, "Serial", return_value=fake):
+            reader._run()
+
+        self.assertEqual(reader.state, "failed")
+        self.assertIn("unexpected", reader.last_error or "")
+        self.assertTrue(any(call.args[0] == "failed" for call in reader.on_health.call_args_list))
+
+    def test_read_failure_on_open_port_is_not_fatal(self):
+        import d2008_scale_reader as module
+
+        reader = self._reader()
+        fake = Mock()
+        fake.is_open = True
+        fake.in_waiting = 0
+
+        def boom(*_args, **_kwargs):
+            reader._running = False
+            raise OSError("read failed")
+
+        fake.read.side_effect = boom
+
+        with unittest.mock.patch.object(module.serial, "SerialException", OSError), \
+                unittest.mock.patch.object(module.serial, "Serial", return_value=fake):
+            reader._run()
+
+        self.assertNotEqual(reader.state, "failed")
+        self.assertEqual(reader._open_failures, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

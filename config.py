@@ -11,6 +11,10 @@ BAUD_RATE = 9600
 SCALE_READER_STALL_SECONDS = 30.0
 SCALE_READER_RECONNECT_INITIAL_SECONDS = 1.0
 SCALE_READER_RECONNECT_MAX_SECONDS = 30.0
+# Consecutive serial-open failures before the reader is declared unrecoverable.
+# A silent-but-open port keeps reconnecting forever; an absent port fails fast so
+# the service can restart rather than run forever with no scale input.
+SCALE_READER_MAX_OPEN_ATTEMPTS = 5
 # Camera addressing is not secret; credentials come from the host environment
 # or config.local.py and are never stored in tracked code.
 RTSP_HOST_CAM1 = "192.168.1.181"

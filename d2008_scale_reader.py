@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 from config import (
+    SCALE_READER_MAX_OPEN_ATTEMPTS,
     SCALE_READER_RECONNECT_INITIAL_SECONDS,
     SCALE_READER_RECONNECT_MAX_SECONDS,
     SCALE_READER_STALL_SECONDS,
@@ -357,6 +358,7 @@ class D2008Reader:
         stall_seconds: float = SCALE_READER_STALL_SECONDS,
         reconnect_initial_seconds: float = SCALE_READER_RECONNECT_INITIAL_SECONDS,
         reconnect_max_seconds: float = SCALE_READER_RECONNECT_MAX_SECONDS,
+        max_open_attempts: int = SCALE_READER_MAX_OPEN_ATTEMPTS,
     ):
         self.port         = port
         self.baud         = baud
@@ -365,6 +367,7 @@ class D2008Reader:
         self.stall_seconds = stall_seconds
         self.reconnect_initial_seconds = reconnect_initial_seconds
         self.reconnect_max_seconds = reconnect_max_seconds
+        self.max_open_attempts = max_open_attempts
 
         self._parser   = D2008Parser()
         self._db       = ScaleDatabase(db_file)
@@ -377,6 +380,7 @@ class D2008Reader:
         self._last_valid_monotonic = None
         self._outage_started_monotonic = None
         self._reconnect_count = 0
+        self._open_failures = 0
         self._last_log   = 0.0
         self._last_print = 0.0
         self._recent_weights = deque(maxlen=STABLE_COUNT)
@@ -401,6 +405,8 @@ class D2008Reader:
         self._stop_event.clear()
         self._running = True
         self.state = "starting"
+        self._reconnect_count = 0
+        self._open_failures = 0
         self._thread  = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         print(f"[READER] Đang kết nối {self.port} @ {self.baud} baud...")
@@ -431,6 +437,7 @@ class D2008Reader:
         delay = self.reconnect_initial_seconds
         try:
             while self._running:
+                opened = False
                 try:
                     self._serial = serial.Serial(
                         port=self.port,
@@ -440,6 +447,8 @@ class D2008Reader:
                         stopbits=serial.STOPBITS_ONE,
                         timeout=2,
                     )
+                    opened = True
+                    self._open_failures = 0
                     print(f"[READER] Kết nối thành công: {self.port}")
                     self.state = "running"
                     self._last_valid_monotonic = time.monotonic()
@@ -467,14 +476,35 @@ class D2008Reader:
                             break
                 except (serial.SerialException, TypeError, OSError) as exc:
                     self.last_error = str(exc)
+                    if opened:
+                        # A failed read on an open port is transient; reconnect.
+                        self._open_failures = 0
+                    else:
+                        # The port could not be opened at all (unplugged/absent).
+                        self._open_failures += 1
+                    if not opened and self._open_failures >= self.max_open_attempts:
+                        self.state = "failed"
+                        self.last_error = (
+                            f"serial port unavailable after {self._open_failures} attempts: {exc}"
+                        )
+                        self._emit_health(
+                            "failed",
+                            reason=self.last_error,
+                        )
+                        print(
+                            f"[ERROR] Scale reader failed: serial port unavailable after "
+                            f"{self._open_failures} attempts: {exc}"
+                        )
+                        break
                     self._mark_stalled(str(exc))
                 except Exception as exc:
                     # An unexpected error must never kill the reader silently:
-                    # surface it as a failure and let the out/ health path see it.
+                    # surface it as a failure and let the health path see it.
                     self.last_error = f"unexpected: {exc}"
                     self.state = "failed"
                     self._emit_health("failed", reason=str(exc))
                     print(f"[ERROR] Scale reader failed: {exc}")
+                    break
                 finally:
                     if self._serial and self._serial.is_open:
                         self._serial.close()
@@ -487,7 +517,9 @@ class D2008Reader:
                     delay = min(delay * 2, self.reconnect_max_seconds)
         finally:
             self._running = False
-            self.state = "stopped"
+            # Preserve a terminal "failed" so the service fail-fast can see it.
+            if self.state != "failed":
+                self.state = "stopped"
             if self._serial and self._serial.is_open:
                 self._serial.close()
 
