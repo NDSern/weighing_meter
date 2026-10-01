@@ -398,16 +398,23 @@ class DiagnosticArchiveCleaner(BackgroundWorker):
         self.retention_days = retention_days
 
     @staticmethod
+    def _listdir(path):
+        try:
+            return os.listdir(path)
+        except OSError:
+            return []
+
+    @staticmethod
     def _day_paths(root):
-        for year in os.listdir(root):
+        for year in DiagnosticArchiveCleaner._listdir(root):
             year_path = os.path.join(root, year)
             if not year.isdigit() or not os.path.isdir(year_path) or os.path.islink(year_path):
                 continue
-            for month in os.listdir(year_path):
+            for month in DiagnosticArchiveCleaner._listdir(year_path):
                 month_path = os.path.join(year_path, month)
                 if not month.isdigit() or not os.path.isdir(month_path) or os.path.islink(month_path):
                     continue
-                for name in os.listdir(month_path):
+                for name in DiagnosticArchiveCleaner._listdir(month_path):
                     path = os.path.join(month_path, name)
                     if name.endswith(".tar.zst"):
                         day = make_date(year, month, name[:-8])
@@ -440,7 +447,11 @@ class DiagnosticArchiveCleaner(BackgroundWorker):
         archive_path = day_path + ".tar.zst"
         temp_path = archive_path + ".tmp"
         if os.path.exists(archive_path):
-            raise FileExistsError(f"Diagnostic archive already exists: {archive_path}")
+            # A previous run finished the archive but crashed before removing
+            # the source day directory. The archive is authoritative; clear the
+            # leftover source so this day does not wedge every later pass.
+            shutil.rmtree(day_path)
+            return archive_path
         try:
             self._run_archive_command(["tar", "--zstd", "-cf", temp_path, "-C", parent, name])
             self._run_archive_command(["tar", "--zstd", "-tf", temp_path])

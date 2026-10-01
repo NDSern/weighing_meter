@@ -383,7 +383,7 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(os.path.exists(recent_day))
             self.assertTrue(os.path.exists(retained_archive))
 
-    def test_diagnostic_archive_keeps_source_when_archive_already_exists(self):
+    def test_diagnostic_archive_removes_source_when_archive_already_exists(self):
         with tempfile.TemporaryDirectory() as root:
             day = os.path.join(root, "2026", "07", "11")
             os.makedirs(day)
@@ -393,7 +393,27 @@ class StorageMaintenanceTests(unittest.TestCase):
 
             result = cleaner.run_once(now=datetime(2026, 7, 15, 12, 0, 0).timestamp())
 
-            self.assertEqual(result, {"archived": 0, "archive_deleted": 0, "failed": 1})
+            self.assertEqual(result, {"archived": 1, "archive_deleted": 0, "failed": 0})
+            self.assertFalse(os.path.exists(day))
+            self.assertTrue(os.path.exists(day + ".tar.zst"))
+
+    def test_diagnostic_archive_skips_unreadable_subtree(self):
+        with tempfile.TemporaryDirectory() as root:
+            day = os.path.join(root, "2026", "07", "11")
+            os.makedirs(day)
+            open(os.path.join(day, "attempt.jpg"), "w").close()
+            cleaner = DiagnosticArchiveCleaner([root], 3, 30, 86400)
+            real_listdir = os.listdir
+
+            def flaky_listdir(path):
+                if os.path.basename(path) == "2026":
+                    raise PermissionError("denied")
+                return real_listdir(path)
+
+            with patch("services.storage.retention_cleaner.os.listdir", side_effect=flaky_listdir):
+                result = cleaner.run_once(now=datetime(2026, 7, 15, 12, 0, 0).timestamp())
+
+            self.assertEqual(result, {"archived": 0, "archive_deleted": 0, "failed": 0})
             self.assertTrue(os.path.exists(day))
 
     def test_diagnostic_archive_shutdown_keeps_source(self):
