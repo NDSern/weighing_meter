@@ -26,22 +26,9 @@ from services.session.result_builder import (
     crop_cam2_result_image,
     prepare_capture_paths,
 )
-from services.session.evidence_selection import (
-    CAMERAS,
-    UNKNOWN_THUMBNAIL_OFFSET_SECONDS,
-    UNKNOWN_THUMBNAIL_WEIGHT_KG,
-    UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS,
-    apply_start_window,
-    apply_threshold_window,
-    build_session_start_candidates,
-    build_timeline,
-    dedicated_candidates,
-    rank_combinations,
-    resolve_detector_tracks,
-    select_candidate_sets,
-    select_target_timestamp,
-    synchronize_cameras,
-)
+from services.session import unknown_capture
+from services.session.evidence_selection import UNKNOWN_THUMBNAIL_OFFSET_SECONDS
+from services.session.metrics import log_metric
 
 from config import (
     MQTT_ENABLED,
@@ -95,10 +82,6 @@ def getSessionFinalization(session_id):
 
 def markSessionFinalized(session_id, outcome, record=None):
     finalization_store.mark(SESSION_FINALIZATION_DB, session_id, outcome, record)
-
-
-def log_metric(log_fn, event, **fields):
-    log_fn("METRIC", json.dumps({"event": event, **fields}, separators=(",", ":"), sort_keys=True))
 
 
 def classify_lpr_failure(diagnostics):
@@ -1104,136 +1087,19 @@ class SessionManager:
         return saved
 
     def _capture_unknown_snapshots_if_due(self, log_fn):
-        deadline = self.session.unknown_snapshot_deadline
-        if (
-            not self.session.session_active
-            or deadline is None
-            or self.session.unknown_snapshot_attempted
-            or time.time() < deadline
-        ):
-            return False
-        self.session.unknown_snapshot_attempted = True
-        captured = self._capture_unknown_snapshot_set("2s", log_fn)
-        self._update_spool_metadata(log_fn)
-        log_metric(
-            log_fn, "unknown_snapshot_captured", id=self.session.session_id,
-            source="start_2s",
-            target_at=datetime.fromtimestamp(deadline, timezone.utc).isoformat(timespec="milliseconds"),
-            captured_at=captured,
-        )
-        return bool(captured)
+        return unknown_capture.capture_unknown_snapshots_if_due(self, log_fn)
 
     def _capture_unknown_weight_snapshots_if_due(self, weight, log_fn):
-        if (
-            not self.session.session_active
-            or self.session.started_at is None
-            or self.session.unknown_weight_snapshot_attempted
-        ):
-            return False
-        capture_deadline = self.session.started_at + UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS
-        if time.time() > capture_deadline:
-            self.session.unknown_weight_snapshot_attempted = True
-            log_metric(
-                log_fn, "unknown_weight_snapshot_expired", id=self.session.session_id,
-                deadline_at=datetime.fromtimestamp(
-                    capture_deadline, timezone.utc,
-                ).isoformat(timespec="milliseconds"),
-                captured_cameras=sorted(self.session.unknown_weight_snapshot_paths),
-            )
-            return False
-        if (
-            self.session.unknown_weight_snapshot_triggered_at is None
-            and weight < UNKNOWN_THUMBNAIL_WEIGHT_KG
-        ):
-            return False
-        if self.session.unknown_weight_snapshot_triggered_at is None:
-            self.session.unknown_weight_snapshot_triggered_at = datetime.now(timezone.utc).isoformat(
-                timespec="milliseconds"
-            )
-            self._update_spool_metadata(log_fn)
-            return False
-        captured = self._capture_unknown_snapshot_set(
-            "weight-10000", log_fn,
-            minimum_captured_ts=datetime.fromisoformat(
-                self.session.unknown_weight_snapshot_triggered_at
-            ).timestamp(),
-            maximum_captured_ts=capture_deadline,
-        )
-        expected_cameras = set(self.lpr_grabbers)
-        if self.rear_grabber is not None:
-            expected_cameras.add("cam2")
-        self.session.unknown_weight_snapshot_attempted = expected_cameras.issubset(
-            self.session.unknown_weight_snapshot_paths
-        )
-        self._update_spool_metadata(log_fn)
-        if captured:
-            log_metric(
-                log_fn, "unknown_snapshot_captured", id=self.session.session_id,
-                source="weight_10000", weight_kg=weight,
-                triggered_at=self.session.unknown_weight_snapshot_triggered_at,
-                captured_at=captured,
-            )
-        return bool(captured)
+        return unknown_capture.capture_unknown_weight_snapshots_if_due(self, weight, log_fn)
 
     def _capture_unknown_snapshot_set(
         self, source, log_fn, minimum_captured_ts=None, maximum_captured_ts=None,
     ):
-        captured = {}
-        grabbers = dict(self.lpr_grabbers)
-        if self.rear_grabber is not None:
-            grabbers["cam2"] = self.rear_grabber
-        for camera, grabber in grabbers.items():
-            if source == "weight-10000" and camera in self.session.unknown_weight_snapshot_paths:
-                continue
-            frame_id = None
-            try:
-                snapshot = getattr(grabber, "peek_latest_frame_snapshot", None)
-                if snapshot:
-                    frame, frame_id, captured_at = snapshot(copy_frame=True)
-                else:
-                    frame = grabber.peek_latest_frame(copy_frame=True)
-                    captured_at = None
-            except Exception as exc:
-                log_fn("ERROR", f"UNKNOWN {source} snapshot failed camera={camera}: {exc}")
-                continue
-            if frame is None:
-                continue
-            captured_at = captured_at or datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-            try:
-                captured_ts = datetime.fromisoformat(captured_at).timestamp()
-            except (TypeError, ValueError):
-                continue
-            if minimum_captured_ts is not None and captured_ts < minimum_captured_ts:
-                continue
-            if maximum_captured_ts is not None and captured_ts > maximum_captured_ts:
-                continue
-            path = None
-            if self.frame_spool and self.session.spool_active:
-                try:
-                    args = (self.session.session_id, f"{camera}-unknown-{source}.jpg", frame)
-                    if source.startswith("local-peak-"):
-                        path = self.frame_spool.save_session_frame(
-                            *args, frame_id=frame_id, captured_at=captured_at,
-                        )
-                    else:
-                        path = self.frame_spool.save_session_frame(*args)
-                except Exception as exc:
-                    log_fn("ERROR", f"UNKNOWN {source} snapshot save failed camera={camera}: {exc}")
-            if path:
-                if source == "weight-10000":
-                    self.session.unknown_weight_snapshot_paths[camera] = path
-                    self.session.unknown_weight_snapshot_captured_at[camera] = captured_at
-                elif source == "local-peak-dwell":
-                    self.session.local_peak_dwell_snapshot_paths[camera] = path
-                    self.session.local_peak_dwell_snapshot_captured_at[camera] = captured_at
-                elif source == "local-peak-drop":
-                    self.session.local_peak_drop_snapshot_paths[camera] = path
-                    self.session.local_peak_drop_snapshot_captured_at[camera] = captured_at
-                else:
-                    self.session.unknown_snapshot_paths[camera] = path
-                    self.session.unknown_snapshot_captured_at[camera] = captured_at
-                captured[camera] = captured_at
-        return captured
+        return unknown_capture.capture_unknown_snapshot_set(
+            self, source, log_fn,
+            minimum_captured_ts=minimum_captured_ts,
+            maximum_captured_ts=maximum_captured_ts,
+        )
 
     def _update_spool_metadata(self, log_fn):
         if not self.frame_spool or not self.session.spool_active:
@@ -1686,197 +1552,23 @@ class SessionManager:
         except Exception as exc:
             log_fn("ERROR", f"Duplicate review registration failed id={session_id}: {exc}")
 
-    @staticmethod
-    def _load_start_frames(metadata):
-        frames = {}
-        for camera, path in metadata.get("start_frame_paths", {}).items():
-            frame = cv2.imread(path)
-            if frame is not None:
-                frames[camera] = frame
-        rear_path = metadata.get("rear_start_path")
-        rear_frame = cv2.imread(rear_path) if rear_path else None
-        if rear_frame is not None:
-            frames["cam2"] = rear_frame
-        return frames
-
-    @staticmethod
-    def _nearest_session_frame(metadata, camera, observed_at):
-        session_dir = metadata.get("session_dir")
-        files = metadata.get("session_files", [])
-        if not session_dir or observed_at is None:
-            return None
-        started_at = datetime.fromisoformat(metadata["started_at"]).timestamp()
-        interval = float(metadata.get("capture_interval_seconds", 0.2))
-        candidates = []
-        for relative_path in files:
-            if not relative_path.startswith(camera + "-"):
-                continue
-            try:
-                index = int(relative_path.split("-", 2)[1])
-            except (ValueError, IndexError):
-                continue
-            candidates.append((abs(started_at + index * interval - observed_at), relative_path))
-        if not candidates:
-            return None
-        return os.path.join(session_dir, min(candidates)[1])
+    def _nearest_session_frame(self, metadata, camera, observed_at):
+        return unknown_capture.nearest_session_frame(metadata, camera, observed_at)
 
     def _load_diagnostic_frames(self, metadata, offset_seconds):
-        target = datetime.fromisoformat(metadata["started_at"]).timestamp() + offset_seconds
-        frames = {}
-        for camera in ("cam1", "cam3"):
-            path = self._nearest_session_frame(metadata, camera, target)
-            frame = cv2.imread(path) if path else None
-            if frame is not None:
-                frames[camera] = frame
-        return frames or self._load_start_frames(metadata)
+        return unknown_capture.load_diagnostic_frames(metadata, offset_seconds)
 
     def _load_unknown_publish_frames(
         self, metadata, frame_metadata, log_fn, spool_started_at=None,
         unknown_plate="UNKNOWN",
     ):
-        target_ts = select_target_timestamp(metadata, unknown_plate)
-        if target_ts is None and unknown_plate in ("UNKNOWN", "UNKNOWN_OCR", "UNKNOWN_DETECTION"):
-            log_fn("WARNING", f"Unknown photo timing unavailable id={metadata['session_id']}")
-            return {}, {}
-
-        session_dir = metadata.get("session_dir")
-        started_at = spool_started_at or metadata.get("started_at")
-        if not session_dir or not started_at:
-            return {}, {}
-        session_dir = os.path.abspath(session_dir)
-        started_ts = datetime.fromisoformat(started_at).timestamp()
-        interval = float(metadata.get("capture_interval_seconds", 0.2))
-        start_target_ts = started_ts + UNKNOWN_THUMBNAIL_OFFSET_SECONDS
-        deadline_ts = started_ts + UNKNOWN_WEIGHT_SNAPSHOT_DEADLINE_SECONDS
-        cameras = CAMERAS
-        rejected = {}
-
-        timeline, start_snapshots = build_timeline(
-            metadata, frame_metadata, started_ts, interval, session_dir, cameras,
+        return unknown_capture.load_unknown_publish_frames(
+            metadata, frame_metadata, log_fn,
+            spool_started_at=spool_started_at, unknown_plate=unknown_plate,
         )
 
-        start_candidates = dedicated_candidates(
-            metadata, "unknown_snapshot_paths", "unknown_snapshot_captured_at",
-            "start_2s", rejected, cameras,
-        )
-        apply_start_window(start_candidates, timeline, start_target_ts, rejected, cameras)
-
-        threshold_candidates = dedicated_candidates(
-            metadata, "unknown_weight_snapshot_paths", "unknown_weight_snapshot_captured_at",
-            "weight_10000", rejected, cameras,
-        )
-        threshold_candidates = apply_threshold_window(
-            threshold_candidates, timeline, metadata, started_ts, deadline_ts, rejected, cameras,
-        )
-
-        session_start_candidates = build_session_start_candidates(start_snapshots, metadata, cameras)
-
-        source, target, candidate_sets = select_candidate_sets(
-            metadata, timeline, target_ts, started_ts, unknown_plate,
-            session_start_candidates, rejected, cameras,
-        )
-
-        available_cameras = [camera for camera in cameras if candidate_sets[camera]]
-        if unknown_plate in ("UNKNOWN_OCR", "UNKNOWN_DETECTION") and len(available_cameras) > 1:
-            available_cameras = synchronize_cameras(
-                available_cameras, candidate_sets, target, source, rejected, cameras,
-            )
-
-        selected = {}
-        captured_at = {}
-        selection = {}
-        synchronized_gap_ms = None
-        ranked = rank_combinations(available_cameras, candidate_sets, target, unknown_plate)
-        for combination in ranked:
-            frames = [cv2.imread(item["path"]) for item in combination]
-            if any(frame is None for frame in frames):
-                continue
-            timestamps = [item["timestamp"] for item in combination]
-            synchronized_gap_ms = round((max(timestamps) - min(timestamps)) * 1000)
-            for camera, item, frame in zip(available_cameras, combination, frames):
-                if unknown_plate == "UNKNOWN_OCR":
-                    tracks = resolve_detector_tracks(
-                        camera, item.get("relative_path"), frame_metadata, metadata,
-                    )
-                    self._draw_unknown_ocr_bbox(frame, tracks)
-                selected[camera] = frame
-                captured_at[camera] = item["captured_at"]
-                selection[camera] = {
-                    "captured_at": item["captured_at"],
-                    "offset_ms": round((item["timestamp"] - target) * 1000),
-                    "source": source,
-                    "fallback": item["origin"] if item["origin"] != "dedicated" else None,
-                }
-            break
-        missing = [camera for camera in cameras if camera not in selected]
-        log_metric(
-            log_fn, "unknown_photo_selection", id=metadata["session_id"],
-            target_at=datetime.fromtimestamp(target, timezone.utc).isoformat(
-                timespec="milliseconds"
-            ),
-            weight_source=metadata.get("weight_source"), unknown_type=unknown_plate,
-            lpr_target_source=source,
-            camera_target_at={
-                camera: datetime.fromtimestamp(target, timezone.utc).isoformat(timespec="milliseconds")
-                for camera in cameras
-            },
-            synchronized_gap_ms=synchronized_gap_ms,
-            selected=selection, rejected=rejected, missing_cameras=missing,
-        )
-        return selected, captured_at
-
-        return selected, captured_at
-
-    @staticmethod
-    def _draw_unknown_ocr_bbox(frame, tracks):
-        if not tracks:
-            return
-        if not hasattr(frame, "shape"):
-            return
-        bbox = max(tracks, key=lambda track: track.get("confidence", 0.0)).get("bbox") or []
-        if len(bbox) != 4:
-            return
-        height, width = frame.shape[:2]
-        x1, y1, x2, y2 = (int(value) for value in bbox)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(width - 1, x2), min(height - 1, y2)
-        if x2 <= x1 or y2 <= y1:
-            return
-        cv2.rectangle(
-            frame, (x1, y1), (x2, y2), (0, 255, 0),
-            max(2, round(height / 1080 * 3)), cv2.LINE_AA,
-        )
-
-    @staticmethod
-    def _load_lpr_diagnostic_frames(metadata, classification):
-        session_dir = metadata.get("session_dir")
-        evidence = (metadata.get("lpr_diagnostics") or {}).get("evidence") or {}
-        if not session_dir:
-            return {}
-        order = (
-            classification,
-            "valid",
-            "plate_detected_ocr_low_confidence",
-            "plate_detected_ocr_invalid_format",
-            "plate_detected_ocr_blank",
-            "crop_failed",
-            "no_plate_detection",
-            "ocr_inference_error",
-            "detector_inference_error",
-            "lpr_frames_unavailable",
-        )
-        frames = {}
-        for camera, paths in evidence.items():
-            relative_path = next((paths.get(key) for key in order if paths.get(key)), None)
-            if not relative_path:
-                continue
-            path = os.path.abspath(os.path.join(session_dir, relative_path))
-            if os.path.commonpath((os.path.abspath(session_dir), path)) != os.path.abspath(session_dir):
-                continue
-            frame = cv2.imread(path)
-            if frame is not None:
-                frames[camera] = frame
-        return frames
+    def _load_lpr_diagnostic_frames(self, metadata, classification):
+        return unknown_capture.load_lpr_diagnostic_frames(metadata, classification)
 
     def publish_result(self, stable_weight, decimal_pos, log_fn, tracker=None, metadata=None):
         """Query PlateTracker and publish if plate is confirmed."""

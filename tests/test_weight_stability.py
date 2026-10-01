@@ -992,9 +992,9 @@ class SessionWeightTests(unittest.TestCase):
         manager.session.unknown_snapshot_deadline = 12.0
 
         with unittest.mock.patch(
-            "services.session.session_manager.time.time", side_effect=[11.9, 12.0, 13.0],
+            "services.session.unknown_capture.time.time", side_effect=[11.9, 12.0, 13.0],
         ), unittest.mock.patch(
-            "services.session.session_manager.datetime"
+            "services.session.unknown_capture.datetime"
         ) as datetime_mock:
             datetime_mock.now.return_value.isoformat.return_value = "2026-07-21T00:00:02.000+00:00"
             datetime_mock.fromtimestamp.return_value.isoformat.return_value = "2026-07-21T00:00:02.000+00:00"
@@ -1024,9 +1024,9 @@ class SessionWeightTests(unittest.TestCase):
         manager.session.started_at = started_at
 
         with unittest.mock.patch(
-            "services.session.session_manager.time.time", return_value=started_at + 1.0,
+            "services.session.unknown_capture.time.time", return_value=started_at + 1.0,
         ), unittest.mock.patch(
-            "services.session.session_manager.datetime", wraps=datetime,
+            "services.session.unknown_capture.datetime", wraps=datetime,
         ) as datetime_mock:
             datetime_mock.now.return_value = datetime(
                 2026, 7, 21, 0, 0, 1, tzinfo=timezone.utc,
@@ -1055,10 +1055,10 @@ class SessionWeightTests(unittest.TestCase):
         manager.session.started_at = started_at
 
         with unittest.mock.patch(
-            "services.session.session_manager.time.time",
+            "services.session.unknown_capture.time.time",
             side_effect=[started_at + 1.0, started_at + 1.1, started_at + 3.1],
         ), unittest.mock.patch(
-            "services.session.session_manager.datetime", wraps=datetime,
+            "services.session.unknown_capture.datetime", wraps=datetime,
         ) as datetime_mock:
             datetime_mock.now.return_value = datetime(
                 2026, 7, 21, 0, 0, 1, tzinfo=timezone.utc,
