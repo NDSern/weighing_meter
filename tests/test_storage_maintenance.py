@@ -312,6 +312,37 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(os.path.exists(old_metadata))
             self.assertTrue(os.path.exists(recent_image))
 
+    def test_tagging_skips_today_yesterday_and_recently_touched_dirs(self):
+        with tempfile.TemporaryDirectory() as root:
+            now_dt = datetime.now()
+            old_dir = os.path.join(root, "2026", "06", "01")
+            recent_dir = os.path.join(root, "2026", "06", "02")
+            today_dir = os.path.join(root, now_dt.strftime("%Y"), now_dt.strftime("%m"), now_dt.strftime("%d"))
+            yesterday_dir = os.path.join(
+                root,
+                (now_dt - timedelta(days=1)).strftime("%Y"),
+                (now_dt - timedelta(days=1)).strftime("%m"),
+                (now_dt - timedelta(days=1)).strftime("%d"),
+            )
+            for path in (old_dir, recent_dir, today_dir, yesterday_dir):
+                os.makedirs(path)
+            old_ts = now_dt.timestamp() - 5 * 86400
+            os.utime(old_dir, (old_ts, old_ts))
+            recent_ts = now_dt.timestamp() - 60
+            os.utime(recent_dir, (recent_ts, recent_ts))
+
+            cleaner = ImageRetentionCleaner([root], 30, 86400, {".jpg"})
+            tagged, _ = cleaner._tag_cleaned_directories(now_dt.timestamp())
+
+            self.assertTrue(os.path.isdir(old_dir + "--Cleaned"))
+            self.assertTrue(os.path.isdir(recent_dir))
+            self.assertFalse(os.path.exists(recent_dir + "--Cleaned"))
+            self.assertTrue(os.path.isdir(today_dir))
+            self.assertFalse(os.path.exists(today_dir + "--Cleaned"))
+            self.assertTrue(os.path.isdir(yesterday_dir))
+            self.assertFalse(os.path.exists(yesterday_dir + "--Cleaned"))
+            self.assertGreaterEqual(tagged, 1)
+
     def test_diagnostic_archive_replaces_old_day_and_expires_old_archive(self):
         with tempfile.TemporaryDirectory() as root:
             archive_dir = os.path.join(root, "2026", "07")

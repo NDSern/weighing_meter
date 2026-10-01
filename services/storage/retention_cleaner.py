@@ -33,6 +33,8 @@ from services.storage.dated_tree import (
 
 CLEANED_SUFFIX = "--Cleaned"
 PRESSURE_CLEANUP_GRACE_SECONDS = 60 * 60
+# Do not tag a directory that may still be receiving its first write.
+TAG_GRACE_SECONDS = 60 * 60
 
 
 class ImageRetentionCleaner(BackgroundWorker):
@@ -111,7 +113,10 @@ class ImageRetentionCleaner(BackgroundWorker):
                 )
         return paths
 
-    def _tag_cleaned_directories(self):
+    def _tag_cleaned_directories(self, now_ts=None):
+        now_ts = time.time() if now_ts is None else now_ts
+        today = datetime.fromtimestamp(now_ts).date()
+        grace_cutoff = now_ts - TAG_GRACE_SECONDS
         tagged = 0
         tag_failed = 0
         for root in self.roots:
@@ -120,6 +125,20 @@ class ImageRetentionCleaner(BackgroundWorker):
             for dirpath in self._iter_dirs_deepest_first(root):
                 dirname = os.path.basename(dirpath)
                 if dirname.endswith(CLEANED_SUFFIX) or os.path.islink(dirpath):
+                    continue
+                # A writer may have created the day directory but not yet
+                # written its first frame; renaming it here would lose the
+                # evidence. Skip today/yesterday and anything touched recently.
+                rel_parts = os.path.relpath(dirpath, root).split(os.sep)
+                dir_date = make_date(*rel_parts) if len(rel_parts) == 3 else None
+                if dir_date is not None and (today - dir_date).days <= 1:
+                    continue
+                try:
+                    dir_stat = os.stat(dirpath, follow_symlinks=False)
+                except OSError as exc:
+                    self._log("WARNING", f"Cleaned tag stat failed for {dirpath}: {exc}")
+                    continue
+                if dir_stat.st_mtime > grace_cutoff:
                     continue
                 if self._subtree_has_images(dirpath):
                     continue
@@ -250,7 +269,7 @@ class ImageRetentionCleaner(BackgroundWorker):
         pressure_deleted, pressure_failed, pressure_reclaimed = self._pressure_cleanup(
             pending_image_paths, now_ts
         )
-        tagged, tag_failed = self._tag_cleaned_directories()
+        tagged, tag_failed = self._tag_cleaned_directories(now_ts)
 
         self._log(
             "INFO",
