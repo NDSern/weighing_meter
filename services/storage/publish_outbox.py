@@ -4,7 +4,6 @@ import json
 import os
 import queue
 import threading
-import time
 import uuid
 import sqlite3
 from contextlib import closing
