@@ -35,6 +35,20 @@ class PlateTrackTests(unittest.TestCase):
         self.assertTrue(track.expire(now=13.1, stale_seconds=3.0))
         self.assertFalse(track.valid)
 
+    def test_empty_detection_does_not_drop_a_valid_track(self):
+        track = CameraPlateTrack("cam1")
+        region = [{"bbox": [0, 0, 10, 10], "det_conf": 0.9}]
+        track.observe(region, frame_id=1, observed_at=10.0)
+        track.observe(region, frame_id=2, observed_at=10.1)
+        self.assertTrue(track.valid)
+
+        # A dropped frame must keep the track; the stale window still applies.
+        self.assertIsNone(track.observe([], frame_id=3, observed_at=10.2))
+        self.assertTrue(track.valid)
+        self.assertEqual(track.hits, 2)
+        self.assertFalse(track.expire(now=13.09, stale_seconds=3.0))
+        self.assertTrue(track.expire(now=13.1, stale_seconds=3.0))
+
     def test_live_ocr_runs_on_confirmation_then_periodically(self):
         track = CameraPlateTrack("cam1")
         region = [{"bbox": [0, 0, 10, 10], "det_conf": 0.9}]

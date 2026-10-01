@@ -44,7 +44,6 @@ class CameraPlateTrack:
         self._last_ocr_at = None
 
     def observe(self, regions, frame_id=None, observed_at=None):
-        self.last_observed_at = time.monotonic() if observed_at is None else observed_at
         best = None
         if self.bbox is not None:
             best = max(regions, key=lambda item: bbox_iou(self.bbox, item["bbox"]), default=None)
@@ -53,15 +52,11 @@ class CameraPlateTrack:
         if best is None:
             best = max(regions, key=lambda item: item.get("det_conf", item.get("confidence", 0.0)), default=None)
         if best is None:
-            self.bbox = None
-            self.confidence = 0.0
-            self.obb = None
-            self.plate_class = None
-            self.two_row = False
-            self.hits = 0
-            self.valid = False
-            self.frame_id = frame_id
+            # No detection this frame: keep the track state and its last
+            # observation time so expire() can apply the miss-tolerance window
+            # instead of dropping the track on a single dropped frame.
             return None
+        self.last_observed_at = time.monotonic() if observed_at is None else observed_at
         bbox = list(best["bbox"])
         if self.bbox is None or bbox_iou(self.bbox, bbox) < self.iou_threshold:
             self.track_id += 1
