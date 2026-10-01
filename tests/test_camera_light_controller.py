@@ -68,6 +68,29 @@ class CameraLightControllerTests(unittest.TestCase):
             "Basic " + base64.b64encode(b"admin:camera-api-secret").decode(),
         )
 
+    def test_url_credentials_are_used_when_api_password_missing(self):
+        self.requests = []
+
+        def open_fn(request, timeout):
+            self.requests.append(request)
+            response = Mock()
+            response.read.return_value = CURRENT_XML if request.get_method() == "GET" else OK_XML
+            return response
+
+        controller = CameraLightController(
+            ["rtsp://admin:url-secret@192.168.1.181:554/ch01/0"],
+            lambda: datetime(2026, 9, 22, 20, 0),
+            open_fn,
+        )
+
+        controller.set_lpr_active(True, Mock())
+
+        authorization = self.requests[0].get_header("Authorization")
+        self.assertEqual(
+            authorization,
+            "Basic " + base64.b64encode(b"admin:url-secret").decode(),
+        )
+
     def test_day_start_does_not_change_light(self):
         controller = self.make_controller(datetime(2026, 9, 22, 12, 0))
 

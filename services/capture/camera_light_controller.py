@@ -23,7 +23,10 @@ class CameraLightController:
         parsed = urlsplit(rtsp_url)
         if not parsed.hostname:
             raise ValueError("Camera RTSP URL must include a host")
-        return parsed.hostname, unquote(parsed.username or ""), api_password
+        # Fall back to the RTSP URL credential so the nightly white-light API
+        # does not silently authenticate with an empty password.
+        password = api_password or unquote(parsed.password or "")
+        return parsed.hostname, unquote(parsed.username or ""), password
 
     @staticmethod
     def _is_night(now):
