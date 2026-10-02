@@ -12,11 +12,13 @@ from datetime import datetime
 import cv2
 from minio import Minio
 from minio.error import S3Error
+from urllib3 import PoolManager, Timeout
 
 from config import (
     MINIO_ACCESS_KEY,
     MINIO_BUCKET,
     MINIO_ENDPOINT,
+    MINIO_REGION,
     MINIO_SECRET_KEY,
     MINIO_SECURE,
     PENDING_RETENTION_DAYS,
@@ -28,6 +30,8 @@ from services.storage.dead_letter import append_dead_letter, is_expired
 UPLOAD_QUEUE_SIZE = 100
 MAX_RETRY_DELAY_SECONDS = 300.0
 MAX_RETRY_EXPONENT = 8
+MINIO_CONNECT_TIMEOUT_SECONDS = 5.0
+MINIO_READ_TIMEOUT_SECONDS = 30.0
 
 _log_fn = None
 
@@ -44,12 +48,8 @@ def log(level: str, msg: str):
         _log_fn(level, msg)
 
 
-_minio = Minio(
-    MINIO_ENDPOINT,
-    access_key=MINIO_ACCESS_KEY,
-    secret_key=MINIO_SECRET_KEY,
-    secure=MINIO_SECURE,
-)
+_minio = None
+_minio_lock = threading.Lock()
 
 _pending_file = os.path.join(SERVICE_DIR, "storage", "upload_pending.jsonl")
 _upload_queue = queue.Queue(maxsize=UPLOAD_QUEUE_SIZE)
@@ -141,14 +141,42 @@ class ImageSaveWorker:
             return _sync_executor
 
     @staticmethod
+    def _get_minio():
+        global _minio
+        with _minio_lock:
+            if _minio is None:
+                _minio = Minio(
+                    MINIO_ENDPOINT,
+                    access_key=MINIO_ACCESS_KEY,
+                    secret_key=MINIO_SECRET_KEY,
+                    secure=MINIO_SECURE,
+                    region=MINIO_REGION,
+                    http_client=PoolManager(
+                        timeout=Timeout(
+                            connect=MINIO_CONNECT_TIMEOUT_SECONDS,
+                            read=MINIO_READ_TIMEOUT_SECONDS,
+                        )
+                    ),
+                )
+            return _minio
+
+    @staticmethod
     def wait_for_pending(timeout=15.0):
         """Wait briefly for queued uploads during shutdown."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if _upload_queue.unfinished_tasks == 0:
+            with _pending_lock:
+                pending = len(_pending_tasks)
+            if _upload_queue.unfinished_tasks == 0 and pending == 0:
                 return True
             time.sleep(0.2)
-        log("WARNING", f"Image upload wait timed out with {_upload_queue.unfinished_tasks} task(s) pending")
+        with _pending_lock:
+            pending = len(_pending_tasks)
+        log(
+            "WARNING",
+            f"Image upload wait timed out with {_upload_queue.unfinished_tasks} queued task(s) "
+            f"and {pending} pending upload(s)",
+        )
         return False
 
     @staticmethod
@@ -181,6 +209,7 @@ class ImageSaveWorker:
         with _worker_lock:
             if _worker_started:
                 return
+            ImageSaveWorker._get_minio()
             os.makedirs(os.path.dirname(_pending_file), exist_ok=True)
             ImageSaveWorker._load_pending_uploads()
             _stop_event.clear()
@@ -239,7 +268,9 @@ class ImageSaveWorker:
             return False
         log("MINIO", f"Uploading {object_key} ...")
         try:
-            res = _minio.fput_object(MINIO_BUCKET, object_key, fpath, content_type="image/jpeg")
+            res = ImageSaveWorker._get_minio().fput_object(
+                MINIO_BUCKET, object_key, fpath, content_type="image/jpeg",
+            )
             log("MINIO", f"Upload OK — etag={res.etag}")
             return True
         except S3Error as exc:
@@ -274,7 +305,7 @@ class ImageSaveWorker:
         log("MINIO", f"Uploading {object_key} ...")
         try:
             upload_started_at = time.time()
-            res = _minio.put_object(
+            res = ImageSaveWorker._get_minio().put_object(
                 MINIO_BUCKET,
                 object_key,
                 io.BytesIO(data),
@@ -327,6 +358,11 @@ class ImageSaveWorker:
             fp.flush()
             os.fsync(fp.fileno())
         os.replace(tmp_path, _pending_file)
+        directory_fd = os.open(os.path.dirname(_pending_file), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     @staticmethod
     def _normalize_upload_task(task):
@@ -379,23 +415,38 @@ class ImageSaveWorker:
 
     @staticmethod
     def _upload_loop():
-        while not _stop_event.is_set():
-            try:
-                task = _upload_queue.get(timeout=0.5)
-            except queue.Empty:
-                with _pending_lock:
-                    ImageSaveWorker._fill_upload_queue_locked()
-                continue
-            try:
-                ImageSaveWorker._upload_task(task)
-            except Exception as exc:
-                log("ERROR", f"MinIO upload worker error: {exc}")
-                ImageSaveWorker._schedule_retry(task)
-            finally:
-                with _pending_lock:
-                    _queued_keys.discard(task.get("object_key"))
-                    ImageSaveWorker._fill_upload_queue_locked()
-                _upload_queue.task_done()
+        global _worker_started
+        try:
+            while not _stop_event.is_set():
+                try:
+                    task = _upload_queue.get(timeout=0.5)
+                except queue.Empty:
+                    try:
+                        with _pending_lock:
+                            ImageSaveWorker._fill_upload_queue_locked()
+                    except Exception as exc:
+                        log("ERROR", f"MinIO upload queue refill failed: {exc}")
+                    continue
+                try:
+                    ImageSaveWorker._upload_task(task)
+                except Exception as exc:
+                    log("ERROR", f"MinIO upload worker error: {exc}")
+                    try:
+                        ImageSaveWorker._schedule_retry(task)
+                    except Exception as retry_exc:
+                        log("ERROR", f"MinIO upload retry scheduling failed: {retry_exc}")
+                finally:
+                    try:
+                        with _pending_lock:
+                            _queued_keys.discard(task.get("object_key"))
+                            ImageSaveWorker._fill_upload_queue_locked()
+                    except Exception as exc:
+                        log("ERROR", f"MinIO upload queue refill failed: {exc}")
+                    _upload_queue.task_done()
+        finally:
+            # If the loop ever exits, allow a later call to restart the worker
+            # instead of leaving uploads queued with no consumer.
+            _worker_started = False
 
     @staticmethod
     def _upload_task(task):
@@ -418,7 +469,9 @@ class ImageSaveWorker:
 
         log("MINIO", f"Uploading {object_key} ...")
         try:
-            res = _minio.fput_object(MINIO_BUCKET, object_key, fpath, content_type="image/jpeg")
+            res = ImageSaveWorker._get_minio().fput_object(
+                MINIO_BUCKET, object_key, fpath, content_type="image/jpeg",
+            )
             log("MINIO", f"Upload OK — etag={res.etag}")
             ImageSaveWorker._mark_uploaded(object_key)
         except S3Error as exc:

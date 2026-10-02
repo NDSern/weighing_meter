@@ -1,0 +1,15 @@
+[Unit]
+Description=Archive aged weighing diagnostics
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/weighing-meter/diagnostic-archive.env
+ExecStart=/usr/bin/python3 ${WEIGHING_METER_DIR}/scripts/archive_diagnostics.py
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=25%
+MemoryMax=768M
+TimeoutStartSec=30min

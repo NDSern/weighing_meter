@@ -39,7 +39,7 @@ class PlateTracker:
         self._image_camera = None  # camera name associated with saved frame
         self._image_conf = 0.0  # best det_conf for saved frame
         self._image_observed_at = None
-        self._plate_images = {}  # plate_text -> (frame, camera_name, det_conf, observed_at)
+        self._plate_images = {}  # plate_text -> (frame, camera_name, det_conf, observed_at, debug)
         self._max_plate_images = max_plate_images
         self._undetectable_frame = None  # first "unknown" frame for undetectable save
         self._undetectable_saved = False  # only save once per session
@@ -54,7 +54,7 @@ class PlateTracker:
         with self._lock:
             self._observations.append((plate_text, weight, source, ts))
 
-    def update_image(self, plate_text: str, det_conf: float, frame, camera_name: str, observed_at=None):
+    def update_image(self, plate_text: str, det_conf: float, frame, camera_name: str, observed_at=None, debug=None):
         """Store the best-confidence frame. Caller transfers ownership (no copy made)."""
         with self._lock:
             old = self._plate_images.get(plate_text)
@@ -67,6 +67,7 @@ class PlateTracker:
                 self._plate_images[plate_text] = (
                     stored_frame, camera_name, det_conf,
                     time.time() if observed_at is None else observed_at,
+                    debug,
                 )
             if det_conf > self._image_conf:
                 self._image_frame = stored_frame if stored_frame is not None else frame.copy()
@@ -116,6 +117,48 @@ class PlateTracker:
                 counts[plate] = counts.get(plate, 0) + 1
         return counts
 
+    def get_confirmation_diagnostics(self):
+        from config import MIN_PLATE_OBSERVATION_SPAN_SECONDS, MIN_SELECTED_PLATE_HITS, PLATE_CONFIRM_THRESHOLD
+
+        with self._lock:
+            observations = list(self._observations)
+        counts = {}
+        scores = {}
+        selected = {}
+        first_seen = {}
+        last_seen = {}
+        for plate, weight, source, timestamp in observations:
+            counts[plate] = counts.get(plate, 0) + 1
+            scores[plate] = scores.get(plate, 0.0) + weight
+            if source == "selected":
+                selected[plate] = selected.get(plate, 0) + 1
+            first_seen[plate] = min(first_seen.get(plate, timestamp), timestamp)
+            last_seen[plate] = max(last_seen.get(plate, timestamp), timestamp)
+        best = max(counts, key=lambda plate: (counts[plate], scores[plate])) if counts else None
+        count = counts.get(best, 0)
+        selected_count = selected.get(best, 0)
+        span = last_seen.get(best, 0.0) - first_seen.get(best, 0.0) if best else 0.0
+        if not best:
+            failure_reason = "no_valid_candidates"
+        elif count < PLATE_CONFIRM_THRESHOLD:
+            failure_reason = "insufficient_observations"
+        elif selected_count < MIN_SELECTED_PLATE_HITS:
+            failure_reason = "insufficient_selected_hits"
+        elif span < MIN_PLATE_OBSERVATION_SPAN_SECONDS:
+            failure_reason = "insufficient_observation_span"
+        else:
+            failure_reason = None
+        return {
+            "best_candidate": best,
+            "observation_count": count,
+            "selected_hit_count": selected_count,
+            "observation_span_seconds": span,
+            "required_observations": PLATE_CONFIRM_THRESHOLD,
+            "required_selected_hits": MIN_SELECTED_PLATE_HITS,
+            "required_span_seconds": MIN_PLATE_OBSERVATION_SPAN_SECONDS,
+            "failure_reason": failure_reason,
+        }
+
     def save_undetectable(self, frame):
         """Store the first 'unknown' frame per session. Only saves once until clear().
         Caller must check needs_undetectable() first to avoid unnecessary frame copy."""
@@ -137,7 +180,7 @@ class PlateTracker:
             return frame
 
     def get_image_frame(self, plate_text=None, aliases=None):
-        """Returns (frame, plate_text, camera_name). Transfers ownership — clears internal ref."""
+        """Returns frame, plate, camera, timestamp, and optional diagnostic metadata."""
         with self._lock:
             lookup_plates = []
             for candidate in [plate_text, *(aliases or [])]:
@@ -146,20 +189,21 @@ class PlateTracker:
 
             matched_plate = next((candidate for candidate in lookup_plates if candidate in self._plate_images), None)
             if matched_plate is not None:
-                frame, camera_name, _conf, observed_at = self._plate_images.pop(matched_plate)
+                frame, camera_name, _conf, observed_at, debug = self._plate_images.pop(matched_plate)
                 plate = matched_plate
             else:
                 frame = self._image_frame
                 plate = self._image_plate
                 camera_name = self._image_camera
                 observed_at = self._image_observed_at
+                debug = None
             self._image_frame = None
             self._image_plate = None
             self._image_camera = None
             self._image_conf = 0.0
             self._image_observed_at = None
             self._plate_images.clear()
-            return frame, plate, camera_name, observed_at
+            return frame, plate, camera_name, observed_at, debug
 
     def clear(self):
         with self._lock:

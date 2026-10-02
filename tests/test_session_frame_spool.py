@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -17,7 +18,7 @@ except ModuleNotFoundError:
     sys.modules.setdefault("cv2", cv2)
     np = None
 
-from services.capture.session_frame_spool import SessionFrameSpool
+from services.capture.session_frame_spool import SessionFrameSpool, set_log_fn
 
 
 class Grabber:
@@ -28,6 +29,12 @@ class Grabber:
     def peek_latest_frame(self, copy_frame=False):
         self.reads += 1
         return self.frame.copy() if copy_frame else self.frame
+
+
+class TimestampedGrabber(Grabber):
+    def peek_latest_frame_snapshot(self, copy_frame=False):
+        frame = self.peek_latest_frame(copy_frame=copy_frame)
+        return frame, 7, "2026-07-15T00:00:00.123+00:00"
 
 
 class Frame:
@@ -128,6 +135,26 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertIn("captured_at", manifest["frame_metadata"][cam1])
             self.assertEqual(manifest["frame_metadata"][cam1]["tracks"][0]["track_id"], 7)
 
+    def test_records_camera_acquisition_timestamp(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = SessionFrameSpool(
+                root, TimestampedGrabber(40), Grabber(180), interval=0.03,
+                min_free_bytes=0, cv2_module=FakeCv2,
+            )
+            spool.start()
+            spool.begin_session("timestamped")
+            time.sleep(0.04)
+            job = spool.end_session("timestamped", {})
+            self.assertTrue(spool.stop(1))
+
+            with open(job, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            cam1 = next(name for name in manifest["files"] if name.startswith("cam1-"))
+            self.assertEqual(
+                manifest["frame_metadata"][cam1]["captured_at"],
+                "2026-07-15T00:00:00.123+00:00",
+            )
+
     def test_pending_jobs_recover_fifo_after_queue_overflow_and_restart(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root, notification_queue_size=1)
@@ -164,6 +191,51 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertEqual(manifest["files"], [])
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(root)))
 
+    def test_limits_persisted_frames_per_camera(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, max_frames_per_camera=2)
+            spool.start()
+            spool.begin_session("bounded")
+            time.sleep(0.15)
+            job = spool.end_session("bounded", {})
+            self.assertTrue(spool.stop(1))
+
+            with open(job, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            self.assertEqual(manifest["frame_counts"], {"cam1": 2, "cam3": 2})
+
+    @unittest.skipUnless(hasattr(os, "posix_fadvise"), "requires posix_fadvise")
+    def test_drops_durable_frame_write_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("cache", {"cam1": Frame(1)})
+
+            with mock.patch("services.capture.session_frame_spool.os.posix_fadvise") as advise:
+                spool.save_session_frame("cache", "rear.jpg", Frame(2))
+
+            self.assertGreaterEqual(advise.call_count, 1)
+            for call in advise.call_args_list:
+                _fd, offset, length, advice = call.args
+                self.assertEqual((offset, length, advice), (0, 0, os.POSIX_FADV_DONTNEED))
+
+    def test_capture_loop_survives_read_errors(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            errors = []
+            set_log_fn(lambda level, message: errors.append((level, message)))
+            self.addCleanup(set_log_fn, None)
+            spool._read_frame = mock.Mock(side_effect=RuntimeError("read boom"))
+            spool.start()
+            spool.begin_session("resilient")
+            deadline = time.monotonic() + 2.0
+            while not errors and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(errors, "capture loop did not log its read error")
+            self.assertEqual(errors[0][0], "ERROR")
+            self.assertIn("read boom", errors[0][1])
+            self.assertTrue(spool._thread.is_alive())
+            self.assertTrue(spool.stop(1))
+
     def test_rejects_overlapping_or_unsafe_sessions(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root)
@@ -186,6 +258,41 @@ class SessionFrameSpoolTests(unittest.TestCase):
             path = spool.end_session("retry", {})
             self.assertTrue(os.path.exists(path))
 
+    def test_terminal_snapshot_survives_failed_finalize_and_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("retry", {"cam1": Frame(1)}, {
+                "session_id": "retry", "started_at": "2026-07-24T00:00:00+00:00",
+                "stable_weight": None,
+            })
+            terminal = {
+                "session_id": "retry", "started_at": "2026-07-24T00:00:00+00:00",
+                "ended_at": "2026-07-24T00:01:00+00:00", "stable_weight": 1200,
+                "duration_s": 60.0, "end_reason": "scale_empty",
+                "weight_observed_at": "2026-07-24T00:00:30+00:00",
+                "raw_peak_weight": 1210, "filtered_peak_weight": 1200,
+            }
+            spool.update_active_metadata("retry", terminal)
+            original = spool._atomic_json
+            spool._atomic_json = lambda path, value: (
+                (_ for _ in ()).throw(OSError("disk"))
+                if os.path.dirname(path) == spool.jobs_dir else original(path, value)
+            )
+            with self.assertRaises(OSError):
+                spool.end_session("retry", terminal)
+
+            restarted = self.make_spool(root)
+            recovered = restarted.get_pending_job(timeout=0)
+            with open(recovered, encoding="utf-8") as handle:
+                metadata = json.load(handle)["metadata"]
+
+            self.assertEqual(metadata["stable_weight"], 1200)
+            self.assertEqual(metadata["weight_observed_at"], "2026-07-24T00:00:30+00:00")
+            self.assertEqual(metadata["raw_peak_weight"], 1210)
+            self.assertEqual(metadata["end_reason"], "scale_empty")
+            self.assertEqual(metadata["ended_at"], "2026-07-24T00:01:00+00:00")
+            self.assertEqual(metadata["duration_s"], 60.0)
+
     def test_acknowledge_removes_manifest_and_session_directory(self):
         with tempfile.TemporaryDirectory() as root:
             spool = self.make_spool(root)
@@ -196,6 +303,65 @@ class SessionFrameSpoolTests(unittest.TestCase):
 
             self.assertFalse(os.path.exists(path))
             self.assertFalse(os.path.exists(session_dir))
+
+    def test_acknowledge_job_holds_lock_for_byte_accounting(self):
+        class CountingLock:
+            def __init__(self):
+                self.entries = 0
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self.entries += 1
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self._lock.release()
+                return False
+
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            spool.begin_session("done", {"cam1": Frame(1)})
+            path = spool.end_session("done", {})
+            self.assertGreater(spool._bytes_written, 0)
+
+            counter = CountingLock()
+            spool._lock = counter
+            spool.acknowledge_job(path)
+
+            self.assertEqual(spool._bytes_written, 0)
+            self.assertGreaterEqual(counter.entries, 1)
+
+    def test_resume_cleanup_holds_lock_for_byte_accounting(self):
+        class CountingLock:
+            def __init__(self):
+                self.entries = 0
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self.entries += 1
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self._lock.release()
+                return False
+
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("cleanup", {"cam1": Frame(1)})
+            job = spool.end_session("cleanup", {})
+            self.assertGreater(spool._bytes_written, 0)
+            # Simulate a completed inference whose cleanup was interrupted.
+            os.replace(job, os.path.join(spool.cleanup_dir, os.path.basename(job)))
+
+            counter = CountingLock()
+            spool._lock = counter
+            spool._resume_cleanup()
+
+            self.assertFalse(os.path.exists(session_dir))
+            self.assertEqual(spool._bytes_written, 0)
+            self.assertGreaterEqual(counter.entries, 1)
 
     def test_abort_clears_partial_active_session(self):
         with tempfile.TemporaryDirectory() as root:
@@ -269,6 +435,28 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertEqual(manifest["metadata"]["end_reason"], "machine_offline")
             self.assertIn("ended_at", manifest["metadata"])
             self.assertGreaterEqual(manifest["metadata"]["duration_s"], 0)
+            self.assertFalse(os.path.exists(os.path.join(restarted.active_dir,
+                                                         "interrupted.json")))
+
+    def test_restart_recovers_zero_frame_active_session_as_pending(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root, disk_cap_bytes=0)
+            spool.begin_session("interrupted", metadata={
+                "session_id": "interrupted",
+                "started_at": "2026-07-15T00:00:00+00:00",
+                "stable_weight": 9000,
+                "decimal_pos": 0,
+            })
+
+            restarted = self.make_spool(root, disk_cap_bytes=0)
+            processing = restarted.get_pending_job(timeout=0)
+            with open(processing, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+
+            self.assertEqual(manifest["files"], [])
+            self.assertEqual(manifest["metadata"]["stable_weight"], 9000)
+            self.assertTrue(manifest["metadata"]["recovered_after_restart"])
+            self.assertIn("no frames captured", manifest["errors"])
             self.assertFalse(os.path.exists(os.path.join(restarted.active_dir,
                                                          "interrupted.json")))
 

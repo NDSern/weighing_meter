@@ -4,7 +4,6 @@ import json
 import os
 import queue
 import threading
-import time
 import uuid
 import sqlite3
 from contextlib import closing
@@ -71,7 +70,7 @@ class PublishOutbox:
         return True
 
     @staticmethod
-    def enqueue(session_result, image_object_keys=None, image_paths=None):
+    def enqueue(session_result, image_object_keys=None, image_paths=None, activate=True):
         event_id = session_result.get("offline_event_id") or uuid.uuid4().hex
         session_result["offline_event_id"] = event_id
         event = {
@@ -80,6 +79,7 @@ class PublishOutbox:
             "image_object_keys": list(image_object_keys or []),
             "image_paths": list(image_paths or []),
             "session_result": session_result,
+            "activated": bool(activate),
         }
         with _pending_lock:
             if PublishOutbox._is_published(event_id):
@@ -90,9 +90,21 @@ class PublishOutbox:
                 return event_id
             _pending_events[event_id] = event
             PublishOutbox._persist_locked()
-        _publish_queue.put(event_id)
+        if activate:
+            _publish_queue.put(event_id)
         log("OFFLINE", f"Queued publish event id={event_id} plate={session_result.get('official_plate')}")
         return event_id
+
+    @staticmethod
+    def activate(event_id):
+        with _pending_lock:
+            event = _pending_events.get(event_id)
+            if event is None:
+                return PublishOutbox._is_published(event_id)
+            event["activated"] = True
+            PublishOutbox._persist_locked()
+        _publish_queue.put(event_id)
+        return True
 
     @staticmethod
     def pending_count():
@@ -115,14 +127,17 @@ class PublishOutbox:
 
     @staticmethod
     def _is_published(event_id):
-        try:
-            PublishOutbox._init_completed_db()
-            with closing(sqlite3.connect(_published_db)) as conn:
-                return conn.execute(
-                    "SELECT 1 FROM completed_events WHERE event_id = ?", (event_id,)
-                ).fetchone() is not None
-        except (OSError, sqlite3.Error):
-            return False
+        """Return True when the broker already acknowledged this event.
+
+        Raises on database read failure. Callers must fail closed: treating an
+        unreadable completion ledger as "not published" would republish an
+        already-acknowledged weighing event.
+        """
+        PublishOutbox._init_completed_db()
+        with closing(sqlite3.connect(_published_db)) as conn:
+            return conn.execute(
+                "SELECT 1 FROM completed_events WHERE event_id = ?", (event_id,)
+            ).fetchone() is not None
 
     @staticmethod
     def _mark_completed(event_id):
@@ -151,12 +166,18 @@ class PublishOutbox:
                     if not event_id or not event.get("session_result"):
                         append_dead_letter("malformed", event, "incomplete MQTT record", "malformed")
                         continue
-                    if PublishOutbox._is_published(event_id):
-                        continue
+                    try:
+                        if PublishOutbox._is_published(event_id):
+                            continue
+                    except (OSError, sqlite3.Error) as exc:
+                        # Cannot verify completion: keep the event pending instead
+                        # of dropping unverified work.
+                        log("ERROR", f"Completion check failed while loading id={event_id}: {exc}")
                     _pending_events[event_id] = event
             PublishOutbox._persist_locked()
-            for event_id in _pending_events:
-                _publish_queue.put(event_id)
+            for event_id, event in _pending_events.items():
+                if event.get("activated", True):
+                    _publish_queue.put(event_id)
         if _pending_events:
             log("OFFLINE", f"Loaded {len(_pending_events)} pending publish event(s)")
 
@@ -170,6 +191,11 @@ class PublishOutbox:
             fp.flush()
             os.fsync(fp.fileno())
         os.replace(tmp_path, _outbox_file)
+        directory_fd = os.open(os.path.dirname(_outbox_file), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     @staticmethod
     def _mark_published(event_id):
@@ -218,13 +244,21 @@ class PublishOutbox:
             timeout=10.0,
         )
         if ok:
-            PublishOutbox._mark_completed(event_id)
+            try:
+                PublishOutbox._mark_completed(event_id)
+            except (OSError, sqlite3.Error) as exc:
+                # The broker already acknowledged this event. Requeueing would
+                # publish it twice, so record the failure loudly and drop it
+                # from the pending queue only.
+                log("CRITICAL", f"Publish ack received but completion write failed id={event_id}: {exc}")
             PublishOutbox._mark_published(event_id)
             result = event["session_result"]
+            weight = result.get("stable_weight")
+            weight_text = f"{weight:g}" if isinstance(weight, (int, float)) else "?"
             log(
                 ">>> SENT <<<",
                 f"plate={result.get('official_plate')} "
-                f"wt={result.get('stable_weight'):g}kg id={event_id[:8]}",
+                f"wt={weight_text}kg id={event_id[:8]}",
             )
             log("METRIC", json.dumps(
                 {"event": "session_publish_acknowledged", "id": event_id},

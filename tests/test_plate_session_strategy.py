@@ -4,7 +4,6 @@ from unittest.mock import Mock, patch
 
 sys.modules.setdefault("serial", Mock())
 sys.modules.setdefault("cv2", Mock())
-sys.modules.setdefault("numpy", Mock())
 sys.modules.setdefault("minio", Mock())
 sys.modules.setdefault("minio.error", Mock())
 
@@ -36,6 +35,214 @@ class PlateTrackTests(unittest.TestCase):
         self.assertTrue(track.expire(now=13.1, stale_seconds=3.0))
         self.assertFalse(track.valid)
 
+    def test_empty_detection_does_not_drop_a_valid_track(self):
+        track = CameraPlateTrack("cam1")
+        region = [{"bbox": [0, 0, 10, 10], "det_conf": 0.9}]
+        track.observe(region, frame_id=1, observed_at=10.0)
+        track.observe(region, frame_id=2, observed_at=10.1)
+        self.assertTrue(track.valid)
+
+        # A dropped frame must keep the track; the stale window still applies.
+        self.assertIsNone(track.observe([], frame_id=3, observed_at=10.2))
+        self.assertTrue(track.valid)
+        self.assertEqual(track.hits, 2)
+        self.assertFalse(track.expire(now=13.09, stale_seconds=3.0))
+        self.assertTrue(track.expire(now=13.1, stale_seconds=3.0))
+
+    def test_live_ocr_runs_on_confirmation_then_periodically(self):
+        track = CameraPlateTrack("cam1")
+        region = [{"bbox": [0, 0, 10, 10], "det_conf": 0.9}]
+
+        track.observe(region, observed_at=10.0)
+        self.assertFalse(track.claim_live_ocr(now=10.0, interval=0.5))
+        track.observe(region, observed_at=10.1)
+        self.assertTrue(track.claim_live_ocr(now=10.1, interval=0.5))
+        track.observe(region, observed_at=10.4)
+        self.assertFalse(track.claim_live_ocr(now=10.4, interval=0.5))
+        track.observe(region, observed_at=10.6)
+        self.assertTrue(track.claim_live_ocr(now=10.6, interval=0.5))
+
+    def test_new_track_gets_ocr_after_confirmation(self):
+        track = CameraPlateTrack("cam1")
+        first = [{"bbox": [0, 0, 10, 10], "det_conf": 0.9}]
+        second = [{"bbox": [30, 0, 40, 10], "det_conf": 0.9}]
+        track.observe(first, observed_at=10.0)
+        track.observe(first, observed_at=10.1)
+        self.assertTrue(track.claim_live_ocr(now=10.1, interval=10.0))
+
+        track.observe(second, observed_at=10.2)
+        self.assertFalse(track.claim_live_ocr(now=10.2, interval=10.0))
+        track.observe(second, observed_at=10.3)
+        self.assertTrue(track.claim_live_ocr(now=10.3, interval=10.0))
+
+    def test_track_follows_iou_match_when_other_region_has_higher_confidence(self):
+        track = CameraPlateTrack("cam1")
+        tracked = {"bbox": [0, 0, 10, 10], "det_conf": 0.8}
+        other = {"bbox": [30, 0, 40, 10], "det_conf": 0.99}
+
+        track.observe([tracked])
+        selected = track.observe([tracked, other])
+
+        self.assertIs(selected, tracked)
+        self.assertTrue(track.valid)
+        self.assertEqual(track.bbox, tracked["bbox"])
+
+    def test_track_metadata_keeps_obb_for_deferred_crop(self):
+        track = CameraPlateTrack("cam1", confirm_hits=1)
+        obb = [[1, 2], [10, 2], [10, 8], [1, 8]]
+
+        track.observe([{
+            "bbox": [1, 2, 10, 8], "obb": obb, "det_conf": 0.9,
+            "class": "BSV", "two_row": True,
+        }], frame_id=7)
+
+        self.assertEqual(track.metadata()[0]["obb"], obb)
+        self.assertEqual(track.metadata()[0]["class"], "BSV")
+        self.assertTrue(track.metadata()[0]["two_row"])
+
+    def test_detection_submits_only_confirmed_best_region_to_ocr(self):
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        camera.lpr_crop = "full"
+        camera.inference_lock = unittest.mock.MagicMock()
+        best = {"bbox": [0, 0, 10, 10], "det_conf": 0.9}
+        extra = {"bbox": [30, 0, 40, 10], "det_conf": 0.5}
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator._enabled = True
+        coordinator._detect_regions_fn = Mock(return_value=[best, extra])
+        coordinator._recognize_regions_fn = Mock()
+        coordinator._submit_ocr_job = Mock()
+        frame = Mock()
+        frame.shape = (100, 100, 3)
+
+        coordinator._run_detection(camera, frame, frame_id=1)
+        coordinator._run_detection(camera, frame, frame_id=2)
+
+        coordinator._submit_ocr_job.assert_called_once()
+        self.assertEqual(coordinator._submit_ocr_job.call_args.args[2], [best])
+
+    def test_high_confidence_ocr_skips_fallback(self):
+        camera = Mock(name="camera")
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        recognize = Mock(return_value=[{"plate": "14C-017.80", "ocr_confidence": 0.99}])
+        fallback_detect = Mock()
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(Mock(), recognize, ["charset"], fallback_detect)
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates[0]["plate"], "14C-017.80")
+        fallback_detect.assert_not_called()
+
+    def test_low_confidence_ocr_selects_stronger_fallback(self):
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        production = {"plate": "15H-172.90", "ocr_confidence": 0.91}
+        fallback = {"plate": "15C-172.90", "ocr_confidence": 0.99}
+        recognize = Mock(side_effect=[[production], [fallback]])
+        fallback_detect = Mock(return_value=[{"fallback": True}])
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(Mock(), recognize, ["charset"], fallback_detect)
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates, [fallback])
+        fallback_detect.assert_called_once_with(
+            unittest.mock.ANY,
+            detector=camera.fallback_detector,
+            imgsz=640,
+        )
+
+    def test_low_confidence_ocr_keeps_stronger_primary(self):
+        camera = Mock(name="camera")
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        production = {"plate": "14C-017.80", "ocr_confidence": 0.97}
+        fallback = {"plate": "14C-017.88", "ocr_confidence": 0.90}
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(
+            Mock(),
+            Mock(side_effect=[[production], [fallback]]),
+            ["charset"],
+            Mock(return_value=[{"fallback": True}]),
+        )
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates, [production])
+
+    def test_same_fallback_text_keeps_primary_detector_confidence(self):
+        camera = Mock(name="camera")
+        camera.ocr = object()
+        camera.fallback_detector = object()
+        production = {"plate": "15C-326.77", "ocr_confidence": 0.94, "det_conf": 0.96}
+        fallback = {"plate": "15C-326.77", "ocr_confidence": 0.99, "det_conf": 0.60}
+        coordinator = DetectCoordinator([camera], Mock())
+        coordinator.configure_split_pipeline(
+            Mock(),
+            Mock(side_effect=[[production], [fallback]]),
+            ["charset"],
+            Mock(return_value=[{"fallback": True}]),
+        )
+
+        plates = coordinator._recognize_with_fallback(camera, Mock(), [{"primary": True}])
+
+        self.assertEqual(plates, [production])
+
+    def test_process_plate_detections_passes_debug_to_tracker_images(self):
+        tracker = Mock()
+        coordinator = DetectCoordinator([Mock()], tracker)
+        coordinator._enabled = True
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        camera.inference_lock = unittest.mock.MagicMock()
+        best = {"plate": "14C-017.80", "det_conf": 0.95, "crop_size": "100x40",
+                "votes": 3, "valid_candidates": [("14C-017.80", 0.95), ("15C-017.80", 0.5)]}
+        alt = {"plate": "unknown", "det_conf": 0.6, "crop_size": "80x30",
+               "ocr_status": "no_plate", "candidates": [], "valid_candidates": [("16N-6554", 0.4)]}
+        plates = [best, alt]
+        frame = Mock()
+
+        coordinator._process_plate_detections(camera, plates, frame)
+
+        debug_calls = [c.kwargs["debug"] for c in tracker.update_image.call_args_list if "debug" in c.kwargs]
+        self.assertEqual(len(debug_calls), 3)
+        self.assertEqual(debug_calls[0], best)   # alt candidate (0.5)
+        self.assertEqual(debug_calls[1], alt)    # alt candidate (0.75)
+        self.assertEqual(debug_calls[2], best)   # final best-plate debug
+
+    def test_stale_session_context_is_ignored_by_plate_processing(self):
+        tracker = Mock()
+        coordinator = DetectCoordinator([Mock()], tracker, session_context=lambda: ("new", 1))
+        coordinator._enabled = True
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        plates = [{"plate": "14C-017.80", "det_conf": 0.95, "crop_size": "100x40",
+                   "votes": 3, "valid_candidates": [("14C-017.80", 0.95)]}]
+        frame = Mock()
+
+        coordinator._process_plate_detections(camera, plates, frame, expected_context=("old", 0))
+
+        tracker.add_observation.assert_not_called()
+        tracker.update_image.assert_not_called()
+
+    def test_matching_session_context_processes_detections(self):
+        tracker = Mock()
+        coordinator = DetectCoordinator([Mock()], tracker, session_context=lambda: ("new", 1))
+        coordinator._enabled = True
+        camera = Mock(name="camera")
+        camera.name = "cam1"
+        plates = [{"plate": "14C-017.80", "det_conf": 0.95, "crop_size": "100x40",
+                   "votes": 3, "valid_candidates": [("14C-017.80", 0.95)]}]
+        frame = Mock()
+
+        coordinator._process_plate_detections(camera, plates, frame, expected_context=("new", 1))
+
+        tracker.add_observation.assert_called_once()
+
     def test_detect_loop_does_not_resubmit_same_frame_generation(self):
         camera = Mock(name="camera")
         camera.name = "cam1"
@@ -59,6 +266,7 @@ class PlateTrackTests(unittest.TestCase):
             coordinator._detect_loop()
 
         self.assertEqual(coordinator._detect_events["cam1"].set.call_count, 1)
+        camera.peek_latest_frame_with_id.assert_called_with(copy_frame=False)
 
 
 class SessionStrategyTests(unittest.TestCase):
@@ -95,7 +303,8 @@ class SessionStrategyTests(unittest.TestCase):
         session_id = self.manager.session.session_id
         self.manager.on_plate_presence("cam3", {"cam1": False, "cam3": True}, self.log)
         self.assertEqual(self.manager.session.session_id, session_id)
-        self.assertTrue(self.manager._plate_owned)
+        self.assertFalse(self.manager._plate_owned)
+        self.assertTrue(self.manager.session.scale_owned)
 
     def test_one_camera_presence_cancels_loss(self):
         self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
@@ -104,21 +313,64 @@ class SessionStrategyTests(unittest.TestCase):
         self.assertTrue(self.manager.session.session_active)
         self.assertIsNone(self.manager._plate_absent_since)
 
-    def test_both_camera_loss_for_one_second_ends_plate_session(self):
-        with patch("services.session.session_manager.time.monotonic", side_effect=[0.0, 0.0, 1.1]):
+    def test_both_camera_loss_waits_for_scale_callback(self):
+        with patch(
+            "services.session.session_manager.time.monotonic",
+            side_effect=[0.0, 0.0, 0.0, 1.1],
+        ):
             self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
             self.manager.on_plate_presence("cam3", {"cam1": False, "cam3": False}, self.log)
-        self.assertFalse(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.session_active)
 
-    def test_scale_callback_completes_plate_loss_deadline(self):
-        with patch("services.session.session_manager.time.monotonic", side_effect=[0.0, 0.0, 1.1]):
-            self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
-            self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
-            frame = make_frame(5000)
-            frame.status = "UNSTABLE"
+        frame = make_frame(0)
+        frame.status = "UNSTABLE"
+        with patch("services.session.session_manager.time.monotonic", return_value=1.1):
             self.manager.on_frame(frame, self.log)
         self.assertFalse(self.manager.session.session_active)
+
+    def test_plate_loss_does_not_split_continuously_rising_scale_session(self):
+        with patch("services.session.session_manager.time.monotonic", return_value=0.0):
+            self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
+            self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
+
+        session_id = self.manager.session.session_id
+        generation = self.manager._generation
+        frame = make_frame(5000)
+        frame.status = "UNSTABLE"
+        with patch(
+            "services.session.session_manager.SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT",
+            True,
+        ), patch("services.session.session_manager.time.monotonic", return_value=1.1):
+            self.manager.on_frame(frame, self.log)
+
+        self.assertTrue(self.manager.session.session_active)
+        self.assertFalse(self.manager._plate_owned)
+
+        self.feed(self.manager, [5300, 5600, 5900, 5800, 6200, 6600], self.log)
+        self.assertTrue(self.manager.session.session_active)
+        self.assertEqual(self.manager.session.session_id, session_id)
+        self.assertEqual(self.manager._generation, generation)
+
+        self.feed(self.manager, [6300, 6000, 5700, 5800, 5300, 4800], self.log)
+        self.assertTrue(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.scale_owned)
+
+    def test_plate_loss_policy_does_not_end_weighted_session_before_promotion(self):
+        with patch("services.session.session_manager.time.monotonic", return_value=0.0):
+            self.manager.on_plate_presence("cam1", {"cam1": True, "cam3": False}, self.log)
+            self.manager.on_plate_presence("cam1", {"cam1": False, "cam3": False}, self.log)
+
+        frame = make_frame(5000)
+        frame.status = "UNSTABLE"
+        with patch(
+            "services.session.session_manager.SESSION_CONTINUE_AFTER_PLATE_LOSS_WITH_WEIGHT",
+            False,
+        ), patch("services.session.session_manager.time.monotonic", return_value=1.1):
+            self.manager.on_frame(frame, self.log)
+
+        self.assertTrue(self.manager.session.session_active)
+        self.assertTrue(self.manager.session.scale_owned)
 
 
 if __name__ == "__main__":

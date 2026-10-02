@@ -1,6 +1,7 @@
 import queue
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import ModuleType
@@ -86,6 +87,85 @@ class ImageSaveWorkerResourceTests(unittest.TestCase):
         self.assertEqual(self.pending["key"]["attempts"], 4)
         self.assertEqual(self.pending["key"]["next_attempt_at"], 2000)
         self.assertTrue(self.queue.empty())
+
+    def test_minio_client_is_created_lazily_once(self):
+        client = mock.Mock()
+        with mock.patch.object(module, "_minio", None), mock.patch.object(
+            module, "Minio", return_value=client,
+        ) as constructor, mock.patch.object(module, "PoolManager") as pool:
+            self.assertIs(ImageSaveWorker._get_minio(), client)
+            self.assertIs(ImageSaveWorker._get_minio(), client)
+
+        http_client = constructor.call_args.kwargs["http_client"]
+        self.assertIs(http_client, pool.return_value)
+        timeout = pool.call_args.kwargs["timeout"]
+        self.assertEqual(timeout.connect_timeout, module.MINIO_CONNECT_TIMEOUT_SECONDS)
+        self.assertEqual(timeout.read_timeout, module.MINIO_READ_TIMEOUT_SECONDS)
+        constructor.assert_called_once_with(
+            module.MINIO_ENDPOINT,
+            access_key=module.MINIO_ACCESS_KEY,
+            secret_key=module.MINIO_SECRET_KEY,
+            secure=module.MINIO_SECURE,
+            region=module.MINIO_REGION,
+            http_client=http_client,
+        )
+
+    def test_wait_for_pending_counts_retry_backlog(self):
+        self.pending["key"] = {"object_key": "key", "fpath": "/tmp/x"}
+
+        self.assertFalse(ImageSaveWorker.wait_for_pending(timeout=0.1))
+
+        self.pending.clear()
+        self.assertTrue(ImageSaveWorker.wait_for_pending(timeout=0.1))
+
+    def test_persist_pending_fsyncs_parent_directory(self):
+        self.pending["key"] = {"object_key": "key", "fpath": "/tmp/x"}
+        sentinel = 4242
+        with mock.patch.object(module.os, "open", return_value=sentinel) as open_mock, mock.patch.object(
+            module.os, "fsync",
+        ) as fsync_mock, mock.patch.object(module.os, "close") as close_mock:
+            ImageSaveWorker._persist_pending_locked()
+
+        open_mock.assert_called_once_with(
+            module.os.path.dirname(self.pending_file),
+            module.os.O_RDONLY | module.os.O_DIRECTORY,
+        )
+        self.assertIn(mock.call(sentinel), fsync_mock.call_args_list)
+        close_mock.assert_called_once_with(sentinel)
+
+
+    def test_upload_loop_survives_retry_persistence_failure(self):
+        stop = threading.Event()
+        self.pending["key"] = {
+            "object_key": "key", "fpath": "/tmp/x", "attempts": 0,
+            "next_attempt_at": 0.0, "created_at": "2026-01-01T00:00:00",
+        }
+        calls = {"count": 0}
+
+        def failing_upload(task):
+            calls["count"] += 1
+            raise RuntimeError("upload boom")
+
+        def failing_retry(task, increment=True):
+            raise OSError("disk full")
+
+        original_started = module._worker_started
+        module._worker_started = True
+        self.addCleanup(setattr, module, "_worker_started", original_started)
+        with mock.patch.object(module, "_stop_event", stop), mock.patch.object(
+            ImageSaveWorker, "_upload_task", side_effect=failing_upload,
+        ), mock.patch.object(ImageSaveWorker, "_schedule_retry", side_effect=failing_retry):
+            worker = threading.Thread(target=ImageSaveWorker._upload_loop, daemon=True)
+            worker.start()
+            deadline = time.time() + 3
+            while calls["count"] < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            stop.set()
+            worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertGreaterEqual(calls["count"], 2)
+        self.assertFalse(module._worker_started)
 
 
 if __name__ == "__main__":

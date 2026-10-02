@@ -15,6 +15,8 @@ Cấu hình trên cân D2008:
 """
 
 import serial
+import fcntl
+import os
 import time
 import sqlite3
 import threading
@@ -24,6 +26,10 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable
 
 from config import (
+    SCALE_READER_MAX_OPEN_ATTEMPTS,
+    SCALE_READER_RECONNECT_INITIAL_SECONDS,
+    SCALE_READER_RECONNECT_MAX_SECONDS,
+    SCALE_READER_STALL_SECONDS,
     SCALE_DATA_RETENTION_DAYS,
     SQLITE_PASSIVE_CHECKPOINT_SECONDS,
     SQLITE_TRUNCATE_CHECKPOINT_SECONDS,
@@ -36,7 +42,7 @@ from config import (
 # ─────────────────────────────────────────────
 SERIAL_PORT   = "/dev/ttyS6"       # Windows: "COM3", Linux: "/dev/ttyUSB0"
 BAUD_RATE     = 9600
-DB_FILE       = "scale_data.db"
+DB_FILE       = "scale_data"
 SERIAL_DUMP_FILE = None
 LOG_INTERVAL  = 0.2          # Persist at the scale's nominal 5 Hz frame rate
 
@@ -138,7 +144,12 @@ class D2008Parser:
         """Parse 12 byte thành WeightFrame."""
         try:
             # Byte 2: dấu
-            sign = '+' if raw[1] == 0x2B else '-'
+            if raw[1] == 0x2B:
+                sign = '+'
+            elif raw[1] == 0x2D:
+                sign = '-'
+            else:
+                return None
 
             # Byte 3-8: 6 chữ số ASCII (không thập phân)
             digits_str = raw[2:8].decode('ascii')
@@ -191,35 +202,74 @@ class ScaleDatabase:
     """Lưu dữ liệu cân vào SQLite."""
 
     def __init__(self, db_file: str):
-        self.db_file = db_file
+        self.db_file = None
+        self.db_dir = None if db_file.endswith(".db") else db_file
+        self._fixed_db_file = db_file if self.db_dir is None else None
+        self._lock_file = None
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self._conn = None
+        self._date = None
         self._last_retention = 0.0
         self._last_passive_checkpoint = 0.0
         self._last_truncate_checkpoint = 0.0
         self.last_maintenance_error = None
+        if self.db_dir:
+            os.makedirs(self.db_dir, exist_ok=True)
+            self._lock_file = open(os.path.join(self.db_dir, ".scale_data.lock"), "a")
+            fcntl.flock(self._lock_file, fcntl.LOCK_SH)
+        if self._fixed_db_file:
+            self._open(self._fixed_db_file)
+
+    @staticmethod
+    def path_for_date(db_dir, value):
+        return os.path.join(db_dir, f"{value:%Y-%m-%d}.db")
+
+    def _open(self, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.db_file = path
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._date = None if self._fixed_db_file else os.path.splitext(os.path.basename(path))[0]
         self._init_db()
 
+    def _close_current_locked(self):
+        if self._conn is None:
+            return
+        self._conn.commit()
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._conn.close()
+        self._conn = None
+
+    def _ensure_date_locked(self, timestamp):
+        if self._fixed_db_file:
+            return
+        date_text = timestamp.strftime("%Y-%m-%d")
+        if self._conn is not None and self._date == date_text:
+            return
+        self._close_current_locked()
+        self._last_passive_checkpoint = 0.0
+        self._last_truncate_checkpoint = 0.0
+        self._open(self.path_for_date(self.db_dir, timestamp))
+
     def _init_db(self):
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("""
-                CREATE TABLE IF NOT EXISTS weight_log (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp   TEXT    NOT NULL,
-                    weight_kg   REAL    NOT NULL,
-                    sign        TEXT    NOT NULL,
-                    decimal_pos INTEGER NOT NULL,
-                    checksum_ok INTEGER NOT NULL,
-                    status      TEXT    NOT NULL DEFAULT 'UNSTABLE'
-                )
-            """)
-            self._conn.commit()
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS weight_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT    NOT NULL,
+                weight_kg   REAL    NOT NULL,
+                sign        TEXT    NOT NULL,
+                decimal_pos INTEGER NOT NULL,
+                checksum_ok INTEGER NOT NULL,
+                status      TEXT    NOT NULL DEFAULT 'UNSTABLE'
+            )
+        """)
+        self._conn.commit()
         print(f"[DB] Database sẵn sàng: {self.db_file}")
 
     def save(self, frame: WeightFrame):
         with self._lock:
+            self._ensure_date_locked(frame.timestamp)
             self._conn.execute("""
                 INSERT INTO weight_log
                     (timestamp, weight_kg, sign, decimal_pos, checksum_ok, status)
@@ -273,20 +323,26 @@ class ScaleDatabase:
 
     def get_recent(self, limit: int = 20) -> list[dict]:
         with self._lock:
+            if self._conn is None:
+                return []
             old_row_factory = self._conn.row_factory
             self._conn.row_factory = sqlite3.Row
-            rows = self._conn.execute("""
-                SELECT * FROM weight_log
-                ORDER BY id DESC LIMIT ?
-            """, (limit,)).fetchall()
-            self._conn.row_factory = old_row_factory
+            try:
+                rows = self._conn.execute("""
+                    SELECT * FROM weight_log
+                    ORDER BY id DESC LIMIT ?
+                """, (limit,)).fetchall()
+            finally:
+                self._conn.row_factory = old_row_factory
         return [dict(r) for r in rows]
 
     def close(self):
         with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
+            self._close_current_locked()
+            if self._lock_file is not None:
+                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+                self._lock_file.close()
+                self._lock_file = None
 
 
 class D2008Reader:
@@ -306,19 +362,32 @@ class D2008Reader:
         db_file: str = DB_FILE,
         dump_file: Optional[str] = SERIAL_DUMP_FILE,
         log_interval: float = LOG_INTERVAL,
+        stall_seconds: float = SCALE_READER_STALL_SECONDS,
+        reconnect_initial_seconds: float = SCALE_READER_RECONNECT_INITIAL_SECONDS,
+        reconnect_max_seconds: float = SCALE_READER_RECONNECT_MAX_SECONDS,
+        max_open_attempts: int = SCALE_READER_MAX_OPEN_ATTEMPTS,
     ):
         self.port         = port
         self.baud         = baud
         self.dump_file    = dump_file
         self.log_interval = log_interval
+        self.stall_seconds = stall_seconds
+        self.reconnect_initial_seconds = reconnect_initial_seconds
+        self.reconnect_max_seconds = reconnect_max_seconds
+        self.max_open_attempts = max_open_attempts
 
         self._parser   = D2008Parser()
         self._db       = ScaleDatabase(db_file)
         self._serial   = None
         self._running  = False
+        self._stop_event = threading.Event()
         self.state = "stopped"
         self.last_error = None
         self._thread   = None
+        self._last_valid_monotonic = None
+        self._outage_started_monotonic = None
+        self._reconnect_count = 0
+        self._open_failures = 0
         self._last_log   = 0.0
         self._last_print = 0.0
         self._recent_weights = deque(maxlen=STABLE_COUNT)
@@ -332,14 +401,19 @@ class D2008Reader:
         self.on_frame: Optional[Callable[[WeightFrame], None]] = None
         # Callback — fires only on status transitions (STABLE↔UNSTABLE, OVERLOAD)
         self.on_status_change: Optional[Callable[[WeightFrame, str, str], None]] = None
+        # Callback — fires for serial reader stalls and recoveries.
+        self.on_health: Optional[Callable[[str, dict], None]] = None
 
         # Giá trị cân mới nhất (thread-safe read)
         self.latest: Optional[WeightFrame] = None
 
     def start(self):
         """Bắt đầu đọc (non-blocking, chạy background thread)."""
+        self._stop_event.clear()
         self._running = True
         self.state = "starting"
+        self._reconnect_count = 0
+        self._open_failures = 0
         self._thread  = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         print(f"[READER] Đang kết nối {self.port} @ {self.baud} baud...")
@@ -347,53 +421,149 @@ class D2008Reader:
     def stop(self):
         """Dừng đọc."""
         self._running = False
-        if self._serial and self._serial.is_open:
-            self._serial.close()
-        if self._thread:
-            self._thread.join(timeout=3)
-            if self._thread.is_alive():
-                print("[WARNING] Reader thread did not stop; database left open")
-                return
-        self._db.close()
+        self._stop_event.set()
+        try:
+            if self._serial and self._serial.is_open:
+                self._serial.close()
+            if self._thread:
+                self._thread.join(timeout=3)
+                if self._thread.is_alive():
+                    print("[WARNING] Reader thread did not stop within 3s")
+        finally:
+            self._db.close()
         print("[READER] Đã dừng.")
 
     def _run(self):
-        try:
-            if self.dump_file:
+        if self.dump_file:
+            try:
                 self._run_from_dump_file(self.dump_file)
-                return
+            finally:
+                self._running = False
+                self.state = "stopped"
+            return
 
-            self._serial = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=2,
-            )
-            print(f"[READER] Kết nối thành công: {self.port}")
-            self.state = "running"
-
+        delay = self.reconnect_initial_seconds
+        try:
             while self._running:
-                raw = self._serial.read(self._serial.in_waiting or 1)
-                if not raw:
-                    continue
+                opened = False
+                try:
+                    self._serial = serial.Serial(
+                        port=self.port,
+                        baudrate=self.baud,
+                        bytesize=serial.EIGHTBITS,
+                        parity=serial.PARITY_NONE,
+                        stopbits=serial.STOPBITS_ONE,
+                        timeout=2,
+                    )
+                    opened = True
+                    self._open_failures = 0
+                    # Discard pre-gap samples so a reconnect cannot splice
+                    # stale weights onto the new serial stream.
+                    self._reset_stability_history()
+                    self._parser = D2008Parser()
+                    print(f"[READER] Kết nối thành công: {self.port}")
+                    self.state = "running"
+                    self._last_valid_monotonic = time.monotonic()
+                    while self._running:
+                        raw = self._serial.read(self._serial.in_waiting or 1)
+                        now = time.monotonic()
+                        if raw:
+                            frames = self._parser.feed(raw)
+                            valid_frame = False
+                            for frame in frames:
+                                if frame.checksum_ok:
+                                    valid_frame = True
+                                self._handle_frame(frame)
+                            if valid_frame:
+                                self._last_valid_monotonic = now
+                                if self._outage_started_monotonic is not None:
+                                    outage_s = now - self._outage_started_monotonic
+                                    self._emit_health("recovered", outage_seconds=outage_s)
+                                    self._outage_started_monotonic = None
+                                    self._reconnect_count = 0
+                                delay = self.reconnect_initial_seconds
+                                continue
+                        if now - self._last_valid_monotonic >= self.stall_seconds:
+                            self._mark_stalled("no checksum-valid frames")
+                            break
+                except (serial.SerialException, TypeError, OSError) as exc:
+                    self.last_error = str(exc)
+                    if opened:
+                        # A failed read on an open port is transient; reconnect.
+                        self._open_failures = 0
+                    else:
+                        # The port could not be opened at all (unplugged/absent).
+                        self._open_failures += 1
+                    if not opened and self._open_failures >= self.max_open_attempts:
+                        self.state = "failed"
+                        self.last_error = (
+                            f"serial port unavailable after {self._open_failures} attempts: {exc}"
+                        )
+                        self._emit_health(
+                            "failed",
+                            reason=self.last_error,
+                        )
+                        print(
+                            f"[ERROR] Scale reader failed: serial port unavailable after "
+                            f"{self._open_failures} attempts: {exc}"
+                        )
+                        break
+                    self._mark_stalled(str(exc))
+                except Exception as exc:
+                    # An unexpected error must never kill the reader silently:
+                    # surface it as a failure and let the health path see it.
+                    self.last_error = f"unexpected: {exc}"
+                    self.state = "failed"
+                    self._emit_health("failed", reason=str(exc))
+                    print(f"[ERROR] Scale reader failed: {exc}")
+                    break
+                finally:
+                    if self._serial and self._serial.is_open:
+                        self._serial.close()
+                    self._serial = None
 
-                frames = self._parser.feed(raw)
-                for frame in frames:
-                    self._handle_frame(frame)
-
-        except (serial.SerialException, TypeError, OSError) as e:
-            self.last_error = str(e)
-            self.state = "failed"
-            if self._running:
-                print(f"[ERROR] Lỗi cổng serial: {e}")
+                if self._running:
+                    self.state = "reconnecting"
+                    self._reconnect_count += 1
+                    self._stop_event.wait(delay)
+                    delay = min(delay * 2, self.reconnect_max_seconds)
         finally:
             self._running = False
+            # Preserve a terminal "failed" so the service fail-fast can see it.
             if self.state != "failed":
                 self.state = "stopped"
             if self._serial and self._serial.is_open:
                 self._serial.close()
+
+    def _mark_stalled(self, reason):
+        now = time.monotonic()
+        self.last_error = reason
+        self.state = "stalled"
+        if self._outage_started_monotonic is None:
+            self._outage_started_monotonic = now
+            self._emit_health("stalled", reason=reason)
+
+    def _emit_health(self, event, **details):
+        if not self.on_health:
+            return
+        payload = {
+            "event": event,
+            "port": self.port,
+            "last_valid_age_seconds": (
+                None if self._last_valid_monotonic is None
+                else max(0.0, time.monotonic() - self._last_valid_monotonic)
+            ),
+            "last_valid_timestamp": (
+                self.latest.timestamp.isoformat(timespec="milliseconds")
+                if self.latest is not None else None
+            ),
+            "reconnect_count": self._reconnect_count,
+            **details,
+        }
+        try:
+            self.on_health(event, payload)
+        except Exception as exc:
+            print(f"[ERROR] Reader health callback failed: {exc}")
 
     def _run_from_dump_file(self, file_path: str):
         """Giả lập đọc serial bằng dữ liệu dump từ file nhị phân."""
@@ -476,7 +646,10 @@ class D2008Reader:
 
         # Fire on every frame for session logic (stable counting etc.)
         if self.on_frame:
-            self.on_frame(frame)
+            try:
+                self.on_frame(frame)
+            except Exception as exc:
+                print(f"[ERROR] Frame callback failed: {exc}")
 
         # Detect status transitions — fires on every change
         if frame.status != self._prev_status:
@@ -501,8 +674,11 @@ class D2008Reader:
 
         # Ghi DB theo interval
         if frame.checksum_ok and (now - self._last_log + 1e-9 >= self.log_interval):
-            self._db.save(frame)
-            self._last_log = now
+            try:
+                self._db.save(frame)
+                self._last_log = now
+            except Exception as exc:
+                print(f"[ERROR] Scale DB save failed: {exc}")
 
 
 # ─────────────────────────────────────────────

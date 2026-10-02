@@ -3,7 +3,15 @@
 import threading
 import time
 
-from config import DETECT_FPS, PLATE_TRACK_STALE_SECONDS, YOLO26_DETECT_FPS
+from config import (
+    DETECT_FPS,
+    LPR_FALLBACK_IMAGE_SIZE,
+    LPR_FALLBACK_OCR_CONFIDENCE,
+    LPR_LIVE_OCR_INTERVAL_SECONDS,
+    PLATE_TRACK_STALE_SECONDS,
+)
+
+TIMING_LOG_INTERVAL_SECONDS = 60.0
 
 
 def bbox_iou(left, right):
@@ -24,21 +32,30 @@ class CameraPlateTrack:
         self.track_id = 0
         self.bbox = None
         self.confidence = 0.0
+        self.obb = None
+        self.plate_class = None
+        self.two_row = False
         self.hits = 0
         self.valid = False
         self.frame_id = None
         self.last_observed_at = None
+        self._last_ocr_track_id = None
+        self._last_ocr_at = None
 
     def observe(self, regions, frame_id=None, observed_at=None):
-        self.last_observed_at = time.monotonic() if observed_at is None else observed_at
-        best = max(regions, key=lambda item: item.get("det_conf", item.get("confidence", 0.0)), default=None)
+        best = None
+        if self.bbox is not None:
+            best = max(regions, key=lambda item: bbox_iou(self.bbox, item["bbox"]), default=None)
+            if best is not None and bbox_iou(self.bbox, best["bbox"]) < self.iou_threshold:
+                best = None
         if best is None:
-            self.bbox = None
-            self.confidence = 0.0
-            self.hits = 0
-            self.valid = False
-            self.frame_id = frame_id
-            return
+            best = max(regions, key=lambda item: item.get("det_conf", item.get("confidence", 0.0)), default=None)
+        if best is None:
+            # No detection this frame: keep the track state and its last
+            # observation time so expire() can apply the miss-tolerance window
+            # instead of dropping the track on a single dropped frame.
+            return None
+        self.last_observed_at = time.monotonic() if observed_at is None else observed_at
         bbox = list(best["bbox"])
         if self.bbox is None or bbox_iou(self.bbox, bbox) < self.iou_threshold:
             self.track_id += 1
@@ -47,8 +64,12 @@ class CameraPlateTrack:
             self.hits += 1
         self.bbox = bbox
         self.confidence = float(best.get("det_conf", best.get("confidence", 0.0)))
+        self.obb = best.get("obb")
+        self.plate_class = best.get("class")
+        self.two_row = bool(best.get("two_row"))
         self.valid = self.hits >= self.confirm_hits
         self.frame_id = frame_id
+        return best
 
     def expire(self, now=None, stale_seconds=PLATE_TRACK_STALE_SECONDS):
         if not self.valid or self.last_observed_at is None:
@@ -58,16 +79,35 @@ class CameraPlateTrack:
             return False
         self.bbox = None
         self.confidence = 0.0
+        self.obb = None
+        self.plate_class = None
+        self.two_row = False
         self.hits = 0
         self.valid = False
         self.frame_id = None
         return True
 
+    def claim_live_ocr(self, now=None, interval=LPR_LIVE_OCR_INTERVAL_SECONDS):
+        if not self.valid:
+            return False
+        now = time.monotonic() if now is None else now
+        if (
+            self._last_ocr_track_id == self.track_id
+            and self._last_ocr_at is not None
+            and now - self._last_ocr_at < interval
+        ):
+            return False
+        self._last_ocr_track_id = self.track_id
+        self._last_ocr_at = now
+        return True
+
     def metadata(self):
         if not self.valid:
             return []
-        return [{"bbox": list(self.bbox), "track_id": self.track_id,
-                 "confidence": self.confidence, "frame_id": self.frame_id}]
+        return [{"bbox": list(self.bbox), "obb": self.obb,
+                 "class": self.plate_class, "two_row": self.two_row,
+                 "track_id": self.track_id, "confidence": self.confidence,
+                 "frame_id": self.frame_id}]
 
 
 def crop_lpr_frame(frame, mode):
@@ -123,9 +163,11 @@ class DetectCoordinator:
         self._session_context = session_context or (lambda: (None, None))
         self._tracks = {cam.name: CameraPlateTrack(cam.name) for cam in cameras}
         self._track_lock = threading.Lock()
+        self._fallback_lock = threading.Lock()
         self._presence_revision = 0
         self._detect_regions_fn = None
         self._recognize_regions_fn = None
+        self._fallback_detect_regions_fn = None
         self._charset = None
         self._running = False
         self._enabled = False
@@ -140,11 +182,58 @@ class DetectCoordinator:
         self._detect_locks = {}
         self._last_submitted_frame_ids = {}
         self._ocr_threads = []
+        self._last_timing_logs = {}
 
-    def configure_split_pipeline(self, detect_regions_fn, recognize_regions_fn, charset):
+    def configure_split_pipeline(
+        self, detect_regions_fn, recognize_regions_fn, charset, fallback_detect_regions_fn=None,
+    ):
         self._detect_regions_fn = detect_regions_fn
         self._recognize_regions_fn = recognize_regions_fn
         self._charset = charset
+        self._fallback_detect_regions_fn = fallback_detect_regions_fn
+
+    def _recognize_with_fallback(self, cam, frame, regions):
+        plates = self._recognize_regions_fn(regions, ocr=cam.ocr, charset=self._charset)
+        valid = [plate for plate in plates if plate["plate"] != "unknown"]
+        primary = max(valid, key=lambda plate: plate.get("ocr_confidence", 0.0), default=None)
+        if (
+            primary is None
+            or primary.get("ocr_confidence", 0.0) >= LPR_FALLBACK_OCR_CONFIDENCE
+            or self._fallback_detect_regions_fn is None
+            or getattr(cam, "fallback_detector", None) is None
+        ):
+            return plates
+        with self._fallback_lock:
+            fallback_regions = self._fallback_detect_regions_fn(
+                frame, detector=cam.fallback_detector, imgsz=LPR_FALLBACK_IMAGE_SIZE,
+            )
+        fallback_plates = self._recognize_regions_fn(
+            fallback_regions, ocr=cam.ocr, charset=self._charset,
+        )
+        fallback_valid = [plate for plate in fallback_plates if plate["plate"] != "unknown"]
+        fallback = max(fallback_valid, key=lambda plate: plate.get("ocr_confidence", 0.0), default=None)
+        if (
+            fallback
+            and fallback["plate"] != primary["plate"]
+            and fallback.get("ocr_confidence", 0.0) > primary.get("ocr_confidence", 0.0)
+        ):
+            log(
+                "PLATE",
+                f"[{cam.name}] fallback selected {fallback['plate']} "
+                f"ocr={fallback['ocr_confidence']:.3f} over "
+                f"{primary['plate']} ocr={primary['ocr_confidence']:.3f}",
+            )
+            return [fallback]
+        return plates
+
+    def _log_timing(self, camera_name, operation, message, now=None):
+        now = time.monotonic() if now is None else now
+        key = (camera_name, operation)
+        last_logged_at = self._last_timing_logs.get(key)
+        if last_logged_at is not None and now - last_logged_at < TIMING_LOG_INTERVAL_SECONDS:
+            return
+        self._last_timing_logs[key] = now
+        log("TIMING", message)
 
     def start(self):
         if self._running:
@@ -224,9 +313,15 @@ class DetectCoordinator:
                 return []
             return metadata
 
-    def _process_plate_detections(self, cam, plates, full_frame):
+    def _process_plate_detections(self, cam, plates, full_frame, expected_context=None):
         """Process plate detections: log, update tracker, capture best plate and unknown frame."""
         if not self.is_enabled():
+            return
+        if expected_context is not None and expected_context != self._session_context():
+            # The session may have started and cleared the shared tracker after
+            # this OCR job was queued; drop the stale detections rather than
+            # attributing them to the new session.
+            log("INFO", f"[{cam.name}] stale detections ignored context={expected_context}")
             return
         best_conf = 0.0
         best_plate = None
@@ -243,9 +338,11 @@ class DetectCoordinator:
                 crop_parts = p["crop_size"].split("x")
                 cw, ch = int(crop_parts[0]), int(crop_parts[1])
                 self._tracker.add_observation(plate_text, p["det_conf"], cw, ch, source="selected")
-                for alt_plate, _ in p.get("valid_candidates", [])[1:]:
+                for alt_plate, _ in p.get("valid_candidates", []):
+                    if alt_plate == plate_text:
+                        continue
                     self._tracker.add_observation(alt_plate, p["det_conf"] * 0.5, cw, ch, source="candidate")
-                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.5, full_frame, cam.name)
+                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.5, full_frame, cam.name, debug=p)
                 if p["det_conf"] > best_conf:
                     best_conf = p["det_conf"]
                     best_plate = plate_text
@@ -260,15 +357,15 @@ class DetectCoordinator:
                 cw, ch = int(crop_parts[0]), int(crop_parts[1])
                 for alt_plate, _ in p.get("valid_candidates", []):
                     self._tracker.add_observation(alt_plate, p["det_conf"] * 0.75, cw, ch, source="candidate")
-                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.75, full_frame, cam.name)
+                    self._tracker.update_image(alt_plate, p["det_conf"] * 0.75, full_frame, cam.name, debug=p)
                     if best_plate is None:
                         best_plate = alt_plate
                         best_conf = p["det_conf"] * 0.75
-        del plates
         if has_unknown and best_plate is None and self._tracker.needs_undetectable():
             self._tracker.save_undetectable(full_frame.copy())
         if best_plate is not None:
-            self._tracker.update_image(best_plate, best_conf, full_frame, cam.name)
+            debug = next((plate for plate in plates if plate["plate"] == best_plate), None)
+            self._tracker.update_image(best_plate, best_conf, full_frame, cam.name, debug=debug)
 
     def _submit_ocr_job(self, cam, full_frame, regions, detect_started_at):
         lock = self._ocr_locks.get(cam.name)
@@ -311,7 +408,7 @@ class DetectCoordinator:
                     continue
                 t0 = time.time()
                 with cam.inference_lock:
-                    plates = self._recognize_regions_fn(regions, ocr=cam.ocr, charset=self._charset)
+                    plates = self._recognize_with_fallback(cam, full_frame, regions)
                 if not self.is_enabled():
                     continue
                 if job["session_context"] != self._session_context():
@@ -323,20 +420,22 @@ class DetectCoordinator:
                     if len(plates) == 1:
                         p = plates[0]
                         candidates = ",".join(p.get("candidates", [])[:5])
-                        log(
-                            "TIMING",
+                        self._log_timing(
+                            cam.name,
+                            "ocr",
                             f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates=1 age={age_ms:.0f}ms "
                             f"plate={p.get('plate')} status={p.get('ocr_status')} candidates={candidates}",
                         )
                     else:
                         summary = ",".join(p.get("plate", "unknown") for p in plates[:5])
-                        log("TIMING", f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates={len(plates)} age={age_ms:.0f}ms plate={summary}")
-                self._process_plate_detections(cam, plates, full_frame)
+                        self._log_timing(
+                            cam.name,
+                            "ocr",
+                            f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates={len(plates)} age={age_ms:.0f}ms plate={summary}",
+                        )
+                self._process_plate_detections(cam, plates, full_frame, job["session_context"])
             except Exception as exc:
                 log("ERROR", f"OCR worker error [{cam.name}]: {exc}")
-            finally:
-                del full_frame
-                del regions
 
     def _run_detection(self, cam, full_frame, frame_id=None):
         """Run detection for one camera. Feeds tracker directly."""
@@ -347,22 +446,33 @@ class DetectCoordinator:
                 regions = self._detect_regions_fn(lpr_frame, detector=cam.detector)
             regions = remap_lpr_regions(regions, dx, dy)
             with self._track_lock:
-                self._tracks[cam.name].observe(regions, frame_id)
+                track = self._tracks[cam.name]
+                ocr_region = track.observe(regions, frame_id)
+                submit_ocr = track.claim_live_ocr()
                 valid = {name: track.valid for name, track in self._tracks.items()}
                 self._presence_revision += 1
                 revision = self._presence_revision
             if self._presence_callback:
                 self._presence_callback(cam.name, valid, revision)
             elapsed_ms = (time.time() - t0) * 1000
-            log("TIMING", f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
-                           f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
-                           f"input={lpr_frame.shape[1]}x{lpr_frame.shape[0]}")
-            self._submit_ocr_job(cam, full_frame, regions, t0)
+            self._log_timing(
+                cam.name,
+                "detect",
+                f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
+                f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
+                f"input={lpr_frame.shape[1]}x{lpr_frame.shape[0]}",
+            )
+            if submit_ocr and ocr_region is not None:
+                self._submit_ocr_job(cam, full_frame, [ocr_region], t0)
             return
         plates = self._detect_plates_fn(full_frame, detector=cam.detector, ocr=cam.ocr)
         elapsed_ms = (time.time() - t0) * 1000
         if plates:
-            log("TIMING", f"[{cam.name}] Frame inference: {elapsed_ms:.0f}ms  plates={len(plates)}")
+            self._log_timing(
+                cam.name,
+                "frame_inference",
+                f"[{cam.name}] Frame inference: {elapsed_ms:.0f}ms  plates={len(plates)}",
+            )
         self._process_plate_detections(cam, plates, full_frame)
 
     def _expire_stale_tracks(self):
@@ -390,8 +500,8 @@ class DetectCoordinator:
             frames = []
             for cam in self._cameras:
                 peek = getattr(cam, "peek_latest_frame_with_id", None)
-                frame, frame_id = peek(copy_frame=True) if peek else (
-                    cam.peek_latest_frame(copy_frame=True), None
+                frame, frame_id = peek(copy_frame=False) if peek else (
+                    cam.peek_latest_frame(copy_frame=False), None
                 )
                 frames.append((cam, frame, frame_id))
             if not any(frame is not None for _cam, frame, _frame_id in frames):
@@ -419,43 +529,3 @@ class DetectCoordinator:
 
             elapsed_total = time.time() - t0
             time.sleep(max(0.0, interval - elapsed_total))
-
-
-class VehicleDetectCoordinator:
-    def __init__(self, cameras: list, tracker, detector=None, detect_vehicles_fn=None):
-        self._cameras = cameras
-        self._tracker = tracker
-        self._detector = detector
-        self._detect_vehicles_fn = detect_vehicles_fn
-        self._running = False
-        self._thread = None
-
-    def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._detect_loop, daemon=True)
-        self._thread.start()
-        log("INFO", f"VehicleDetectCoordinator started with {len(self._cameras)} cameras")
-
-    def stop(self, timeout=3.0):
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-        return not self._thread or not self._thread.is_alive()
-
-    def _detect_loop(self):
-        interval = 1.0 / YOLO26_DETECT_FPS
-        while self._running:
-            t0 = time.time()
-            for cam in self._cameras:
-                full_frame = cam.peek_latest_frame(copy_frame=True)
-                if full_frame is None:
-                    continue
-                try:
-                    detections = self._detect_vehicles_fn(full_frame, detector=self._detector)
-                    self._tracker.update(cam.name, detections, full_frame.shape)
-                except Exception as exc:
-                    log("ERROR", f"Vehicle detection error [{cam.name}]: {exc}")
-                finally:
-                    del full_frame
-            elapsed = time.time() - t0
-            time.sleep(max(0.0, interval - elapsed))

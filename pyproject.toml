@@ -1,0 +1,32 @@
+[project]
+name = "weighing-meter"
+version = "0.0.0"
+description = "Weighbridge capture, LPR, MQTT publication service"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [
+    "models",
+    "yolov5lpr",
+    "/storage",
+    "scale_data",
+    ".venv",
+]
+
+# High-signal checks only: real defects, not formatting churn.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W6"]
+# E731 (lambda assignment) and E741 (ambiguous `l` for LAB channels) are
+# accepted existing style; neither has caused a defect in this codebase.
+ignore = ["E731", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# These entry points intentionally manipulate sys.path before importing.
+"tests/*" = ["E402"]
+"scripts/*" = ["E402"]
+"weighing_service.py" = ["E402"]
+
+[tool.unittest]
+start-dir = "tests"

@@ -1,6 +1,6 @@
 import json
 import os
-import queue
+import sqlite3
 import tempfile
 import unittest
 import sys
@@ -8,13 +8,13 @@ from unittest.mock import patch
 from unittest.mock import Mock
 
 sys.modules.setdefault("cv2", Mock())
-sys.modules.setdefault("numpy", Mock())
 sys.modules.setdefault("minio", Mock())
 sys.modules.setdefault("minio.error", Mock())
 
 from services.storage import publish_outbox as module
 from services.storage.publish_outbox import PublishOutbox
 from services.session import session_manager as session_module
+from services.session import plate_registry as plate_registry_module
 
 
 class PublishOutboxIdempotencyTests(unittest.TestCase):
@@ -32,6 +32,7 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         )
         self.finalization_patch.start()
         module._pending_events.clear()
+        module._stop_event.clear()
         while not module._publish_queue.empty():
             module._publish_queue.get_nowait()
 
@@ -67,6 +68,128 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         with open(self.pending) as fp:
             self.assertEqual(fp.read(), "")
 
+    def test_deferred_enqueue_waits_for_activation(self):
+        event_id = PublishOutbox.enqueue(
+            {"offline_event_id": "deferred"}, activate=False,
+        )
+
+        self.assertEqual(event_id, "deferred")
+        self.assertTrue(module._publish_queue.empty())
+        module._pending_events.clear()
+        PublishOutbox._load_pending()
+        self.assertTrue(module._publish_queue.empty())
+        self.assertTrue(PublishOutbox.activate(event_id))
+        self.assertEqual(module._publish_queue.get_nowait(), "deferred")
+
+    def test_activation_survives_crash_before_queue_insertion(self):
+        PublishOutbox.enqueue({"offline_event_id": "activation-crash"}, activate=False)
+        with patch.object(module._publish_queue, "put", side_effect=RuntimeError("power loss")):
+            with self.assertRaises(RuntimeError):
+                PublishOutbox.activate("activation-crash")
+
+        module._pending_events.clear()
+        PublishOutbox._load_pending()
+
+        self.assertEqual(module._publish_queue.get_nowait(), "activation-crash")
+
+    def test_outbox_replace_fsyncs_parent_directory(self):
+        with patch.object(module.os, "open", return_value=123) as open_dir, patch.object(
+            module.os, "fsync",
+        ) as fsync, patch.object(module.os, "close") as close:
+            PublishOutbox.enqueue({"offline_event_id": "durable"}, activate=False)
+
+        open_dir.assert_called_once_with(self.root.name, os.O_RDONLY | os.O_DIRECTORY)
+        fsync.assert_any_call(123)
+        close.assert_called_once_with(123)
+
+    def test_finalized_retry_activates_deferred_outbox(self):
+        PublishOutbox.enqueue({"offline_event_id": "retry"}, activate=False)
+        session_module.markSessionFinalized("retry", "published", {
+            "event": "session_publish_queued", "id": "retry", "outbox_event_id": "retry",
+        })
+        manager = session_module.SessionManager(Mock())
+
+        self.assertTrue(manager.finalize_deferred_session(
+            self.deferred_metadata("retry"), Mock(), Mock(),
+        ))
+
+        self.assertEqual(module._publish_queue.get_nowait(), "retry")
+
+    def test_finalized_publish_without_outbox_evidence_is_not_acknowledged(self):
+        session_module.markSessionFinalized("missing", "published", {
+            "event": "session_publish_queued", "id": "missing", "outbox_event_id": "missing",
+        })
+        manager = session_module.SessionManager(Mock())
+
+        with patch.object(session_module, "MQTT_ENABLED", True):
+            self.assertFalse(manager.finalize_deferred_session(
+                self.deferred_metadata("missing"), Mock(), Mock(),
+            ))
+
+    def test_legacy_published_finalization_without_outbox_id_is_accepted(self):
+        session_module.markSessionFinalized("legacy", "published")
+        manager = session_module.SessionManager(Mock())
+
+        with patch.object(session_module, "MQTT_ENABLED", True):
+            self.assertTrue(manager.finalize_deferred_session(
+                self.deferred_metadata("legacy"), Mock(), Mock(),
+            ))
+
+    def test_legacy_published_finalization_does_not_activate_outbox(self):
+        session_module.markSessionFinalized("legacy-reentry", "published")
+        manager = session_module.SessionManager(Mock())
+
+        with patch.object(session_module, "MQTT_ENABLED", True), patch.object(
+            session_module.PublishOutbox, "activate", return_value=False,
+        ) as activate:
+            self.assertTrue(manager.finalize_deferred_session(
+                self.deferred_metadata("legacy-reentry"), Mock(), Mock(),
+            ))
+
+        activate.assert_not_called()
+
+    def test_mqtt_disabled_finalization_needs_no_outbox_evidence(self):
+        session_module.markSessionFinalized("local-only", "published")
+        manager = session_module.SessionManager(Mock())
+
+        with patch.object(session_module, "MQTT_ENABLED", False):
+            self.assertTrue(manager.finalize_deferred_session(
+                self.deferred_metadata("local-only"), Mock(), Mock(),
+            ))
+
+    def test_scale_reader_stalled_session_without_weight_is_not_published(self):
+        manager = session_module.SessionManager(Mock())
+        metadata = self.deferred_metadata("reader-gap-no-weight")
+        metadata.update({
+            "stable_weight": None,
+            "raw_peak_weight": None,
+            "filtered_peak_weight": None,
+            "end_reason": "scale_reader_stalled",
+            "scale_data_gap": True,
+        })
+
+        with patch.object(manager, "_load_diagnostic_frames", return_value={}), patch.object(
+            manager, "_save_diagnostic_frames", return_value=0,
+        ) as save_diagnostics:
+            self.assertTrue(manager.finalize_deferred_session(metadata, Mock(), Mock()))
+
+        self.assertEqual(session_module.getSessionFinalization("reader-gap-no-weight")[0], "no_weight")
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+        self.assertEqual(save_diagnostics.call_args.args[0], session_module.NO_STABLE_DIR)
+        self.assertEqual(save_diagnostics.call_args.args[3]["reason"], "no_usable_weight")
+
+    def test_completed_ledger_satisfies_finalized_retry(self):
+        PublishOutbox._mark_completed("completed")
+        session_module.markSessionFinalized("completed", "published", {
+            "event": "session_publish_queued", "id": "completed",
+            "outbox_event_id": "completed",
+        })
+        manager = session_module.SessionManager(Mock())
+
+        self.assertTrue(manager.finalize_deferred_session(
+            self.deferred_metadata("completed"), Mock(), Mock(),
+        ))
+
     def test_completed_ledger_is_not_loaded_into_memory(self):
         for index in range(1000):
             PublishOutbox._mark_completed(f"session-{index}")
@@ -75,25 +198,298 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         self.assertTrue(PublishOutbox.has_event("session-999"))
 
     def test_finalization_ledger_survives_restart(self):
-        session_module.markSessionFinalized("session-3", "no_plate")
+        terminal = {
+            "event": "session_no_plate", "id": "session-3",
+            "started_at": "2026-07-24T00:00:00+00:00",
+            "ended_at": "2026-07-24T00:01:00+00:00",
+        }
+        session_module.markSessionFinalized("session-3", "no_plate", terminal)
 
         self.assertTrue(session_module.isSessionFinalized("session-3"))
         self.assertFalse(session_module.isSessionFinalized("session-4"))
+        import sqlite3
+        connection = sqlite3.connect(self.finalization_db)
+        try:
+            stored = connection.execute(
+                "SELECT record_json FROM terminal_outcomes WHERE session_id = ?", ("session-3",)
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(json.loads(stored[0]), terminal)
 
     def test_plate_count_updates_once_per_session_id(self):
-        db_path = os.path.join(self.root.name, "plates.db")
-        with patch.object(session_module, "SERVICE_DIR", self.root.name):
+        with patch.object(plate_registry_module, "SERVICE_DIR", self.root.name):
             first = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")
             replay = session_module.saveConfirmedLicensePlate("14C-000.01", "session-5")
 
         self.assertEqual(first, 1)
         self.assertEqual(replay, 1)
 
+    def terminal_outcome(self, session_id):
+        import sqlite3
+        connection = sqlite3.connect(self.finalization_db)
+        try:
+            row = connection.execute(
+                "SELECT record_json FROM terminal_outcomes WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return json.loads(row[0])
+
+    def deferred_metadata(self, session_id):
+        return {
+            "session_id": session_id,
+            "stable_weight": 1000,
+            "decimal_pos": 0,
+            "started_at": "2026-07-24T00:00:05+00:00",
+            "ended_at": "2026-07-24T00:00:06+00:00",
+            "end_reason": "scale_empty",
+        }
+
+    def test_registry_corrected_plate_session_is_published(self):
+        manager = session_module.SessionManager(Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = ("RAW-1", 0.9, 4)
+        tracker.get_all_plates_summary.return_value = {"RAW-1": 4}
+
+        with patch.object(
+            session_module, "correctWithRegisteredLicensePlate",
+            return_value=("CANON-1", "exact"),
+        ), patch.object(
+            manager, "_attach_publish_images", return_value=True,
+        ), patch.object(
+            session_module, "saveConfirmedLicensePlate", return_value=1,
+        ):
+            self.assertTrue(manager.finalize_deferred_session(
+                self.deferred_metadata("registry"), tracker, Mock(),
+            ))
+
+        self.assertEqual(session_module.getSessionFinalization("registry")[0], "published")
+        self.assertEqual(self.terminal_outcome("registry")["plate"], "CANON-1")
+
+    def test_detailed_candidate_plate_session_is_published(self):
+        manager = session_module.SessionManager(Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = ("15C1234", 0.9, 4)
+        tracker.get_all_plates_summary.return_value = {"15C1234": 4, "15C12340": 3}
+
+        with patch.object(
+            session_module, "correctWithRegisteredLicensePlate",
+            side_effect=lambda plate: (plate, None),
+        ), patch.object(
+            manager, "_attach_publish_images", return_value=True,
+        ), patch.object(
+            session_module, "saveConfirmedLicensePlate", return_value=1,
+        ):
+            self.assertTrue(manager.finalize_deferred_session(
+                self.deferred_metadata("detailed"), tracker, Mock(),
+            ))
+
+        self.assertEqual(session_module.getSessionFinalization("detailed")[0], "published")
+        self.assertEqual(self.terminal_outcome("detailed")["plate"], "15C12340")
+
+    def test_same_plate_distinct_session_ids_are_both_enqueued(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = ("14C-017.80", 0.9, 4)
+        tracker.get_all_plates_summary.return_value = {"14C-017.80": 4}
+        first = self.deferred_metadata("cycle-1")
+        first["started_at"] = "2026-09-27T07:39:53+00:00"
+        first["ended_at"] = "2026-09-27T07:40:16+00:00"
+        second = self.deferred_metadata("cycle-2")
+        second["started_at"] = "2026-09-27T07:40:24+00:00"
+        second["ended_at"] = "2026-09-27T07:40:47+00:00"
+
+        with patch.object(
+            session_module, "correctWithRegisteredLicensePlate",
+            side_effect=lambda plate: (plate, None),
+        ), patch.object(
+            manager, "_attach_publish_images", return_value=True,
+        ), patch.object(
+            session_module, "saveConfirmedLicensePlate", return_value=1,
+        ):
+            self.assertTrue(manager.finalize_deferred_session(first, tracker, Mock()))
+            self.assertTrue(manager.finalize_deferred_session(second, tracker, Mock()))
+
+        self.assertEqual(session_module.getSessionFinalization("cycle-1")[0], "published")
+        self.assertEqual(session_module.getSessionFinalization("cycle-2")[0], "published")
+        self.assertIn("cycle-1", module._pending_events)
+        self.assertIn("cycle-2", module._pending_events)
+
+    def test_publish_activates_outbox_only_after_terminal_ledger(self):
+        manager = session_module.SessionManager(Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = ("30A-1", 0.9, 4)
+        manager.publish_result = Mock(return_value={
+            "status": "published", "plate": "30A-1", "outbox_event_id": "ordered",
+        })
+
+        def assert_finalized(event_id):
+            self.assertEqual(event_id, "ordered")
+            self.assertTrue(session_module.isSessionFinalized("ordered"))
+            return True
+
+        with patch.object(PublishOutbox, "activate", side_effect=assert_finalized):
+            self.assertTrue(manager.finalize_deferred_session(
+                self.deferred_metadata("ordered"), tracker, Mock(),
+            ))
+
+    def test_weight_backed_session_without_plate_is_published(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = (None, 0, 0)
+        metadata = self.deferred_metadata("no-plate-event")
+        metadata.update({
+            "stable_weight": 39220,
+            "weight_source": "stable",
+            "weight_observed_at": "2026-07-24T00:00:05.500+00:00",
+            "raw_peak_weight": 39300,
+            "filtered_peak_weight": 39300,
+            "lpr_diagnostics": {"detector_successes": 30, "detected_regions": 0},
+        })
+
+        with patch.object(manager, "_load_lpr_diagnostic_frames", return_value={}), patch.object(
+            manager, "_load_diagnostic_frames", return_value={},
+        ), patch.object(
+            manager, "_load_unknown_publish_frames", return_value=({}, {}),
+        ), patch.object(manager, "_save_diagnostic_frames", return_value=0), patch.object(
+            session_module.ImageSaveWorker, "save_and_enqueue_upload",
+        ) as save_images:
+            self.assertTrue(manager.finalize_deferred_session(metadata, tracker, Mock()))
+
+        outcome, terminal = session_module.getSessionFinalization("no-plate-event")
+        self.assertEqual(outcome, "published")
+        self.assertEqual(terminal["plate"], "UNKNOWN_DETECTION")
+        self.assertEqual(terminal["plate_status"], "unreadable")
+        self.assertEqual(module._publish_queue.get_nowait(), "no-plate-event")
+        queued = module._pending_events["no-plate-event"]["session_result"]
+        self.assertEqual(queued["official_plate"], "UNKNOWN_DETECTION")
+        self.assertEqual(queued["stable_weight"], 39220)
+        self.assertIsNone(queued["ocr_plate_read"])
+        self.assertEqual(queued["metadata"]["plate_status"], "unreadable")
+        self.assertEqual(queued["photos"], [])
+        save_images.assert_not_called()
+
+    def test_weight_backed_unknown_persists_evidence_before_outbox_activation(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = (None, 0, 0)
+        metadata = self.deferred_metadata("unknown-with-images")
+        metadata["weight_observed_at"] = "2026-07-24T00:00:05.500+00:00"
+        metadata["_frame_metadata"] = {"private": "spool timestamps"}
+        metadata["_spool_started_at"] = "2026-07-24T00:00:05+00:00"
+        metadata["lpr_diagnostics"] = {"detector_successes": 30, "detected_regions": 0}
+        diagnostic_frames = {"cam1": Mock(name="diagnostic-frame")}
+        frames = {
+            "cam1": Mock(name="cam1-frame"),
+            "cam2": Mock(name="cam2-frame"),
+            "cam3": Mock(name="cam3-frame"),
+        }
+        cropped_cam2 = Mock(name="cropped-cam2-frame")
+        captured_at = {
+            "cam1": "2026-07-24T00:00:05.480+00:00",
+            "cam2": "2026-07-24T00:00:05.510+00:00",
+            "cam3": "2026-07-24T00:00:05.530+00:00",
+        }
+        paths = {
+            "cam1": ("/local/cam1.jpg", "storage/weighbridge/cam1.jpg", "/storage/weighbridge/cam1.jpg"),
+            "cam2": ("/local/cam2.jpg", "storage/weighbridge/cam2.jpg", "/storage/weighbridge/cam2.jpg"),
+            "cam3": ("/local/cam3.jpg", "storage/weighbridge/cam3.jpg", "/storage/weighbridge/cam3.jpg"),
+        }
+        original_activate = PublishOutbox.activate
+
+        def assert_finalized_before_activation(event_id):
+            self.assertTrue(session_module.isSessionFinalized("unknown-with-images"))
+            self.assertFalse(module._pending_events[event_id]["activated"])
+            return original_activate(event_id)
+
+        with patch.object(
+            manager, "_load_lpr_diagnostic_frames", return_value=diagnostic_frames,
+        ), patch.object(
+            manager, "_load_unknown_publish_frames", return_value=(frames, captured_at),
+        ), patch.object(
+            manager, "_save_diagnostic_frames", return_value=1,
+        ), patch.object(
+            manager, "_prepare_capture_paths", return_value=paths,
+        ), patch.object(
+            manager, "_crop_cam2_result_image", return_value=cropped_cam2,
+        ), patch.object(
+            session_module.ImageSaveWorker, "save_and_enqueue_upload", return_value=True,
+        ) as save_images, patch.object(
+            PublishOutbox, "activate", side_effect=assert_finalized_before_activation,
+        ):
+            self.assertTrue(manager.finalize_deferred_session(metadata, tracker, Mock()))
+
+        self.assertEqual(save_images.call_args_list, [
+            unittest.mock.call([["/local/cam1.jpg", frames["cam1"], "storage/weighbridge/cam1.jpg"]]),
+            unittest.mock.call([["/local/cam2.jpg", cropped_cam2, "storage/weighbridge/cam2.jpg"]]),
+            unittest.mock.call([["/local/cam3.jpg", frames["cam3"], "storage/weighbridge/cam3.jpg"]]),
+        ])
+        event = module._pending_events["unknown-with-images"]
+        self.assertEqual(
+            event["image_paths"],
+            ["/local/cam1.jpg", "/local/cam2.jpg", "/local/cam3.jpg"],
+        )
+        self.assertEqual(event["image_object_keys"], [
+            "storage/weighbridge/cam1.jpg",
+            "storage/weighbridge/cam2.jpg",
+            "storage/weighbridge/cam3.jpg",
+        ])
+        self.assertEqual(event["session_result"]["photos"], [
+            {"url": "/storage/weighbridge/cam1.jpg", "type": "cam1", "captured_at": captured_at["cam1"]},
+            {"url": "/storage/weighbridge/cam2.jpg", "type": "cam2", "captured_at": captured_at["cam2"]},
+            {"url": "/storage/weighbridge/cam3.jpg", "type": "cam3", "captured_at": captured_at["cam3"]},
+        ])
+        self.assertNotIn("_frame_metadata", event["session_result"])
+        self.assertNotIn("_spool_started_at", event["session_result"])
+        self.assertNotIn("_frame_metadata", self.terminal_outcome("unknown-with-images"))
+        self.assertNotIn("_spool_started_at", self.terminal_outcome("unknown-with-images"))
+
+    def test_weight_backed_unknown_drops_only_failed_evidence_image(self):
+        manager = session_module.SessionManager(Mock(), mqtt_svc=Mock())
+        tracker = Mock()
+        tracker.get_confirmed_plate.return_value = (None, 0, 0)
+        metadata = self.deferred_metadata("unknown-save-failed")
+        frames = {"cam1": Mock(name="cam1-frame"), "cam2": Mock(name="cam2-frame")}
+        paths = {
+            "cam1": ("/local/cam1.jpg", "storage/weighbridge/cam1.jpg", "/storage/weighbridge/cam1.jpg"),
+            "cam2": ("/local/cam2.jpg", "storage/weighbridge/cam2.jpg", "/storage/weighbridge/cam2.jpg"),
+        }
+
+        with patch.object(
+            manager, "_load_lpr_diagnostic_frames", return_value=frames,
+        ), patch.object(
+            manager, "_load_unknown_publish_frames", return_value=(frames, {
+                "cam1": "2026-07-24T00:00:05+00:00",
+                "cam2": "2026-07-24T00:00:05+00:00",
+            }),
+        ), patch.object(
+            manager, "_save_diagnostic_frames", return_value=1,
+        ), patch.object(
+            manager, "_prepare_capture_paths", return_value=paths,
+        ), patch.object(
+            manager, "_crop_cam2_result_image", return_value=frames["cam2"],
+        ), patch.object(
+            session_module.ImageSaveWorker, "save_and_enqueue_upload", side_effect=[False, True],
+        ):
+            self.assertTrue(manager.finalize_deferred_session(metadata, tracker, Mock()))
+
+        outcome, _terminal = session_module.getSessionFinalization("unknown-save-failed")
+        self.assertEqual(outcome, "published")
+        event = module._pending_events["unknown-save-failed"]
+        self.assertEqual(event["image_paths"], ["/local/cam2.jpg"])
+        self.assertEqual(event["image_object_keys"], ["storage/weighbridge/cam2.jpg"])
+        self.assertEqual(event["session_result"]["photos"], [{
+            "url": "/storage/weighbridge/cam2.jpg",
+            "type": "cam2",
+            "captured_at": "2026-07-24T00:00:05+00:00",
+        }])
+
     def test_publish_success_logs_one_prominent_line_and_metric(self):
         event_id = "1234567890abcdef"
         module._pending_events[event_id] = {
             "id": event_id,
-            "created_at": "2026-07-23T00:00:00",
+            "created_at": module.datetime.now().isoformat(timespec="seconds"),
             "image_paths": [],
             "session_result": {
                 "official_plate": "14C-017.80",
@@ -112,6 +508,135 @@ class PublishOutboxIdempotencyTests(unittest.TestCase):
         human = [entry for entry in logs if entry[0] != "METRIC"]
         self.assertEqual(human, [(">>> SENT <<<", "plate=14C-017.80 wt=34780kg id=12345678")])
         self.assertEqual(len([entry for entry in logs if entry[0] == "METRIC"]), 1)
+
+    def test_publish_success_survives_non_numeric_weight(self):
+        event_id = "abcdef1234567890"
+        module._pending_events[event_id] = {
+            "id": event_id,
+            "created_at": module.datetime.now().isoformat(timespec="seconds"),
+            "image_paths": [],
+            "session_result": {
+                "official_plate": "14C-017.80",
+                "stable_weight": None,
+            },
+        }
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = True
+        logs = []
+
+        with patch.object(module, "_mqtt_svc", mqtt), patch.object(
+            module, "_log_fn", lambda level, message: logs.append((level, message))
+        ):
+            PublishOutbox._publish_event(event_id)
+
+        human = [entry for entry in logs if entry[0] != "METRIC"]
+        self.assertEqual(human, [(">>> SENT <<<", "plate=14C-017.80 wt=?kg id=abcdef12")])
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+
+    def test_publish_failure_keeps_pending_event_and_requeues(self):
+        event_id = PublishOutbox.enqueue({
+            "offline_event_id": "mqtt-failure",
+            "official_plate": "14C-017.80",
+            "stable_weight": 34780.0,
+        })
+        self.assertEqual(module._publish_queue.get_nowait(), event_id)
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = False
+
+        with patch.object(module, "_mqtt_svc", mqtt), patch.object(
+            module._stop_event, "wait", return_value=False,
+        ):
+            PublishOutbox._publish_event(event_id)
+
+        self.assertEqual(PublishOutbox.pending_count(), 1)
+        self.assertEqual(module._publish_queue.get_nowait(), event_id)
+        mqtt.publish_weighbridge_event.assert_called_once_with(
+            module._pending_events[event_id]["session_result"],
+            wait_for_ack=True,
+            timeout=10.0,
+        )
+
+    def test_restart_loads_and_drains_pending_event_after_ack(self):
+        event_id = PublishOutbox.enqueue({
+            "offline_event_id": "restart-drain",
+            "official_plate": "14C-017.80",
+            "stable_weight": 34780.0,
+        })
+        module._pending_events.clear()
+        while not module._publish_queue.empty():
+            module._publish_queue.get_nowait()
+
+        PublishOutbox._load_pending()
+        recovered_id = module._publish_queue.get_nowait()
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = True
+        with patch.object(module, "_mqtt_svc", mqtt):
+            PublishOutbox._publish_event(recovered_id)
+
+        self.assertEqual(recovered_id, event_id)
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+        self.assertTrue(PublishOutbox._is_published(event_id))
+        published_result = mqtt.publish_weighbridge_event.call_args.args[0]
+        self.assertEqual(published_result["offline_event_id"], event_id)
+
+    def test_completion_check_failure_is_not_treated_as_unpublished(self):
+        with patch.object(
+            module.sqlite3, "connect", side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                PublishOutbox._is_published("completed-but-unreadable")
+            with self.assertRaises(sqlite3.OperationalError):
+                PublishOutbox.enqueue({"offline_event_id": "completed-but-unreadable"})
+
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+
+    def test_load_pending_keeps_event_when_completion_check_fails(self):
+        event = {
+            "id": "unreadable-check",
+            "created_at": "2026-07-15T00:00:00",
+            "image_object_keys": [],
+            "image_paths": [],
+            "session_result": {"offline_event_id": "unreadable-check"},
+            "activated": True,
+        }
+        with open(self.pending, "w") as fp:
+            fp.write(json.dumps(event) + "\n")
+
+        with patch.object(
+            module.PublishOutbox, "_is_published",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            PublishOutbox._load_pending()
+
+        self.assertEqual(PublishOutbox.pending_count(), 1)
+        self.assertEqual(module._publish_queue.get_nowait(), "unreadable-check")
+
+    def test_completion_write_failure_after_ack_does_not_requeue(self):
+        event_id = "1234567890abcdef"
+        module._pending_events[event_id] = {
+            "id": event_id,
+            "created_at": module.datetime.now().isoformat(timespec="seconds"),
+            "image_paths": [],
+            "session_result": {
+                "official_plate": "14C-017.80",
+                "stable_weight": 34780.0,
+            },
+        }
+        mqtt = Mock()
+        mqtt.publish_weighbridge_event.return_value = True
+        logs = []
+
+        with patch.object(module, "_mqtt_svc", mqtt), patch.object(
+            module, "_log_fn", lambda level, message: logs.append((level, message))
+        ), patch.object(
+            module.PublishOutbox, "_mark_completed",
+            side_effect=sqlite3.OperationalError("disk full"),
+        ):
+            PublishOutbox._publish_event(event_id)
+
+        self.assertEqual(PublishOutbox.pending_count(), 0)
+        self.assertIn("CRITICAL", [level for level, _ in logs])
+        self.assertTrue(module._publish_queue.empty())
 
 
 if __name__ == "__main__":

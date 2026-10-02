@@ -5,7 +5,6 @@ import threading
 import time
 import unittest
 import sys
-from datetime import datetime
 from types import SimpleNamespace
 from types import ModuleType
 from unittest import mock
@@ -66,8 +65,8 @@ class Tracker:
     def add_observation(self, *args, **kwargs):
         self.observations.append((args, kwargs))
 
-    def update_image(self, *args):
-        self.images.append(args)
+    def update_image(self, *args, **kwargs):
+        self.images.append((args, kwargs))
 
     def needs_undetectable(self):
         return self.unknown is None
@@ -126,6 +125,143 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertIn("crop_img", region)
             self.assertNotIn("crop", region)
 
+    def test_tracked_obb_reuses_perspective_crop(self):
+        frame = Frame()
+        crop = Frame()
+        crop.shape = (6, 9, 3)
+        track = {
+            "bbox": [1, 2, 10, 8],
+            "obb": [[1, 2], [10, 2], [10, 8], [1, 8]],
+            "confidence": 0.9,
+            "class": "BSV",
+            "two_row": True,
+        }
+
+        with mock.patch(
+            "services.pipeline.deferred_lpr_worker.crop_obb", return_value=crop
+        ) as crop_obb:
+            regions = DeferredLprWorker._tracked_regions(frame, [track])
+
+        crop_obb.assert_called_once_with(frame, track["obb"])
+        self.assertIs(regions[0]["crop_img"], crop)
+        self.assertEqual(regions[0]["class"], "BSV")
+        self.assertTrue(regions[0]["two_row"])
+
+    def test_long_session_selection_combines_confidence_and_timeline(self):
+        files = ["cam1-%06d.jpg" % index for index in range(10)]
+        metadata = {
+            name: {"tracks": [{"confidence": 0.99 if index in (4, 5) else 0.1}]}
+            for index, name in enumerate(files)
+        }
+
+        selected = DeferredLprWorker._select_frame_paths(files, metadata, 4)
+
+        self.assertEqual(selected, [files[0], files[4], files[5], files[-1]])
+
+    def test_long_session_without_tracks_still_spreads_selection(self):
+        files = ["cam1-%06d.jpg" % index for index in range(10)]
+
+        selected = DeferredLprWorker._select_frame_paths(files, {}, 4)
+
+        indexes = [files.index(path) for path in selected]
+        self.assertEqual(indexes[0], 0)
+        self.assertEqual(indexes[-1], 9)
+        self.assertLessEqual(max(right - left for left, right in zip(indexes, indexes[1:])), 5)
+
+    def test_diagnostics_count_ocr_outcomes_per_camera(self):
+        diagnostics = DeferredLprWorker._new_diagnostics(["cam1-000001.jpg"])
+        camera = SimpleNamespace(name="cam1", detector="detector", ocr="ocr", lpr_crop="full")
+        region = {
+            "bbox": [1, 2, 10, 8], "obb": None, "det_conf": 0.9,
+            "class": "BSD", "crop_size": "9x6", "crop_img": Frame(),
+            "ocr_status": None,
+        }
+        worker = DeferredLprWorker(
+            FakeSpool([]), [camera], "chars", lambda *_args: True,
+            detect_regions_fn=mock.Mock(return_value=[region]),
+            recognize_regions_fn=mock.Mock(return_value=[{
+                "plate": "unknown", "crop_size": "9x6", "det_conf": 0.9,
+                "valid_candidates": [], "ocr_outcome": "invalid_format",
+            }]),
+            tracker_factory=Tracker,
+            cv2_module=FakeCv2({"cam1-000001.jpg": Frame()}),
+        )
+
+        worker._process_frame(
+            "/tmp", "cam1-000001.jpg", Tracker(), 1.0, diagnostics=diagnostics
+        )
+
+        self.assertEqual(diagnostics["detector_successes"], 1)
+        self.assertEqual(diagnostics["detected_regions"], 1)
+        self.assertEqual(diagnostics["ocr_invalid_format"], 1)
+        self.assertEqual(
+            diagnostics["evidence"]["cam1"]["plate_detected_ocr_invalid_format"],
+            "cam1-000001.jpg",
+        )
+
+    def test_diagnostics_keep_detected_box_first_timing_and_tracker_debug(self):
+        diagnostics = DeferredLprWorker._new_diagnostics(["cam1-000001.jpg"])
+        camera = SimpleNamespace(name="cam1", detector="detector", ocr="ocr", lpr_crop="full")
+        region = {
+            "bbox": [1, 2, 10, 8], "obb": None, "det_conf": 0.9,
+            "class": "BSD", "crop_size": "9x6", "crop_img": Frame(),
+            "ocr_status": None,
+        }
+        tracker = Tracker()
+        worker = DeferredLprWorker(
+            FakeSpool([]), [camera], "chars", lambda *_args: True,
+            detect_regions_fn=mock.Mock(return_value=[region]),
+            recognize_regions_fn=mock.Mock(return_value=[{
+                "plate": "30A-12345", "crop_size": "9x6", "det_conf": 0.9,
+                "valid_candidates": [("30A-12345", 0.99)], "ocr_outcome": "valid",
+            }]),
+            tracker_factory=Tracker,
+            cv2_module=FakeCv2({"cam1-000001.jpg": Frame()}),
+        )
+
+        worker._process_frame(
+            "/tmp", "cam1-000001.jpg", tracker, 12.5, diagnostics=diagnostics,
+            session_started_at=10.0,
+        )
+
+        self.assertEqual(diagnostics["detected_boxes"]["cam1-000001.jpg"], [
+            {"bbox": [1, 2, 10, 8], "confidence": 0.9},
+        ])
+        self.assertEqual(diagnostics["first_plate_detected_delay_seconds"], 2.5)
+        self.assertEqual(diagnostics["first_valid_ocr_frame"], "cam1-000001.jpg")
+        self.assertEqual(tracker.images[-1][1]["debug"]["plate"], "30A-12345")
+
+    def test_all_detector_failures_retry_then_dead_letter_with_classification(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "failure", ["cam1-000001.jpg"])
+            logs = []
+            spool = FakeSpool([path])
+            callback = mock.Mock()
+            worker = DeferredLprWorker(
+                spool,
+                [SimpleNamespace(name="cam1", detector=1, ocr=2, lpr_crop="full")],
+                [], callback,
+                detect_regions_fn=mock.Mock(side_effect=RuntimeError("detector failed")),
+                tracker_factory=Tracker,
+                cv2_module=FakeCv2({"cam1-000001.jpg": Frame()}),
+                failed_retry_delay=0.01,
+                max_retries=2,
+                log_fn=lambda level, message: logs.append((level, message)),
+            )
+
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: spool.failed))
+            self.assertTrue(worker.stop())
+
+            callback.assert_not_called()
+            self.assertEqual(spool.acknowledged, [])
+            metrics = [json.loads(message) for level, message in logs if level == "METRIC"]
+            dead_letter = next(
+                metric for metric in metrics
+                if metric["event"] == "session_processing_dead_lettered"
+            )
+            self.assertEqual(dead_letter["classification"], "detector_inference_error")
+
     @staticmethod
     def wait_for(predicate, timeout=1):
         deadline = time.time() + timeout
@@ -169,6 +305,59 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertEqual(trackers[0].observations, [])
             self.assertEqual(spool.acknowledged, [path])
             self.assertFalse(worker.status()["running"])
+
+    def test_manifest_degradation_is_passed_to_finalizer(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "degraded", [], {"errors": ["metadata-error"]})
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest["incomplete"] = True
+            manifest["errors"] = ["disk cap reached", "metadata-error"]
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            received = []
+            spool = FakeSpool([path])
+            worker = DeferredLprWorker(
+                spool, [], [], lambda metadata, _tracker: received.append(dict(metadata)) or True,
+                tracker_factory=Tracker, cv2_module=FakeCv2({}),
+            )
+
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: spool.acknowledged))
+            self.assertTrue(worker.stop())
+
+            self.assertTrue(received[0]["incomplete"])
+            self.assertEqual(received[0]["errors"], ["metadata-error", "disk cap reached"])
+
+    def test_frame_timestamps_are_passed_privately_to_finalizer(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.make_manifest(root, "timed", [])
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest["frame_metadata"] = {
+                "cam2-000001-sample.jpg": {
+                    "captured_at": "2026-07-15T00:00:01.200+00:00",
+                    "frame_id": 10,
+                },
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            received = []
+            spool = FakeSpool([path])
+            worker = DeferredLprWorker(
+                spool, [], [], lambda metadata, _tracker: received.append(dict(metadata)) or True,
+                tracker_factory=Tracker, cv2_module=FakeCv2({}),
+            )
+
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: spool.acknowledged))
+            self.assertTrue(worker.stop())
+
+            self.assertEqual(received[0]["_frame_metadata"], manifest["frame_metadata"])
+            self.assertEqual(
+                received[0]["_spool_started_at"],
+                "2026-07-15T00:00:00+00:00",
+            )
 
     def test_cleans_memory_and_logs_rss_after_job(self):
         with tempfile.TemporaryDirectory() as root:
@@ -220,6 +409,36 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertTrue(worker.stop())
             self.assertEqual(seen, [good])
             self.assertEqual(len(callbacks), 1)
+
+    def test_frame_failure_is_counted_in_diagnostics(self):
+        with tempfile.TemporaryDirectory() as root:
+            files = ["cam1-bad.jpg", "cam1-good.jpg"]
+            path = self.make_manifest(root, "counters", files)
+            captured = []
+            worker = DeferredLprWorker(
+                FakeSpool([path]),
+                [SimpleNamespace(name="cam1", detector=1, ocr=2, lpr_crop="full")],
+                [], lambda metadata, tracker: captured.append(metadata),
+                detect_regions_fn=lambda frame, detector: [],
+                recognize_regions_fn=lambda *args, **kwargs: [],
+                tracker_factory=Tracker,
+                cv2_module=FakeCv2({"cam1-good.jpg": Frame()}),
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: captured))
+            self.assertTrue(worker.stop())
+            diagnostics = captured[0]["lpr_diagnostics"]
+            self.assertEqual(diagnostics["frame_errors"], 1)
+            self.assertEqual(diagnostics["cameras"]["cam1"]["frame_errors"], 1)
+            self.assertEqual(
+                diagnostics["evidence"]["cam1"]["frame_error"], "cam1-bad.jpg"
+            )
+
+    def test_frame_processing_failure_classification(self):
+        self.assertEqual(
+            DeferredLprWorker._processing_failure_classification({"frame_errors": 1}),
+            "frame_processing_error",
+        )
 
     def test_callback_failure_blocks_later_jobs_to_preserve_fifo(self):
         with tempfile.TemporaryDirectory() as root:
