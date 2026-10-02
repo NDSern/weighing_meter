@@ -20,5 +20,5 @@ jobs:
           cache: pip
       # Runtime deps needed by unit tests. Tests stub cv2/minio/serial and the
       # RKNN runtime, so those heavy wheels are intentionally not installed.
-      - run: python -m pip install numpy paho-mqtt ruff
+      - run: python -m pip install numpy paho-mqtt ruff urllib3
       - run: make verify
