@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -19,6 +19,14 @@ from scripts import recover_missed_session as module
 SESSION_ID = "c9f95576942341a28ee7e93812f26061"
 
 
+def _local_time(utc_iso):
+    return datetime.fromisoformat(utc_iso).astimezone()
+
+
+def _fmt_local(value):
+    return value.strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+
 class MissedSessionRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.TemporaryDirectory()
@@ -27,8 +35,8 @@ class MissedSessionRecoveryTests(unittest.TestCase):
             (self.service / relative).mkdir(parents=True, exist_ok=True)
         self.started = "2026-09-28T09:08:53.950+00:00"
         self.ended = "2026-09-28T09:09:51.281+00:00"
-        self.local_started = "2026-09-28T16:08:53.950000"
-        self.local_ended = "2026-09-28T16:09:51.281000"
+        self.local_started = _fmt_local(_local_time(self.started))
+        self.local_ended = _fmt_local(_local_time(self.ended))
         self.image = self.service / "storage/no-stable/2026/09/28" / f"{SESSION_ID}_cam3.jpg"
         self.image.write_bytes(b"audited-image")
         metadata = {
@@ -79,14 +87,20 @@ class MissedSessionRecoveryTests(unittest.TestCase):
         connection.execute(
             "CREATE TABLE weight_log (timestamp TEXT, weight_kg REAL, status TEXT, checksum_ok INTEGER)"
         )
+        started = _local_time(self.started)
+        ended = _local_time(self.ended)
+
+        def at(**offset):
+            return _fmt_local(started + timedelta(**offset))
+
         rows = [
-            ("2026-09-28T16:08:50.000000", 0, "STABLE", 1),
+            (at(seconds=-3.95), 0, "STABLE", 1),
             (self.local_started, 1000, "UNSTABLE", 1),
-            ("2026-09-28T16:09:10.000000", 30630, "STABLE", 1),
-            ("2026-09-28T16:09:11.000000", 30620, "STABLE", 1),
-            ("2026-09-28T16:09:12.000000", 30630, "STABLE", 1),
-            ("2026-09-28T16:09:13.000000", 30640, "UNSTABLE", 1),
-            (self.local_ended, 0, "STABLE", 1),
+            (at(seconds=16.05), 30630, "STABLE", 1),
+            (at(seconds=17.05), 30620, "STABLE", 1),
+            (at(seconds=18.05), 30630, "STABLE", 1),
+            (at(seconds=19.05), 30640, "UNSTABLE", 1),
+            (_fmt_local(ended), 0, "STABLE", 1),
         ]
         connection.executemany("INSERT INTO weight_log VALUES (?, ?, ?, ?)", rows)
         connection.commit()
@@ -288,16 +302,21 @@ class ImageLessRecoveryTests(unittest.TestCase):
         connection.execute(
             "CREATE TABLE weight_log (timestamp TEXT, weight_kg REAL, status TEXT, checksum_ok INTEGER)"
         )
+        started = _local_time(self.started)
+
+        def at(seconds):
+            return _fmt_local(started + timedelta(seconds=seconds))
+
         rows = [
-            ("2026-09-27T14:40:10.000000", 41300, "STABLE", 1),
-            ("2026-09-27T14:40:16.000000", 0, "STABLE", 1),
-            ("2026-09-27T14:40:26.736000", 17680, "UNSTABLE", 1),
-            ("2026-09-27T14:40:30.000000", 17710, "STABLE", 1),
-            ("2026-09-27T14:40:35.000000", 17710, "STABLE", 1),
-            ("2026-09-27T14:40:40.000000", 17710, "STABLE", 1),
-            ("2026-09-27T14:40:43.000000", 17940, "UNSTABLE", 1),
-            ("2026-09-27T14:40:45.216000", 17720, "STABLE", 1),
-            ("2026-09-27T14:40:46.500000", 0, "STABLE", 1),
+            (at(-14.276), 41300, "STABLE", 1),
+            (at(-8.276), 0, "STABLE", 1),
+            (at(2.460), 17680, "UNSTABLE", 1),
+            (at(5.724), 17710, "STABLE", 1),
+            (at(10.724), 17710, "STABLE", 1),
+            (at(15.724), 17710, "STABLE", 1),
+            (at(18.724), 17940, "UNSTABLE", 1),
+            (at(20.940), 17720, "STABLE", 1),
+            (at(22.224), 0, "STABLE", 1),
         ]
         connection.executemany("INSERT INTO weight_log VALUES (?, ?, ?, ?)", rows)
         connection.commit()
