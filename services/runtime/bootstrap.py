@@ -27,6 +27,7 @@ from config import (
     IMAGE_STORAGE_TARGET_FREE_BYTES,
     LPR_CHARSET,
     LPR_DEFERRED_MAX_FRAMES_PER_CAMERA,
+    LPR_DEFERRED_WORKER_COUNT,
     LPR_DETECTOR_MODEL,
     LPR_FALLBACK_DETECTOR_MODEL,
     LPR_RECOGNIZER_MODEL,
@@ -333,6 +334,7 @@ def construct_service(log, res=None) -> ServiceResources:
         tracker_factory=lambda: PlateTracker(max_plate_images=2),
         job_interval=1.0,
         memory_cleanup_fn=_malloc_trim,
+        worker_count=LPR_DEFERRED_WORKER_COUNT,
         log_fn=log,
     )
     res.image_worker_started = True

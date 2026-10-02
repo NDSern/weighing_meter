@@ -306,6 +306,42 @@ class DeferredLprWorkerTests(unittest.TestCase):
             self.assertEqual(spool.acknowledged, [path])
             self.assertFalse(worker.status()["running"])
 
+    def test_parallel_workers_process_jobs_concurrently(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths = [
+                self.make_manifest(root, "p1", ["cam1-000001.jpg"]),
+                self.make_manifest(root, "p2", ["cam1-000001.jpg"]),
+            ]
+            lock = threading.Lock()
+            active = [0]
+            peak = [0]
+
+            def detect(_frame, detector):
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                time.sleep(0.05)
+                with lock:
+                    active[0] -= 1
+                return [{"camera": detector}]
+
+            spool = FakeSpool(paths)
+            worker = DeferredLprWorker(
+                spool,
+                [SimpleNamespace(name="cam1", detector="d1", ocr="o1", lpr_crop="full")],
+                "chars", lambda metadata, tracker: None,
+                detect_regions_fn=detect, recognize_regions_fn=lambda *a, **k: [],
+                tracker_factory=Tracker,
+                cv2_module=FakeCv2({"cam1-000001.jpg": Frame()}),
+                worker_count=2,
+            )
+            worker.start()
+            self.assertTrue(self.wait_for(lambda: len(spool.acknowledged) == 2))
+            self.assertTrue(worker.stop())
+            self.assertGreaterEqual(peak[0], 2)
+            self.assertEqual(worker.status()["workers"], 2)
+            self.assertFalse(worker.status()["running"])
+
     def test_manifest_degradation_is_passed_to_finalizer(self):
         with tempfile.TemporaryDirectory() as root:
             path = self.make_manifest(root, "degraded", [], {"errors": ["metadata-error"]})

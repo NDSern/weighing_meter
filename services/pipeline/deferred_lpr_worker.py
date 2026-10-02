@@ -28,7 +28,7 @@ class DeferredLprFailure(RuntimeError):
 
 
 class DeferredLprWorker:
-    """Consume finalized spool jobs in FIFO order on one background thread."""
+    """Consume finalized spool jobs in FIFO order across worker thread(s)."""
 
     def __init__(
         self,
@@ -46,6 +46,7 @@ class DeferredLprWorker:
         job_interval=0.0,
         gc_interval=10,
         memory_cleanup_fn=None,
+        worker_count=1,
         log_fn=None,
     ):
         self._spool = spool
@@ -65,7 +66,8 @@ class DeferredLprWorker:
         self._memory_cleanup_fn = memory_cleanup_fn
         self._log_fn = log_fn
         self._stop_event = threading.Event()
-        self._thread = None
+        self._worker_count = max(1, int(worker_count))
+        self._threads = []
         self._failed_until = {}
         self._retry_counts = {}
         self._state_lock = threading.Lock()
@@ -73,30 +75,38 @@ class DeferredLprWorker:
         self._last_error = None
 
     def start(self):
-        """Start the worker. Safe to call more than once."""
+        """Start the worker thread(s). Safe to call more than once."""
         with self._state_lock:
-            if self._thread and self._thread.is_alive():
+            if any(thread.is_alive() for thread in self._threads):
                 return
             self._stop_event.clear()
-            self._thread = threading.Thread(
-                target=self._run, name="deferred-lpr-worker", daemon=True
-            )
-            self._thread.start()
+            self._threads = []
+            for index in range(self._worker_count):
+                name = "deferred-lpr-worker"
+                if self._worker_count > 1:
+                    name = "deferred-lpr-worker-%d" % index
+                thread = threading.Thread(target=self._run, name=name, daemon=True)
+                thread.start()
+                self._threads.append(thread)
 
     def stop(self, timeout=5.0):
-        """Request clean shutdown and report whether the thread stopped."""
+        """Request clean shutdown and report whether every thread stopped."""
         self._stop_event.set()
-        thread = self._thread
-        if thread:
-            thread.join(timeout)
-        return not thread or not thread.is_alive()
+        deadline = time.monotonic() + timeout
+        stopped = True
+        for thread in list(self._threads):
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                stopped = False
+        return stopped
 
     def status(self):
         """Return a thread-safe worker status snapshot."""
         with self._state_lock:
-            thread = self._thread
+            running = any(thread.is_alive() for thread in self._threads)
             return {
-                "running": bool(thread and thread.is_alive()),
+                "running": running,
+                "workers": self._worker_count,
                 "current_job": self._current_job,
                 "failed_jobs": len(self._failed_until),
                 "last_error": self._last_error,
@@ -120,15 +130,17 @@ class DeferredLprWorker:
             try:
                 self._process_job(path)
                 self._spool.acknowledge_job(path)
-                self._failed_until.pop(path, None)
-                self._retry_counts.pop(path, None)
+                with self._state_lock:
+                    self._failed_until.pop(path, None)
+                    self._retry_counts.pop(path, None)
                 current_path = None
                 finished = True
             except Exception as exc:
                 classification = getattr(exc, "classification", None)
-                self._retry_counts[path] = self._retry_counts.get(path, 0) + 1
-                self._failed_until[path] = time.monotonic() + self._failed_retry_delay
                 with self._state_lock:
+                    attempts = self._retry_counts.get(path, 0) + 1
+                    self._retry_counts[path] = attempts
+                    self._failed_until[path] = time.monotonic() + self._failed_retry_delay
                     self._last_error = "%s: %s" % (type(exc).__name__, exc)
                 self._log("ERROR", "Deferred LPR job failed [%s]: %s" % (path, exc))
                 self._log(
@@ -140,20 +152,21 @@ class DeferredLprWorker:
                         separators=(",", ":"), sort_keys=True,
                     ),
                 )
-                if self._retry_counts[path] >= self._max_retries:
+                if attempts >= self._max_retries:
                     failed_path = self._spool.fail_job(path)
                     self._log(
                         "METRIC",
                         json.dumps(
                             {"event": "session_processing_dead_lettered",
-                             "manifest": failed_path, "retries": self._retry_counts[path],
+                             "manifest": failed_path, "retries": attempts,
                              "classification": classification,
                              "lpr_diagnostics": getattr(exc, "diagnostics", None)},
                             separators=(",", ":"), sort_keys=True,
                         ),
                     )
-                    self._failed_until.pop(path, None)
-                    self._retry_counts.pop(path, None)
+                    with self._state_lock:
+                        self._failed_until.pop(path, None)
+                        self._retry_counts.pop(path, None)
                     current_path = None
                     finished = True
                 else:
