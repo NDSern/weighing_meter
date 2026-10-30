@@ -18,7 +18,7 @@ from services.session.plate_registry import (
     saveConfirmedLicensePlate,
     set_log_fn as set_plate_registry_log,
 )
-from services.session.weight_state import WeighingSessionState
+from services.session.weight_state import SustainedPlateauTracker, WeighingSessionState
 from services.session.result_builder import (
     build_publish_images,
     build_publish_result,
@@ -183,6 +183,7 @@ class SessionManager:
         self._session_local_peak_ts = None
         self._session_local_peak_confirmed = False
         self._session_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
+        self._sustained_plateau = SustainedPlateauTracker()
         self.fatal_error = None
         self._spool_failure_logged_for = None
         self._pending_terminal_snapshot = None
@@ -353,6 +354,7 @@ class SessionManager:
         self._update_peak_candidate(frame, log_fn)
         if self.session.session_active and frame.weight > 0:
             observed_at = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+            self._sustained_plateau.observe(frame.weight, observed_at, frame.timestamp)
             if self._session_raw_peak is None or frame.weight > self._session_raw_peak:
                 self._session_raw_peak = frame.weight
                 self._session_raw_peak_observed_at = observed_at
@@ -383,6 +385,7 @@ class SessionManager:
                 self._update_attempt(frame, log_fn, allow_chained_stable=True)
             self._handle_stable_frame(frame, log_fn)
         else:
+            self.session.end_plateau_candidate()
             if not self.session.session_active and self._attempt_wait_reference is not None:
                 if frame.weight <= WEIGHT_THRESHOLD:
                     self._attempt_wait_reference = None
@@ -870,6 +873,7 @@ class SessionManager:
         self.session.lpr_start_frames = self._attempt["start_frames"]
         self.session.started_at = time.time()
         self._session_started_monotonic = time.monotonic()
+        self._sustained_plateau.reset()
         self.session.session_id = self._attempt["id"]
         self.session.started_at_iso = self._attempt["started_at"]
         if self.session.stable_weight is not None:
@@ -1204,6 +1208,7 @@ class SessionManager:
         self._session_local_peak_ts = None
         self._session_local_peak_confirmed = False
         self._session_weight_window.clear()
+        self._sustained_plateau.reset()
         self.session.stable_count = 0
         self.session.stable_weight = None
         self.session.stable_decimal_pos = 0
@@ -1254,6 +1259,10 @@ class SessionManager:
         if stable is not None:
             assigned, source = stable, "stable"
             observed_at = self.session.stable_weight_observed_at
+        elif self._sustained_plateau.best is not None:
+            sustained = self._sustained_plateau.best
+            assigned, source = sustained["weight"], "sustained_plateau"
+            observed_at = sustained["observed_at"]
         elif self._session_filtered_peak is not None:
             assigned, source = self._session_filtered_peak, "filtered_peak"
             observed_at = self._session_filtered_peak_observed_at

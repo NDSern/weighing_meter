@@ -361,14 +361,69 @@ class SessionWeightTests(unittest.TestCase):
         self.manager._end_session.assert_not_called()
         self.assertEqual(self.manager.session.vehicle_type, "truck")
 
-    def test_rolling_mode_forgets_old_plateau(self):
+    def test_retained_plateau_survives_longer_lower_plateau(self):
         for _ in range(25):
             self.manager.on_frame(self.stable_frame(39120), Mock())
         for _ in range(25):
             self.manager.on_frame(self.stable_frame(38500), Mock())
 
-        self.assertEqual(self.manager.session.stable_weight, 38500)
-        self.assertEqual(len(self.manager.session.stable_weight_history), 25)
+        self.assertEqual(self.manager.session.stable_weight, 39120)
+        self.assertEqual(self.manager.session.plateau_retained_weight, 39120)
+
+    def test_higher_validated_plateau_replaces_partial_entry(self):
+        for _ in range(5):
+            self.manager.on_frame(self.stable_frame(20000), Mock())
+        for _ in range(3):
+            self.manager.on_frame(self.stable_frame(39120), Mock())
+
+        self.assertEqual(self.manager.session.stable_weight, 39120)
+        self.assertEqual(self.manager.session.plateau_retained_weight, 39120)
+
+    def test_isolated_high_spike_does_not_replace_retained_plateau(self):
+        for _ in range(25):
+            self.manager.on_frame(self.stable_frame(39120), Mock())
+
+        self.manager.on_frame(self.stable_frame(50000), Mock())
+        self.assertEqual(self.manager.session.stable_weight, 39120)
+
+        for _ in range(3):
+            self.manager.on_frame(self.stable_frame(39120), Mock())
+        self.assertEqual(self.manager.session.stable_weight, 39120)
+        self.assertEqual(self.manager.session.plateau_retained_weight, 39120)
+
+    def test_new_visit_reselects_same_weight_with_fresh_observation(self):
+        from services.session.weight_state import WeighingSessionState
+
+        state = WeighingSessionState()
+        state.session_active = True
+        state.record_stable_weight(39120, 0, "2026-10-24T10:00:00+00:00")
+        first_observed_at = state.stable_weight_observed_at
+
+        state.clear_stable_weight_history()
+        state.record_stable_weight(39120, 0, "2026-10-24T11:00:00+00:00")
+
+        self.assertEqual(state.stable_weight, 39120)
+        self.assertEqual(state.stable_weight_observed_at, "2026-10-24T11:00:00+00:00")
+        self.assertNotEqual(first_observed_at, state.stable_weight_observed_at)
+
+    def test_sustained_filtered_plateau_backs_terminal_snapshot(self):
+        manager = SessionManager(Mock())
+        manager.session.session_active = True
+        manager.session.session_id = "sustained"
+        manager.session.started_at = 1.0
+        manager.session.started_at_iso = "2026-07-24T00:00:00+00:00"
+        started = datetime(2026, 7, 24, tzinfo=timezone.utc)
+
+        for index, weight in enumerate([30200, 30400, 30300, 30350, 30250] * 2):
+            frame = make_frame(weight)
+            frame.status = "UNSTABLE"
+            frame.timestamp = started + timedelta(seconds=index * 0.2)
+            manager.on_frame(frame, Mock())
+
+        metadata = manager._snapshot_session("weight_drop_confirmed")
+        self.assertEqual(metadata["weight_source"], "sustained_plateau")
+        self.assertIn(metadata["stable_weight"], (30200, 30250, 30300, 30350, 30400))
+        self.assertIsNotNone(metadata["weight_observed_at"])
 
     def test_empty_dwell_does_not_replace_loaded_stable_weight(self):
         manager = SessionManager(Mock())
