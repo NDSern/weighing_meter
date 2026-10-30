@@ -44,7 +44,7 @@ SERIAL_PORT   = "/dev/ttyS6"       # Windows: "COM3", Linux: "/dev/ttyUSB0"
 BAUD_RATE     = 9600
 DB_FILE       = "scale_data"
 SERIAL_DUMP_FILE = None
-LOG_INTERVAL  = 0.2          # Persist at the scale's nominal 5 Hz frame rate
+LOG_INTERVAL  = 1.0          # Persist at 1 Hz; session logic still sees every frame
 
 # Stability detection
 STABLE_COUNT     = 10        # Consecutive readings required for software stability

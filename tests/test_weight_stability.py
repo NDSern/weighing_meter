@@ -159,23 +159,22 @@ class WeightStabilityTests(unittest.TestCase):
         self.reader._thread.join.assert_called_once_with(timeout=3)
         wait.assert_not_called()
 
-    def test_db_persists_at_five_hz_while_display_remains_one_hz(self):
-        self.reader.log_interval = 0.2
+    def test_db_persists_at_one_hz_while_session_gets_every_frame(self):
         self.reader.on_frame = Mock()
         self.reader.on_weight = Mock()
         self.reader._db.save = Mock()
-        frames = [make_frame(weight) for weight in (100, 200, 300, 400, 500, 600)]
+        frames = [make_frame(weight) for weight in range(100, 1200, 100)]
 
         with unittest.mock.patch(
             "d2008_scale_reader.time.time",
-            side_effect=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            side_effect=[index * 0.2 for index in range(11)],
         ):
             for frame in frames:
                 self.reader._handle_frame(frame)
 
-        self.assertEqual(self.reader.on_frame.call_count, 6)
-        self.assertEqual(self.reader._db.save.call_count, 5)
-        self.assertEqual(self.reader.on_weight.call_count, 1)
+        self.assertEqual(self.reader.on_frame.call_count, 11)
+        self.assertEqual(self.reader._db.save.call_count, 2)
+        self.assertEqual(self.reader.on_weight.call_count, 2)
 
     def test_four_exact_readings_do_not_reach_stability(self):
         frames = self.statuses([39120] * 4)

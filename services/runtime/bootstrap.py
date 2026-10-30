@@ -249,7 +249,6 @@ def construct_service(log, res=None) -> ServiceResources:
         port=SERIAL_PORT,
         baud=BAUD_RATE,
         db_file=SCALE_DATA_DIR,
-        log_interval=0.2,
     )
     res.storage_maintenance = StorageMaintenance(IMAGE_RETENTION_CHECK_INTERVAL_SECONDS, log_fn=log)
     res.storage_maintenance.start()
