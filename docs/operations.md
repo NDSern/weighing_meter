@@ -155,3 +155,17 @@ back independently; do not restore revoked credentials.
   `wip/lpr-camera-experiments-2026-09-29`, not part of this change.
 - Credential rotation and env-file installation on both hosts (see
   `SECURITY.md`).
+## Offline replay (read-only)
+
+`scripts/replay_weight_sessions.py` re-runs the live session lifecycle over
+recorded `scale_data/YYYY-MM-DD.db` logs without touching a host. It is
+strictly read-only (sqlite `mode=ro`) and writes nothing outside `--json`:
+
+```bash
+python3 -B scripts/replay_weight_sessions.py scale_data/2026-10-24.db \
+    --csv /path/to/can_hang_2026-10-24.csv --json /tmp/replay.json
+```
+
+It prints a summary (session count, end reasons, loaded sessions) and, with
+`--csv`, a one-to-one match of replayed sessions against CAN HANG gross/tare
+targets. Matches are an upper-coverage estimate, not a recall claim.

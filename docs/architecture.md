@@ -11,7 +11,8 @@ labels a session.
 | `weighing_service.py` | Entry point: logging, signals, start/stop loop only. |
 | `services/runtime/bootstrap.py` | `construct_service()` / `shutdown_service()`: build and tear down every worker. |
 | `services/session/session_manager.py` | Session lifecycle orchestration: start, promotion, empty dwell, end, finalization, publication. |
-| `services/session/weight_state.py` | `WeighingSessionState`: raw/stable weight candidates, peaks, trend history. |
+| `services/session/weight_state.py` | `WeighingSessionState`: raw/stable weight candidates, retained visit plateau, peaks, trend history. |
+| `services/session/weight_motion.py` | `WeightMotion`: confirmed departure (median drop) and renewed-rise detection used to split visits. |
 | `services/session/plate_registry.py` | Confirmed-plate registry, normalisation, OCR correction, plate DB counts. |
 | `services/session/evidence_selection.py` | Pure selection of UNKNOWN_* result frames (target time, candidates, camera sync, detector boxes). |
 | `services/session/result_builder.py` | Result payload and image-path/caption construction. |
@@ -28,12 +29,26 @@ labels a session.
    loaded frame arrives. Promotion runs **before** plate-loss completion, so a
    lost plate track can never finalize a loaded cycle early.
 3. **Weight selection.** Only readings above `WEIGHT_THRESHOLD` (100 kg) may
-   become the selected stable weight. Trailing empty readings cannot evict a
-   loaded plateau. If no loaded stable value exists, the filtered peak then the
-   raw peak is used.
-4. **Termination.** A scale-owned session ends only after the scale stays
+   become the selected stable weight. A validated plateau is retained for the
+   whole visit: a longer lower plateau cannot overwrite it, and an isolated
+   spike cannot replace it; only a higher validated plateau (>= 2 stable
+   readings 20 kg above the retained value) upgrades it. If no loaded stable
+   value exists, the sustained filtered plateau, then the filtered peak, then
+   the raw peak is used.
+4. **Termination.** A scale-owned session ends when the scale stays
    `<= WEIGHT_THRESHOLD` for `SESSION_END_EMPTY_DWELL_SECONDS` (2 s), recorded
-   as `scale_empty`. Loaded sessions ignore falling-trend termination.
+   as `scale_empty`. Independently, a confirmed departure ends the session as
+   `weight_drop_confirmed` without waiting for empty: a 5-reading median drop
+   of at least `max(SESSION_DROP_MIN_KG, SESSION_DROP_RATIO x plateau)` held
+   for `SESSION_DROP_DWELL_SECONDS` across `SESSION_DROP_MIN_READINGS`
+   readings. The session manager then waits for a renewed rise
+   (`max(SESSION_RISE_MIN_KG, SESSION_RISE_RATIO x plateau)` above the running
+   trough, held for `SESSION_RISE_DWELL_SECONDS`) before admitting the next
+   visit — a reversing or returning vehicle with the same plate starts a new
+   session without a zero crossing. Boundary timestamps (`boundary_kind`,
+   `crossed_at`, `confirmed_at`, `reference_kg`, `threshold_kg`, `trough_kg`)
+   are recorded in session metadata; for a departure the terminal `ended_at`
+   is the threshold crossing time.
 5. **Finalization.** The terminal record is written once (idempotent on session
    id). Publication is queued in the outbox and acknowledged over MQTT.
 
