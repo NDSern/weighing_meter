@@ -18,6 +18,7 @@ from services.session.plate_registry import (
     saveConfirmedLicensePlate,
     set_log_fn as set_plate_registry_log,
 )
+from services.session.weight_motion import DEPARTURE, RISE, MotionDecision, WeightMotion
 from services.session.weight_state import SustainedPlateauTracker, WeighingSessionState
 from services.session.result_builder import (
     build_publish_images,
@@ -184,6 +185,11 @@ class SessionManager:
         self._session_local_peak_confirmed = False
         self._session_weight_window = deque(maxlen=PEAK_FILTER_FRAMES)
         self._sustained_plateau = SustainedPlateauTracker()
+        self._weight_motion = WeightMotion()
+        self._awaiting_renewed_rise = False
+        self._reentry_empty_since = None
+        self._pending_rise_start = None
+        self._session_boundary = None
         self.fatal_error = None
         self._spool_failure_logged_for = None
         self._pending_terminal_snapshot = None
@@ -206,6 +212,8 @@ class SessionManager:
             now = time.monotonic()
             if any_valid:
                 if self._scale_recovery_blocked:
+                    return
+                if self._awaiting_renewed_rise:
                     return
                 self._plate_absent_since = None
                 if not self.session.session_active:
@@ -332,6 +340,9 @@ class SessionManager:
             self._scale_recovery_blocked = False
             self._scale_data_gap_details = None
             log_fn("EVENT", "Scale lifecycle unblocked after reader recovery empty dwell")
+        if self._awaiting_renewed_rise:
+            if self._feed_reentry_locked(frame, log_fn):
+                return
         if (
             self.session.session_active
             and not self.session.scale_owned
@@ -355,6 +366,27 @@ class SessionManager:
         if self.session.session_active and frame.weight > 0:
             observed_at = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
             self._sustained_plateau.observe(frame.weight, observed_at, frame.timestamp)
+            decision = self._weight_motion.observe_loaded(
+                frame.weight, time.monotonic(), observed_at, self._motion_reference()
+            )
+            if decision is not None and decision.kind == DEPARTURE:
+                ended_id = self.session.session_id
+                if self._end_session("weight_drop_confirmed", log_fn, boundary=decision) is not False:
+                    self._weight_motion.arm_reentry(decision.reference_kg)
+                    self._awaiting_renewed_rise = True
+                    self._reentry_empty_since = None
+                    log_fn(
+                        "EVENT",
+                        "Departure confirmed id=%s reference=%.0fkg threshold=%.0fkg "
+                        "crossed_at=%s; awaiting renewed rise"
+                        % (
+                            ended_id,
+                            decision.reference_kg,
+                            decision.threshold_kg,
+                            decision.crossed_at,
+                        ),
+                    )
+                return
             if self._session_raw_peak is None or frame.weight > self._session_raw_peak:
                 self._session_raw_peak = frame.weight
                 self._session_raw_peak_observed_at = observed_at
@@ -569,6 +601,99 @@ class SessionManager:
         self._peak_movement_frames = []
         self._peak_movement_started_at = None
 
+    def _boundary_metadata(self):
+        boundary = self._session_boundary
+        if boundary is None:
+            return {}
+        meta = {
+            "boundary_kind": boundary.kind,
+            "boundary_crossed_at": boundary.crossed_at,
+            "boundary_confirmed_at": boundary.confirmed_at,
+            "boundary_reference_kg": boundary.reference_kg,
+            "boundary_threshold_kg": boundary.threshold_kg,
+        }
+        if boundary.trough_kg is not None:
+            meta["boundary_trough_kg"] = boundary.trough_kg
+        return meta
+
+    def _motion_reference(self):
+        """Best retained visit plateau to judge departure against."""
+        retained = self.session.plateau_retained_weight
+        if retained is not None and retained > WEIGHT_THRESHOLD:
+            return retained
+        best = self._sustained_plateau.best
+        if best:
+            return best["weight"]
+        if self._session_filtered_peak is not None:
+            return self._session_filtered_peak
+        return self._session_raw_peak
+
+    def _feed_reentry_locked(self, frame, log_fn):
+        """Drive the post-departure renewed-rise wait. Returns True when the
+        frame is consumed (new visit started, or still waiting)."""
+        if frame.weight > WEIGHT_THRESHOLD and self._pending_rise_start is not None:
+            decision, samples = self._pending_rise_start
+            if (
+                self._start_session(
+                    frame.decimal_pos,
+                    log_fn,
+                    trigger="scale_rise_after_departure",
+                    observed_at=frame.timestamp,
+                    rise_samples=samples,
+                    boundary=decision,
+                )
+                is False
+            ):
+                return True
+            self._pending_rise_start = None
+            self._awaiting_renewed_rise = False
+            self._reentry_empty_since = None
+            self._weight_motion.start_visit()
+            return True
+        if frame.weight <= WEIGHT_THRESHOLD:
+            now = time.monotonic()
+            if self._reentry_empty_since is None:
+                self._reentry_empty_since = now
+            elif now - self._reentry_empty_since >= SESSION_END_EMPTY_DWELL_SECONDS:
+                self._awaiting_renewed_rise = False
+                self._reentry_empty_since = None
+                self._pending_rise_start = None
+                self._weight_motion.start_visit()
+                log_fn("EVENT", "Reentry wait cleared after fresh empty dwell; ordinary admission restored")
+            return True
+        self._reentry_empty_since = None
+        observed_at = frame.timestamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        try:
+            decision = self._weight_motion.observe_reentry(
+                frame.weight, time.monotonic(), observed_at
+            )
+        except ValueError:
+            return True
+        if decision is None or decision.kind != RISE:
+            return True
+        samples = self._weight_motion.rise_samples()
+        # The detector emits the rise decision once; keep it around until the
+        # new session actually starts so a transient spool admission failure
+        # can retry on the next loaded frame instead of losing the visit.
+        self._pending_rise_start = (decision, samples)
+        if (
+            self._start_session(
+                frame.decimal_pos,
+                log_fn,
+                trigger="scale_rise_after_departure",
+                observed_at=frame.timestamp,
+                rise_samples=samples,
+                boundary=decision,
+            )
+            is False
+        ):
+            return True
+        self._pending_rise_start = None
+        self._awaiting_renewed_rise = False
+        self._reentry_empty_since = None
+        self._weight_motion.start_visit()
+        return True
+
     def _wait_for_empty_cycle(self, frame, log_fn):
         if not self._waiting_for_empty:
             return False
@@ -613,6 +738,8 @@ class SessionManager:
         # Stable weight alone never starts a cycle; rising trend does.
 
     def _update_attempt(self, frame, log_fn, allow_chained_stable=False):
+        if not self.session.session_active and self._awaiting_renewed_rise:
+            return
         if self.session.session_active:
             if self._attempt:
                 self._attempt["max_weight"] = max(self._attempt["max_weight"], frame.weight)
@@ -740,6 +867,8 @@ class SessionManager:
             comparison_frames=len(window),
         )
         if not self.session.session_active:
+            if self._awaiting_renewed_rise:
+                return False
             if direction == "rising" and self._can_start_session(log_fn):
                 self._attempt = {
                     "id": uuid.uuid4().hex,
@@ -820,6 +949,7 @@ class SessionManager:
 
     def _start_session(
         self, decimal_pos: int, log_fn, trigger="scale_rising", observed_at=None,
+        rise_samples=None, boundary=None,
     ):
         self.plate_tracker.clear()
         self.session.stable_weight_observed_at = None
@@ -843,9 +973,16 @@ class SessionManager:
             self.session.last_publish_weight = None
             self.session.last_publish_decimal_pos = decimal_pos
             self.session.clear_stable_weight_history()
-        elif trigger == "scale_rising":
-            rising_window = list(self.session.weight_trend_window)
-            rising_observation_times = list(self.session.weight_trend_observation_times)
+        elif trigger in ("scale_rising", "scale_rise_after_departure"):
+            if trigger == "scale_rise_after_departure" and rise_samples:
+                rising_window = [weight for weight, _observed_at in rise_samples]
+                rising_observation_times = [
+                    datetime.fromisoformat(observed_at_value)
+                    for _weight, observed_at_value in rise_samples
+                ]
+            else:
+                rising_window = list(self.session.weight_trend_window)
+                rising_observation_times = list(self.session.weight_trend_observation_times)
             self.session.stable_weight = None
             self.session.last_publish_weight = None
             self.session.clear_stable_weight_history()
@@ -875,16 +1012,32 @@ class SessionManager:
         self._session_started_monotonic = time.monotonic()
         self._sustained_plateau.reset()
         self.session.session_id = self._attempt["id"]
-        self.session.started_at_iso = self._attempt["started_at"]
+        if boundary is not None:
+            # The visit physically began at the rise crossing, not when the
+            # detector accumulated enough dwell to confirm it.
+            self.session.started_at_iso = boundary.crossed_at
+            try:
+                self.session.started_at = datetime.fromisoformat(boundary.crossed_at).timestamp()
+            except ValueError:
+                self.session.started_at = time.time()
+        else:
+            self.session.started_at_iso = self._attempt["started_at"]
         if self.session.stable_weight is not None:
             self.session.start_stable_weight_history()
         self.session.stable_decimal_pos = decimal_pos
         self.session.last_publish_weight = self.session.stable_weight
         self.session.last_publish_decimal_pos = decimal_pos
-        self.session.scale_owned = trigger == "scale_rising"
+        self.session.scale_owned = trigger in ("scale_rising", "scale_rise_after_departure")
+        self._session_boundary = boundary
         if self.session.scale_owned and self._start_session_spool(log_fn, trigger) is False:
+            self._session_boundary = None
             return False
         self.session.session_active = True
+        if rise_samples and trigger == "scale_rise_after_departure":
+            for weight, observed_at_value in rise_samples:
+                self.session.record_stable_weight(weight, decimal_pos, observed_at_value)
+            self.session.last_publish_weight = self.session.stable_weight
+            self.session.last_publish_decimal_pos = decimal_pos
         if self.lpr_light_controller:
             self.lpr_light_controller.set_lpr_active(True, log_fn)
         self.session.unknown_snapshot_deadline = (
@@ -942,6 +1095,7 @@ class SessionManager:
                     "vehicle_type": self.session.vehicle_type,
                     "rear_start_path": None,
                     "start_frame_paths": {},
+                    **self._boundary_metadata(),
                 },
             )
             self.session.spool_active = True
@@ -1123,17 +1277,18 @@ class SessionManager:
                     "local_peak_dwell_snapshot_captured_at": dict(self.session.local_peak_dwell_snapshot_captured_at),
                     "local_peak_drop_snapshot_paths": dict(self.session.local_peak_drop_snapshot_paths),
                     "local_peak_drop_snapshot_captured_at": dict(self.session.local_peak_drop_snapshot_captured_at),
+                    **self._boundary_metadata(),
                 },
             )
         except Exception as exc:
             log_fn("ERROR", f"Session frame spool metadata update failed: {exc}")
 
-    def _end_session(self, reason: str, log_fn):
+    def _end_session(self, reason: str, log_fn, boundary: MotionDecision = None):
         if not self.session.session_active:
             return
 
         if self._pending_terminal_snapshot is None:
-            self._pending_terminal_snapshot = self._snapshot_session(reason)
+            self._pending_terminal_snapshot = self._snapshot_session(reason, boundary=boundary)
         metadata = dict(self._pending_terminal_snapshot)
         end_reason = metadata["end_reason"]
         log_fn("EVENT", f"Session end id={self.session.session_id} reason={reason} weight_source={metadata['weight_source']}")
@@ -1246,9 +1401,10 @@ class SessionManager:
         self.session.stability_rule = None
         self.session.stable_weight_observed_at = None
         self._pending_terminal_snapshot = None
+        self._session_boundary = None
         return True
 
-    def _snapshot_session(self, reason):
+    def _snapshot_session(self, reason, boundary: MotionDecision = None):
         ended_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         stable = (
             self.session.stable_weight
@@ -1269,7 +1425,7 @@ class SessionManager:
         else:
             assigned, source = self._session_raw_peak, "raw_peak" if self._session_raw_peak else "none"
             observed_at = self._session_raw_peak_observed_at
-        return {
+        snapshot = {
             "session_id": self.session.session_id,
             "started_at": self.session.started_at_iso,
             "ended_at": ended_at,
@@ -1301,6 +1457,27 @@ class SessionManager:
             "local_peak_drop_snapshot_paths": dict(self.session.local_peak_drop_snapshot_paths),
             "local_peak_drop_snapshot_captured_at": dict(self.session.local_peak_drop_snapshot_captured_at),
         }
+        if boundary is not None:
+            snapshot["boundary_kind"] = boundary.kind
+            snapshot["boundary_crossed_at"] = boundary.crossed_at
+            snapshot["boundary_confirmed_at"] = boundary.confirmed_at
+            snapshot["boundary_reference_kg"] = boundary.reference_kg
+            snapshot["boundary_threshold_kg"] = boundary.threshold_kg
+            if boundary.trough_kg is not None:
+                snapshot["boundary_trough_kg"] = boundary.trough_kg
+            if boundary.kind == DEPARTURE:
+                # The visit ended when the weight physically crossed the
+                # departure level; confirmation arrived later.
+                snapshot["ended_at"] = boundary.crossed_at
+                snapshot["departure_confirmed_at"] = boundary.confirmed_at
+                try:
+                    started = datetime.fromisoformat(self.session.started_at_iso)
+                    crossed = datetime.fromisoformat(boundary.crossed_at)
+                except (TypeError, ValueError):
+                    started = crossed = None
+                if started is not None and crossed is not None:
+                    snapshot["duration_s"] = max(0.0, (crossed - started).total_seconds())
+        return snapshot
 
     def finalize_deferred_session(self, metadata, tracker, log_fn=None):
         """Finalize one immutable ended session after deferred LPR completes."""

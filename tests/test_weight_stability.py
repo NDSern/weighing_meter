@@ -14,6 +14,7 @@ sys.modules.setdefault("minio", Mock())
 sys.modules.setdefault("minio.error", Mock())
 
 from d2008_scale_reader import D2008Reader, WeightFrame
+from services.session import session_manager as session_manager_module
 from services.session.session_manager import SessionManager
 from services.storage.image_save_worker import ImageSaveWorker
 
@@ -2182,6 +2183,194 @@ class ReaderFailureTests(unittest.TestCase):
         self.assertEqual(len(reader._recent_weights), 0)
         self.assertIsNone(reader._same_weight)
         self.assertEqual(reader._same_weight_count, 0)
+
+
+class _FakeClock:
+    """Controllable monotonic/wall clock for dwell tests."""
+
+    def __init__(self):
+        self.mono = 1000.0
+        self.wall = 1_793_000_000.0
+
+    def monotonic(self):
+        return self.mono
+
+    def time(self):
+        return self.wall
+
+    def advance(self, seconds):
+        self.mono += seconds
+        self.wall += seconds
+
+
+SPLIT_START_DT = datetime(2026, 10, 30, 10, 0, 0, tzinfo=timezone.utc)
+
+
+class SessionSplitTests(unittest.TestCase):
+    """Departure/renewed-rise visit splitting through SessionManager."""
+
+    def setUp(self):
+        self.clock = _FakeClock()
+        self.spool = Mock()
+        self.manager = SessionManager(Mock(), frame_spool=self.spool)
+        self.manager.session.session_active = True
+        self.manager.session.scale_owned = True
+        self.manager.session.spool_active = True
+        self.manager.session.started_at = self.clock.time() - 10.0
+        self.manager.session.started_at_iso = (
+            SPLIT_START_DT - timedelta(seconds=10)
+        ).isoformat()
+
+    def _feed(self, weights, step=0.25, status="UNSTABLE", start_index=0):
+        for offset, weight in enumerate(weights):
+            self.clock.advance(step)
+            frame = make_frame(weight)
+            frame.status = status
+            if status == "STABLE":
+                frame.stable_weight = weight
+            frame.timestamp = SPLIT_START_DT + timedelta(
+                seconds=(start_index + offset + 1) * step
+            )
+            frame.decimal_pos = 0
+            self.manager.on_frame(frame, Mock())
+        return start_index + len(weights)
+
+    def _iso(self, index, step=0.25):
+        return (
+            SPLIT_START_DT + timedelta(seconds=(index + 1) * step)
+        ).astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+    def test_confirmed_departure_splits_visit_and_rise_starts_new_visit(self):
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            last = self._feed([39120] * 3, status="STABLE")
+            last = self._feed([35000] * 5, start_index=last)
+
+            self.assertFalse(self.manager.session.session_active)
+            self.assertTrue(self.manager._awaiting_renewed_rise)
+            end_meta = self.spool.end_session.call_args[0][1]
+            self.assertEqual(end_meta["boundary_kind"], "departure")
+            self.assertEqual(end_meta["boundary_reference_kg"], 39120)
+            self.assertAlmostEqual(end_meta["boundary_threshold_kg"], 3912.0)
+            # Median filter still holds plateau samples for ~2 frames, so the
+            # crossing level is reached on the 3rd drop frame.
+            self.assertEqual(end_meta["ended_at"], self._iso(5))
+            self.assertEqual(end_meta["departure_confirmed_at"], self._iso(7))
+            self.assertAlmostEqual(end_meta["duration_s"], 11.5)
+
+            last = self._feed([10000] * 5, start_index=last)
+            last = self._feed([12500] * 5, start_index=last)
+
+            self.assertTrue(self.manager.session.session_active)
+            self.assertFalse(self.manager._awaiting_renewed_rise)
+            self.assertEqual(self.manager.session.stable_weight, 12500)
+            self.assertTrue(self.manager.session.scale_owned)
+            begin_meta = self.spool.begin_session.call_args.kwargs["metadata"]
+            self.assertEqual(begin_meta["boundary_kind"], "rise")
+            self.assertEqual(begin_meta["boundary_trough_kg"], 10000)
+            self.assertEqual(begin_meta["started_at"], self._iso(15))
+
+    def test_short_empty_gap_does_not_clear_reentry_wait(self):
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            last = self._feed([39120] * 3, status="STABLE")
+            last = self._feed([35000] * 5, start_index=last)
+            last = self._feed([50] * 4, start_index=last)
+
+            self.assertTrue(self.manager._awaiting_renewed_rise)
+
+            last = self._feed([10000] * 5, start_index=last)
+            self._feed([12500] * 5, start_index=last)
+
+            self.assertTrue(self.manager.session.session_active)
+
+    def test_plate_presence_ignored_while_awaiting_rise(self):
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            last = self._feed([39120] * 3, status="STABLE")
+            self._feed([35000] * 5, start_index=last)
+
+            self.assertTrue(self.manager._awaiting_renewed_rise)
+            self.manager.on_plate_presence(
+                "cam1", {"cam1": True}, log_fn=Mock(), revision=5
+            )
+
+            self.assertFalse(self.manager.session.session_active)
+            self.assertIsNone(self.manager.session.session_id)
+            self.spool.begin_session.assert_not_called()
+
+    def test_higher_plateau_after_load_does_not_split(self):
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            last = self._feed([39120] * 3, status="STABLE")
+            self._feed([45000] * 8, start_index=last)
+
+            self.assertTrue(self.manager.session.session_active)
+            self.assertFalse(self.manager._awaiting_renewed_rise)
+            self.spool.end_session.assert_not_called()
+
+    def test_shallow_rocking_does_not_split(self):
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            last = self._feed([39120] * 3, status="STABLE")
+            self._feed([38510] * 8, start_index=last)
+
+            self.assertTrue(self.manager.session.session_active)
+            self.spool.end_session.assert_not_called()
+
+    def test_spool_finalization_failure_keeps_session_and_waits(self):
+        self.spool.end_session.side_effect = Exception("disk full")
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            last = self._feed([39120] * 3, status="STABLE")
+            self._feed([35000] * 5, start_index=last)
+
+            self.assertTrue(self.manager.session.session_active)
+            self.assertFalse(self.manager._awaiting_renewed_rise)
+            self.assertIsNotNone(self.manager.fatal_error)
+
+    def test_spool_admission_failure_on_rise_retries_next_frame(self):
+        self.spool.begin_session.side_effect = [Exception("admission boom"), Mock()]
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            last = self._feed([39120] * 3, status="STABLE")
+            last = self._feed([35000] * 5, start_index=last)
+            last = self._feed([10000] * 5, start_index=last)
+            self._feed([12500] * 5, start_index=last)
+
+            self.assertFalse(self.manager.session.session_active)
+            self.assertTrue(self.manager._awaiting_renewed_rise)
+            self.assertIsNotNone(self.manager._pending_rise_start)
+            # Admission failure is fatal by design; simulate operator/restart
+            # recovery clearing the flag, then the pending rise retries.
+            self.assertIsNotNone(self.manager.fatal_error)
+            self.manager.fatal_error = None
+
+            self._feed([12500])
+
+            self.assertTrue(self.manager.session.session_active)
+            self.assertFalse(self.manager._awaiting_renewed_rise)
+            self.assertEqual(self.manager.session.stable_weight, 12500)
+            self.assertEqual(self.spool.begin_session.call_count, 2)
+
+    def test_normal_end_metadata_has_no_boundary_keys(self):
+        with unittest.mock.patch.object(
+            session_manager_module, "time", self.clock
+        ):
+            self._feed([39120] * 3, status="STABLE")
+            self._feed([0] * 9)
+
+            self.assertFalse(self.manager.session.session_active)
+            end_meta = self.spool.end_session.call_args[0][1]
+            self.assertEqual(end_meta["end_reason"], "scale_empty")
+            self.assertNotIn("boundary_kind", end_meta)
 
 
 if __name__ == "__main__":
