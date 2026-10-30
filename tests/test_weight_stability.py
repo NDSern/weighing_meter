@@ -371,6 +371,19 @@ class SessionWeightTests(unittest.TestCase):
         self.assertEqual(self.manager.session.stable_weight, 39120)
         self.assertEqual(self.manager.session.plateau_retained_weight, 39120)
 
+    def test_retained_plateau_publishes_after_rolling_eviction(self):
+        for _ in range(25):
+            self.manager.on_frame(self.stable_frame(39120), Mock())
+        # A lower plateau pushes 39120 out of the 25-frame rolling window.
+        for _ in range(25):
+            self.manager.on_frame(self.stable_frame(38500), Mock())
+        for _ in range(5):
+            self.manager.on_frame(self.stable_frame(38500), Mock())
+
+        self.assertEqual(self.manager.session.stable_weight, 39120)
+        self.assertEqual(self.manager.session.stable_decimal_pos, 0)
+        self.assertIsNotNone(self.manager.session.stable_weight_observed_at)
+
     def test_higher_validated_plateau_replaces_partial_entry(self):
         for _ in range(5):
             self.manager.on_frame(self.stable_frame(20000), Mock())

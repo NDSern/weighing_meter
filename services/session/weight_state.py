@@ -226,6 +226,7 @@ class WeighingSessionState:
         if selection is None:
             return
         retained = self.plateau_retained_weight
+        expose_retained = False
         if retained is not None:
             episode_selection = _mode_newest(None, self._episode_counts, self._episode_last_seen)
             if (
@@ -238,11 +239,19 @@ class WeighingSessionState:
                 self.plateau_retained_observed_at = self._episode_observation_times[episode_selection]
                 retained = episode_selection
                 selection = episode_selection
+                expose_retained = True
             elif abs(selection - retained) > PLATEAU_BAND_KG:
                 selection = retained
+                expose_retained = True
         self.stable_weight = selection
-        self.stable_decimal_pos = self.stable_weight_decimal_pos[selection]
-        self.stable_weight_observed_at = self.stable_weight_observation_times[selection]
+        if expose_retained:
+            # The retained plateau may already have been evicted from the
+            # rolling window; its own metadata survives on the retained fields.
+            self.stable_decimal_pos = self.plateau_retained_decimal_pos
+            self.stable_weight_observed_at = self.plateau_retained_observed_at
+        else:
+            self.stable_decimal_pos = self.stable_weight_decimal_pos[selection]
+            self.stable_weight_observed_at = self.stable_weight_observation_times[selection]
 
     def start_stable_weight_history(self):
         self.clear_stable_weight_history()

@@ -24,6 +24,10 @@ import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 sys.modules.setdefault("serial", unittest.mock.Mock())
 sys.modules.setdefault("cv2", unittest.mock.Mock())
 sys.modules.setdefault("minio", unittest.mock.Mock())
@@ -94,7 +98,8 @@ def _replay_datetime_factory(clock):
 
 
 def _parse_timestamp(raw):
-    value = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S.%f")
+    # Host DBs store ISO ("2026-10-24T00:00:00.102127"); fixtures use " ".
+    value = datetime.fromisoformat(raw.replace(" ", "T"))
     return value.replace(tzinfo=VN_TZ)
 
 
