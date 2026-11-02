@@ -13,8 +13,16 @@ from xml.etree import ElementTree
 class CameraLightController:
     """Use each camera's vendor XML API without changing unrelated settings."""
 
-    def __init__(self, rtsp_urls, now_fn, open_fn=None, api_password="", monotonic_fn=None):
-        self._targets = [self._parse_target(url, api_password) for url in rtsp_urls]
+    def __init__(self, rtsp_urls, now_fn, open_fn=None, api_password=None, monotonic_fn=None,
+                 http_credentials=None):
+        if http_credentials is None:
+            http_credentials = [(None, None)] * len(rtsp_urls)
+        if len(http_credentials) != len(rtsp_urls):
+            raise ValueError("HTTP credentials must match camera slots")
+        self._targets = [
+            self._parse_target(url, api_password, username, password)
+            for url, (username, password) in zip(rtsp_urls, http_credentials)
+        ]
         self._now_fn = now_fn
         self._monotonic = monotonic_fn or time.monotonic
         self._open = open_fn or build_opener(ProxyHandler({})).open
@@ -24,14 +32,16 @@ class CameraLightController:
         self._retry_state = {}
 
     @staticmethod
-    def _parse_target(rtsp_url, api_password):
+    def _parse_target(rtsp_url, api_password, http_username=None, http_password=None):
         parsed = urlsplit(rtsp_url)
         if not parsed.hostname:
             raise ValueError("Camera RTSP URL must include a host")
-        # Fall back to the RTSP URL credential so the nightly white-light API
-        # does not silently authenticate with an empty password.
-        password = api_password or unquote(parsed.password or "")
-        return parsed.hostname, unquote(parsed.username or ""), password
+        # None means unset; an explicit empty password must never fall back.
+        password = api_password if api_password is not None else unquote(parsed.password or "")
+        if http_password is not None:
+            password = http_password
+        username = unquote(parsed.username or "") if http_username is None else http_username
+        return parsed.hostname, username, password
 
     @staticmethod
     def _is_night(now):

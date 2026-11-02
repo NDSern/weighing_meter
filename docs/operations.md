@@ -149,12 +149,21 @@ logs recovery. A failed off request retains the known-on state for retry.
 HTTP 404 disables that target for the process; HTTP 500 remains retryable.
 Errors log HTTP status or exception type, never credential-bearing error text.
 
-On 2026-11-02, read-only authenticated GET checks using HP2's effective service
-credentials returned HTTP 401 from cameras `.181` and `.177`, and HTTP 500 from
-`.20`. Backoff does not repair authentication. Validate camera HTTP account
-permissions and endpoint support with the device administrator; RTSP access
-alone does not establish HTTP API access. Keep credentials outside tracked files
-and logs. Brightness changes require a separate operational check.
+HTTP light credentials can differ from RTSP credentials. Configure
+`CAM1_HTTP_USERNAME` / `CAM1_HTTP_PASSWORD` through `CAM3_HTTP_USERNAME` /
+`CAM3_HTTP_PASSWORD` in host-local configuration, or use the corresponding
+`WEIGHING_`-prefixed environment variables. Slots follow `RTSP_URL`,
+`RTSP_URL_2`, and `RTSP_URL_3`, respectively. Each unset (`None`) field falls back
+to its RTSP counterpart; an explicit empty string remains blank. Environment
+values override local configuration even when empty for these HTTP fields.
+Leave unused entries commented in the environment template to preserve fallback.
+
+On 2026-11-02, read-only GET probes confirmed `/Images/1/IrCutFilter` and variable
+white-light capability on HP2 cameras `.181` and `.177` using device HTTP
+credentials, while service RTSP credentials returned HTTP 401. Camera `.20`
+returned HTTP 500; its light route remains unresolved. Keep credentials outside
+tracked files and logs. Successful GET access does not establish write
+permission; brightness changes require a separate operational check.
 
 ## Recovery tooling (restricted)
 

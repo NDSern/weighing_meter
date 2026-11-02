@@ -124,6 +124,29 @@ class PartialStartupShutdownTests(unittest.TestCase):
                         bootstrap.construct_service(mock.Mock(), res)
                 self.assertTrue(getattr(res, flag), flag)
 
+    def test_light_controller_receives_slot_credentials_including_blank(self):
+        from services.runtime import bootstrap
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._construction_patchers():
+                stack.enter_context(patcher)
+            light = stack.enter_context(mock.patch(
+                "services.capture.camera_light_controller.CameraLightController"))
+            for name, value in {
+                "CAM1_HTTP_USERNAME": "http-user", "CAM1_HTTP_PASSWORD": "",
+                "CAM2_HTTP_USERNAME": None, "CAM2_HTTP_PASSWORD": None,
+                "CAM3_HTTP_USERNAME": "third-user", "CAM3_HTTP_PASSWORD": "third-pass",
+            }.items():
+                stack.enter_context(mock.patch.object(bootstrap, name, value))
+            # Stop construction immediately after the controller is wired.
+            light.side_effect = RuntimeError("controller reached")
+            with self.assertRaisesRegex(RuntimeError, "controller reached"):
+                bootstrap.construct_service(mock.Mock(), bootstrap.ServiceResources())
+            self.assertEqual(light.call_args.kwargs["http_credentials"],
+                             [("http-user", ""), (None, None), ("third-user", "third-pass")])
+            self.assertEqual(light.call_args.args[0],
+                             [bootstrap.RTSP_URL, bootstrap.RTSP_URL_2, bootstrap.RTSP_URL_3])
+
     def test_shutdown_stops_a_half_started_resource(self):
         from services.runtime import bootstrap
 

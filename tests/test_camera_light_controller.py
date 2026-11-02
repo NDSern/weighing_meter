@@ -91,6 +91,48 @@ class CameraLightControllerTests(unittest.TestCase):
             "Basic " + base64.b64encode(b"admin:url-secret").decode(),
         )
 
+    def test_per_camera_http_credentials_preserve_blanks_and_fallbacks(self):
+        requests = []
+
+        def opener(request, timeout):
+            requests.append(request)
+            response = Mock()
+            response.read.return_value = CURRENT_XML if request.get_method() == "GET" else OK_XML
+            return response
+
+        controller = CameraLightController(
+            ["rtsp://stream:stream-secret@camera1/x",
+             "rtsp://stream2:encoded%40secret@camera2/x",
+             "rtsp://stream3:stream-secret3@camera3/x"],
+            lambda: datetime(2026, 9, 22, 20, 0), opener,
+            http_credentials=[("admin", ""), (None, None), ("http-user", "http-pass")],
+        )
+        controller.set_lpr_active(True, Mock())
+        self.assertEqual(len(requests), 6)
+        for request, expected in zip(
+            requests, [b"admin:"] * 2 + [b"stream2:encoded@secret"] * 2 + [b"http-user:http-pass"] * 2,
+        ):
+            self.assertEqual(request.get_header("Authorization"),
+                             "Basic " + base64.b64encode(expected).decode())
+
+    def test_http_username_only_preserves_rtsp_password(self):
+        controller = CameraLightController(
+            ["rtsp://stream:secret@camera1/x"], datetime.now,
+            http_credentials=[("http-user", None)],
+        )
+        self.assertEqual(controller._targets, [("camera1", "http-user", "secret")])
+
+    def test_explicit_blank_api_password_does_not_fall_back(self):
+        controller = CameraLightController(
+            ["rtsp://stream:secret@camera1/x"], datetime.now, api_password="",
+        )
+        self.assertEqual(controller._targets, [("camera1", "stream", "")])
+
+    def test_incomplete_slot_mapping_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "match camera slots"):
+            CameraLightController(["rtsp://stream:secret@camera1/x"], datetime.now,
+                                  http_credentials=[])
+
     def test_day_start_does_not_change_light(self):
         controller = self.make_controller(datetime(2026, 9, 22, 12, 0))
 

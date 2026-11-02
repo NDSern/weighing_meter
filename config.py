@@ -26,6 +26,14 @@ RTSP_PASSWORD = ""
 RTSP_URL = ""
 RTSP_URL_2 = ""
 RTSP_URL_3 = ""
+# HTTP light-control credentials, by RTSP camera slot. None falls back to RTSP;
+# an empty string is an explicit blank credential.
+CAM1_HTTP_USERNAME = None
+CAM1_HTTP_PASSWORD = None
+CAM2_HTTP_USERNAME = None
+CAM2_HTTP_PASSWORD = None
+CAM3_HTTP_USERNAME = None
+CAM3_HTTP_PASSWORD = None
 CAM1_EXPECTED_RESOLUTION = None
 
 WEIGHT_THRESHOLD = 100.0
@@ -229,6 +237,17 @@ for _name, _env_name in _ENV_OVERRIDES.items():
             except ValueError:
                 _env_value = -1
         globals()[_name] = _env_value
+        _LOCAL_OVERRIDES.add(_name)
+
+# Unlike existing secret overrides, HTTP credentials preserve explicit blanks.
+for _name in (
+    "CAM1_HTTP_USERNAME", "CAM1_HTTP_PASSWORD",
+    "CAM2_HTTP_USERNAME", "CAM2_HTTP_PASSWORD",
+    "CAM3_HTTP_USERNAME", "CAM3_HTTP_PASSWORD",
+):
+    _env_name = "WEIGHING_" + _name
+    if _env_name in os.environ:
+        globals()[_name] = os.environ[_env_name]
         _LOCAL_OVERRIDES.add(_name)
 
 if "RTSP_URL" not in _LOCAL_OVERRIDES:

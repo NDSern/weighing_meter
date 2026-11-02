@@ -173,6 +173,32 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.MQTT_PASSWORD, "env-pass")
 
+    def test_http_credentials_default_to_none(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            config = self.load_config(_CREDENTIALS)
+        for slot in (1, 2, 3):
+            self.assertIsNone(getattr(config, "CAM%d_HTTP_USERNAME" % slot))
+            self.assertIsNone(getattr(config, "CAM%d_HTTP_PASSWORD" % slot))
+
+    def test_http_environment_blank_overrides_local_password(self):
+        with mock.patch.dict(os.environ, {
+            "WEIGHING_CAM1_HTTP_USERNAME": "http-user",
+            "WEIGHING_CAM1_HTTP_PASSWORD": "",
+            "WEIGHING_CAM3_HTTP_PASSWORD": "http-three",
+            "WEIGHING_RTSP_PASSWORD": "",
+        }, clear=True):
+            config = self.load_config(
+                _CREDENTIALS + 'CAM1_HTTP_PASSWORD = "local-http"\n'
+                + 'CAM2_HTTP_USERNAME = "local-user"\nCAM2_HTTP_PASSWORD = ""\n'
+            )
+        self.assertEqual(config.CAM1_HTTP_USERNAME, "http-user")
+        self.assertEqual(config.CAM1_HTTP_PASSWORD, "")
+        self.assertEqual(config.CAM2_HTTP_USERNAME, "local-user")
+        self.assertEqual(config.CAM2_HTTP_PASSWORD, "")
+        self.assertIsNone(config.CAM3_HTTP_USERNAME)
+        self.assertEqual(config.CAM3_HTTP_PASSWORD, "http-three")
+        self.assertEqual(config.RTSP_PASSWORD, "camera-pass")
+
     def test_incomplete_rtsp_credentials_are_rejected(self):
         config = self.load_config(
             'WEIGHBRIDGE_ID = "100ecc11-dbcb-4c23-8e89-d41ccefcda37"\n'

@@ -13,6 +13,12 @@ from config import (
     BAUD_RATE,
     CAM1_LPR_CROP,
     CAM1_EXPECTED_RESOLUTION,
+    CAM1_HTTP_USERNAME,
+    CAM1_HTTP_PASSWORD,
+    CAM2_HTTP_USERNAME,
+    CAM2_HTTP_PASSWORD,
+    CAM3_HTTP_USERNAME,
+    CAM3_HTTP_PASSWORD,
     CAM2_RESULT_CROP,
     CAM3_LPR_CROP,
     CAPTURE_DIR,
@@ -293,6 +299,11 @@ def construct_service(log, res=None) -> ServiceResources:
         cam2_result_crop=CAM2_RESULT_CROP,
         lpr_light_controller=CameraLightController(
             [RTSP_URL, RTSP_URL_2, RTSP_URL_3], datetime.now,
+            http_credentials=[
+                (CAM1_HTTP_USERNAME, CAM1_HTTP_PASSWORD),
+                (CAM2_HTTP_USERNAME, CAM2_HTTP_PASSWORD),
+                (CAM3_HTTP_USERNAME, CAM3_HTTP_PASSWORD),
+            ],
         ),
         duplicate_reviewer=res.duplicate_reviewer,
     )
