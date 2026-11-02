@@ -332,6 +332,92 @@ class SessionFrameSpoolTests(unittest.TestCase):
             self.assertEqual(spool._bytes_written, 0)
             self.assertGreaterEqual(counter.entries, 1)
 
+    def test_sweep_skips_acknowledgement_in_progress(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("done", {"cam1": Frame(1)})
+            path = spool.end_session("done", {})
+            deleting = threading.Event()
+            release = threading.Event()
+            errors = []
+            import shutil
+            original = shutil.rmtree
+
+            def paused_delete(directory):
+                deleting.set()
+                if not release.wait(2):
+                    raise RuntimeError("cleanup test timed out")
+                return original(directory)
+
+            def acknowledge():
+                try:
+                    spool.acknowledge_job(path)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch("services.capture.session_frame_spool.shutil.rmtree", side_effect=paused_delete):
+                worker = threading.Thread(target=acknowledge, daemon=True)
+                worker.start()
+                try:
+                    self.assertTrue(deleting.wait(1))
+                    spool._resume_cleanup()
+                    self.assertTrue(os.path.isdir(session_dir))
+                    self.assertTrue(spool._lock.acquire(blocking=False))
+                    spool._lock.release()
+                finally:
+                    release.set()
+                    worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            spool.acknowledge_job(path)
+            spool._resume_cleanup()
+            self.assertEqual(spool._bytes_written, 0)
+            self.assertEqual(os.listdir(spool.failed_dir), [])
+            self.assertFalse(os.path.exists(session_dir))
+
+    def test_unreadable_cleanup_is_retried_not_quarantined(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("done", {"cam1": Frame(1)})
+            path = spool.end_session("done", {})
+            cleanup = os.path.join(spool.cleanup_dir, os.path.basename(path))
+            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+                spool.acknowledge_job(path)
+            self.assertTrue(os.path.exists(cleanup))
+            self.assertTrue(os.path.isdir(session_dir))
+            self.assertEqual(os.listdir(spool.failed_dir), [])
+            spool._resume_cleanup()
+            self.assertFalse(os.path.exists(cleanup))
+            self.assertEqual(spool._bytes_written, 0)
+
+    def test_corrupt_cleanup_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            cleanup = os.path.join(spool.cleanup_dir, "broken.json")
+            with open(cleanup, "w") as handle:
+                handle.write("not json")
+            spool._resume_cleanup()
+            self.assertFalse(os.path.exists(cleanup))
+            self.assertEqual(os.listdir(spool.failed_dir), ["broken.json"])
+
+    def test_partial_cleanup_failure_accounts_removed_bytes_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            spool = self.make_spool(root)
+            session_dir = spool.begin_session("done", {"cam1": Frame(1), "cam3": Frame(2)})
+            path = spool.end_session("done", {})
+
+            def partial_delete(directory):
+                os.unlink(os.path.join(directory, os.listdir(directory)[0]))
+                raise PermissionError("remaining file busy")
+
+            with mock.patch("services.capture.session_frame_spool.shutil.rmtree", side_effect=partial_delete):
+                spool.acknowledge_job(path)
+            self.assertEqual(spool._bytes_written, spool._directory_size(session_dir))
+            spool._resume_cleanup()
+            self.assertEqual(spool._bytes_written, 0)
+            spool.acknowledge_job(path)
+            self.assertEqual(spool._bytes_written, 0)
+
     def test_resume_cleanup_holds_lock_for_byte_accounting(self):
         class CountingLock:
             def __init__(self):

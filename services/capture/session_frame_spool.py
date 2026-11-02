@@ -71,6 +71,7 @@ class SessionFrameSpool:
         self._notifications = queue.Queue(maxsize=notification_queue_size)
         self._notification_lock = threading.Lock()
         self._lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
         self._active = None
@@ -198,29 +199,19 @@ class SessionFrameSpool:
         """Remove a processed job marker and its captured session files."""
         path = self._job_path(manifest_path, (self.processing_dir, self.jobs_dir))
         cleanup_path = os.path.join(self.cleanup_dir, os.path.basename(path))
-        os.replace(path, cleanup_path)
-        self._fsync_dir(os.path.dirname(path))
-        self._fsync_dir(self.cleanup_dir)
-        session_dir = None
-        try:
-            with open(cleanup_path, encoding="utf-8") as handle:
-                session_dir = json.load(handle).get("session_dir")
-        except (OSError, ValueError, TypeError):
-            self._move_failed(cleanup_path)
-            return
-        if session_dir:
-            session_dir = os.path.abspath(session_dir)
-            if self._is_session_dir(session_dir):
-                try:
-                    size = self._directory_size(session_dir)
-                    shutil.rmtree(session_dir)
-                    with self._lock:
-                        self._bytes_written = max(0, self._bytes_written - size)
-                except OSError:
-                    return
-        self._unlink_durable(cleanup_path)
-        with self._notification_lock:
-            self._known_notifications.discard(path)
+        with self._cleanup_lock:
+            try:
+                os.replace(path, cleanup_path)
+            except FileNotFoundError:
+                # A prior acknowledgement may have completed or left cleanup
+                # pending. Both cases converge through the same cleanup path.
+                pass
+            else:
+                self._fsync_dir(os.path.dirname(path))
+                self._fsync_dir(self.cleanup_dir)
+            self._cleanup_job_locked(cleanup_path)
+            with self._notification_lock:
+                self._known_notifications.discard(path)
 
     def abort_session(self, session_id):
         """Discard one partially initialized active session."""
@@ -303,26 +294,51 @@ class SessionFrameSpool:
             next_capture = max(next_capture + self._interval, time.monotonic())
 
     def _resume_cleanup(self):
-        for path in self._manifest_paths(self.cleanup_dir):
-            manifest = self._read_manifest(path)
-            if manifest is None:
-                self._move_failed(path)
-                continue
-            session_dir = os.path.abspath(str(manifest.get("session_dir", "")))
-            if not self._is_session_dir(session_dir):
-                self._move_failed(path)
-                continue
-            try:
-                size = self._directory_size(session_dir)
-                shutil.rmtree(session_dir)
-            except FileNotFoundError:
-                size = 0
-            except OSError:
-                continue
+        # The sampler must not wait behind a deferred worker's deletion.
+        if not self._cleanup_lock.acquire(blocking=False):
+            return
+        try:
+            for path in self._manifest_paths(self.cleanup_dir):
+                self._cleanup_job_locked(path)
+            self._expire_quarantine()
+        finally:
+            self._cleanup_lock.release()
+
+    def _cleanup_job_locked(self, path):
+        """Consume one cleanup marker while holding cleanup ownership."""
+        try:
+            with open(path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except FileNotFoundError:
+            return
+        except (ValueError, TypeError):
+            self._move_failed(path)
+            return
+        except OSError:
+            # Unreadable is not corrupt: retry after the I/O issue clears.
+            return
+        session_dir = os.path.abspath(str(manifest.get("session_dir", ""))) if isinstance(manifest, dict) else ""
+        if not self._is_session_dir(session_dir):
+            self._move_failed(path)
+            return
+        size = self._directory_size(session_dir)
+        try:
+            shutil.rmtree(session_dir)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # rmtree may have removed some files before failing. Account only
+            # the removed bytes; the remaining marker permits a later retry.
+            remaining = self._directory_size(session_dir)
             with self._lock:
-                self._bytes_written = max(0, self._bytes_written - size)
-            self._unlink_durable(path)
-        self._expire_quarantine()
+                self._bytes_written = max(0, self._bytes_written - max(0, size - remaining))
+            return
+        with self._lock:
+            self._bytes_written = max(0, self._bytes_written - size)
+        self._unlink_durable(path)
+        with self._notification_lock:
+            for directory in (self.jobs_dir, self.processing_dir):
+                self._known_notifications.discard(os.path.join(directory, os.path.basename(path)))
 
     def _expire_quarantine(self):
         cutoff = time.time() - self._quarantine_retention_seconds
