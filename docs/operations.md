@@ -49,7 +49,8 @@ Restarting during a loaded cycle can split one vehicle into two sessions.
 
 1. Confirm the raw scale is at or below `WEIGHT_THRESHOLD` (100 kg) for at least
    2 seconds (`SESSION_END_EMPTY_DWELL_SECONDS`).
-2. Confirm the MQTT pending queue and image upload queue are both empty.
+2. Confirm the MQTT pending queue, image upload queue, and deferred LPR
+   `storage/lpr-spool/pending/` and `processing/` queues are empty.
 3. Restart, then verify: service active, `NRestarts` stable, fresh raw scale
    rows, and no traceback or import error.
 
@@ -104,6 +105,7 @@ Preflight before restart:
 
 - raw scale fresh and `<= 100 kg` for at least 2 seconds
 - no active session or spool finalization in progress
+- deferred LPR `pending/` and `processing/` queues drained
 - `storage/publish_pending.jsonl` empty and image upload queue empty
 - service active and `NRestarts` stable
 - timestamped backup of every file to be replaced
@@ -113,6 +115,46 @@ scale ingestion, correct stable/peak selection, `scale_empty` finalization, one
 queued-and-acknowledged publication, image upload success, and no traceback,
 restart, backlog, or memory/spool growth. Run one host as canary before the
 other.
+
+## Inference timing and fairness
+
+Each camera's inference lock admits waiters FIFO within the live and deferred
+classes, retaining live/deferred class arbitration. A detector cannot repeatedly
+reacquire ahead of an already-waiting live OCR job. OCR checks session context
+and enablement again after acquiring the lock, before expensive inference.
+
+Rate-limited timing logs use monotonic durations: `queue_ms` is time before the
+OCR worker takes the job, `wait_ms` is inference-lock admission time,
+`inference_ms` includes recognition and any fallback, and `total_ms` includes
+queueing, lock wait, and inference. Detection logs split lock wait and inference
+too. Compare these fields rather than interpreting the old combined OCR elapsed
+time as model compute time. Observation timestamps remain wall-clock values.
+
+## Spool cleanup ownership
+
+Acknowledgement cleanup and the background cleanup sweep share a cleanup lock.
+The sampler skips a sweep when acknowledgement owns it; directory deletion does
+not hold the active-frame capture lock. Missing cleanup markers are idempotent,
+unreadable markers remain for retry, and corrupt markers go to `failed/`.
+Partial deletion accounts only for removed bytes before retrying the remainder.
+Keep failed/orphan evidence for normal quarantine retention unless an explicit
+recovery decision calls for moving it to a backup.
+
+## Camera light failures
+
+Light-control failures back off per camera: 60, 120, 240, 480, then 900 seconds
+(capped). Retry occurs on a subsequent controller call after the deadline;
+there is no autonomous retry timer. Successful control clears the backoff and
+logs recovery. A failed off request retains the known-on state for retry.
+HTTP 404 disables that target for the process; HTTP 500 remains retryable.
+Errors log HTTP status or exception type, never credential-bearing error text.
+
+On 2026-11-02, read-only authenticated GET checks using HP2's effective service
+credentials returned HTTP 401 from cameras `.181` and `.177`, and HTTP 500 from
+`.20`. Backoff does not repair authentication. Validate camera HTTP account
+permissions and endpoint support with the device administrator; RTSP access
+alone does not establish HTTP API access. Keep credentials outside tracked files
+and logs. Brightness changes require a separate operational check.
 
 ## Recovery tooling (restricted)
 
