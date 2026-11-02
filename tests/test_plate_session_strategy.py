@@ -1,5 +1,6 @@
 import unittest
 import sys
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 sys.modules.setdefault("serial", Mock())
@@ -267,6 +268,70 @@ class PlateTrackTests(unittest.TestCase):
 
         self.assertEqual(coordinator._detect_events["cam1"].set.call_count, 1)
         camera.peek_latest_frame_with_id.assert_called_with(copy_frame=False)
+
+
+class OcrAdmissionTests(unittest.TestCase):
+    def run_job(self, on_acquire=None, on_recognize=None):
+        camera = Mock()
+        camera.name = "cam1"
+        context = ["visit-1"]
+        coordinator = DetectCoordinator([camera], Mock(), session_context=lambda: context[0])
+        coordinator._enabled = True
+        coordinator._running = True
+        event = Mock()
+        event.wait.side_effect = [None, lambda: None]
+        coordinator._ocr_events = {"cam1": event}
+        calls = 0
+
+        def take(_cam):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                coordinator._running = False
+                return None
+            return {"frame": Mock(), "regions": [], "created_mono": 5.0,
+                    "session_context": "visit-1"}
+
+        @contextmanager
+        def admission():
+            if on_acquire:
+                on_acquire(coordinator, context)
+            yield
+
+        camera.inference_lock = admission()
+        coordinator._take_ocr_job = take
+        coordinator._recognize_with_fallback = Mock(return_value=[])
+        if on_recognize:
+            coordinator._recognize_with_fallback.side_effect = lambda *args: on_recognize(context)
+        coordinator._process_plate_detections = Mock()
+        coordinator._log_timing = Mock()
+        with patch("services.capture.detect_coordinator.time.monotonic", side_effect=[10.0, 13.0, 15.0]), \
+                patch("services.capture.detect_coordinator.time.time", side_effect=AssertionError("wall clock used")):
+            coordinator._ocr_loop(camera)
+        return coordinator
+
+    def test_context_changed_while_waiting_skips_inference(self):
+        coordinator = self.run_job(on_acquire=lambda _c, ctx: ctx.__setitem__(0, "visit-2"))
+        coordinator._recognize_with_fallback.assert_not_called()
+        self.assertIn("outcome=stale_skip", coordinator._log_timing.call_args.args[2])
+
+    def test_disabled_while_waiting_skips_inference(self):
+        coordinator = self.run_job(on_acquire=lambda c, _ctx: c.set_enabled(False))
+        coordinator._recognize_with_fallback.assert_not_called()
+
+    def test_context_changed_during_inference_discards_result(self):
+        def recognize(ctx):
+            ctx[0] = "visit-2"
+            return [{"plate": "test"}]
+        coordinator = self.run_job(on_recognize=recognize)
+        coordinator._process_plate_detections.assert_not_called()
+        self.assertIn("outcome=stale_result", coordinator._log_timing.call_args.args[2])
+
+    def test_empty_result_reports_monotonic_wait_and_inference(self):
+        coordinator = self.run_job()
+        message = coordinator._log_timing.call_args.args[2]
+        for field in ("queue_ms=5000", "wait_ms=3000", "inference_ms=2000", "total_ms=10000", "outcome=empty"):
+            self.assertIn(field, message)
 
 
 class SessionStrategyTests(unittest.TestCase):

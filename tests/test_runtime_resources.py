@@ -100,6 +100,53 @@ class RknnModelSetTests(unittest.TestCase):
 
 
 class PriorityInferenceLockTests(unittest.TestCase):
+    def test_queued_live_work_precedes_reacquisition(self):
+        lock = PriorityInferenceLock()
+        queued = threading.Event()
+        original_wait = lock._condition.wait
+        order = []
+
+        def waiting(timeout=None):
+            queued.set()
+            return original_wait(timeout)
+
+        def ocr():
+            with lock:
+                order.append("ocr")
+
+        with mock.patch.object(lock._condition, "wait", side_effect=waiting):
+            with lock:
+                worker = threading.Thread(target=ocr, daemon=True)
+                worker.start()
+                self.assertTrue(queued.wait(1))
+            with lock:
+                order.append("detector-reacquired")
+            worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(order, ["ocr", "detector-reacquired"])
+
+    def test_cancelled_waiter_does_not_strand_queue(self):
+        for context in (lambda lock: lock, lambda lock: lock.deferred()):
+            lock = PriorityInferenceLock()
+            with lock:
+                with mock.patch.object(lock._condition, "wait", side_effect=RuntimeError("cancel")):
+                    with self.assertRaises(RuntimeError):
+                        with context(lock):
+                            self.fail("admitted while active")
+            self.assertEqual(lock._live_waiters, 0)
+            self.assertEqual(lock._deferred_waiters, 0)
+            with context(lock):
+                self.assertTrue(lock._active)
+            self.assertFalse(lock._active)
+
+    def test_inference_exception_releases_lock(self):
+        lock = PriorityInferenceLock()
+        for context in (lambda: lock, lock.deferred):
+            with self.assertRaises(ValueError):
+                with context():
+                    raise ValueError("inference failed")
+            self.assertFalse(lock._active)
+
     def test_waiting_live_work_runs_before_next_deferred_call(self):
         lock = PriorityInferenceLock()
         order = []

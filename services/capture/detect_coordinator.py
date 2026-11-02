@@ -377,6 +377,7 @@ class DetectCoordinator:
                 "frame": full_frame,
                 "regions": regions,
                 "created_at": time.time(),
+                "created_mono": time.monotonic(),
                 "detect_started_at": detect_started_at,
                 "session_context": self._session_context(),
             }
@@ -406,16 +407,34 @@ class DetectCoordinator:
             try:
                 if not self.is_enabled():
                     continue
-                t0 = time.time()
+                t0 = time.monotonic()
+                age_ms = (t0 - job["created_mono"]) * 1000
                 with cam.inference_lock:
+                    acquired = time.monotonic()
+                    if (not self._running or not self.is_enabled()
+                            or job["session_context"] != self._session_context()):
+                        self._log_timing(
+                            cam.name, "ocr",
+                            f"[{cam.name}] OCR: {(acquired - t0) * 1000:.0f}ms "
+                            f"queue_ms={age_ms:.0f} wait_ms={(acquired - t0) * 1000:.0f} "
+                            "inference_ms=0 outcome=stale_skip",
+                        )
+                        continue
                     plates = self._recognize_with_fallback(cam, full_frame, regions)
-                if not self.is_enabled():
+                    finished = time.monotonic()
+                elapsed_ms = (finished - t0) * 1000
+                stale = (not self._running or not self.is_enabled()
+                         or job["session_context"] != self._session_context())
+                timing = (f"queue_ms={age_ms:.0f} wait_ms={(acquired - t0) * 1000:.0f} "
+                          f"inference_ms={(finished - acquired) * 1000:.0f} "
+                          f"total_ms={age_ms + elapsed_ms:.0f}")
+                if stale or not plates:
+                    self._log_timing(
+                        cam.name, "ocr", f"[{cam.name}] OCR: {elapsed_ms:.0f}ms {timing} "
+                        f"outcome={'stale_result' if stale else 'empty'}",
+                    )
+                if stale:
                     continue
-                if job["session_context"] != self._session_context():
-                    log("INFO", f"[{cam.name}] stale OCR result ignored context={job['session_context']}")
-                    continue
-                elapsed_ms = (time.time() - t0) * 1000
-                age_ms = (t0 - job["created_at"]) * 1000
                 if plates:
                     if len(plates) == 1:
                         p = plates[0]
@@ -423,7 +442,7 @@ class DetectCoordinator:
                         self._log_timing(
                             cam.name,
                             "ocr",
-                            f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates=1 age={age_ms:.0f}ms "
+                            f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates=1 {timing} "
                             f"plate={p.get('plate')} status={p.get('ocr_status')} candidates={candidates}",
                         )
                     else:
@@ -431,7 +450,7 @@ class DetectCoordinator:
                         self._log_timing(
                             cam.name,
                             "ocr",
-                            f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates={len(plates)} age={age_ms:.0f}ms plate={summary}",
+                            f"[{cam.name}] OCR: {elapsed_ms:.0f}ms  plates={len(plates)} {timing} plate={summary}",
                         )
                 self._process_plate_detections(cam, plates, full_frame, job["session_context"])
             except Exception as exc:
@@ -440,10 +459,14 @@ class DetectCoordinator:
     def _run_detection(self, cam, full_frame, frame_id=None):
         """Run detection for one camera. Feeds tracker directly."""
         t0 = time.time()
+        started_mono = time.monotonic()
         if self._detect_regions_fn and self._recognize_regions_fn:
             lpr_frame, dx, dy = crop_lpr_frame(full_frame, cam.lpr_crop)
+            waiting = time.monotonic()
             with cam.inference_lock:
+                acquired = time.monotonic()
                 regions = self._detect_regions_fn(lpr_frame, detector=cam.detector)
+                finished = time.monotonic()
             regions = remap_lpr_regions(regions, dx, dy)
             with self._track_lock:
                 track = self._tracks[cam.name]
@@ -454,11 +477,13 @@ class DetectCoordinator:
                 revision = self._presence_revision
             if self._presence_callback:
                 self._presence_callback(cam.name, valid, revision)
-            elapsed_ms = (time.time() - t0) * 1000
+            elapsed_ms = (time.monotonic() - started_mono) * 1000
             self._log_timing(
                 cam.name,
                 "detect",
                 f"[{cam.name}] Detect: {elapsed_ms:.0f}ms regions={len(regions)} "
+                f"wait_ms={(acquired - waiting) * 1000:.0f} "
+                f"inference_ms={(finished - acquired) * 1000:.0f} "
                 f"lpr_crop={cam.lpr_crop} source={full_frame.shape[1]}x{full_frame.shape[0]} "
                 f"input={lpr_frame.shape[1]}x{lpr_frame.shape[0]}",
             )

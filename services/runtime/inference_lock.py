@@ -1,6 +1,7 @@
 """Inference serialization with live-work priority."""
 
 import threading
+from collections import deque
 from contextlib import contextmanager
 
 
@@ -13,17 +14,24 @@ class PriorityInferenceLock:
         self._live_waiters = 0
         self._deferred_waiters = 0
         self._live_burst = 0
+        self._live_queue = deque()
+        self._deferred_queue = deque()
 
     def __enter__(self):
         with self._condition:
+            token = object()
+            self._live_queue.append(token)
             self._live_waiters += 1
             try:
-                while self._active or (self._deferred_waiters and self._live_burst):
+                while (self._active or self._live_queue[0] is not token
+                       or (self._deferred_waiters and self._live_burst)):
                     self._condition.wait()
                 self._active = True
                 self._live_burst += 1
             finally:
+                self._live_queue.remove(token)
                 self._live_waiters -= 1
+                self._condition.notify_all()
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback):
@@ -32,16 +40,21 @@ class PriorityInferenceLock:
     @contextmanager
     def deferred(self):
         with self._condition:
+            token = object()
+            self._deferred_queue.append(token)
             if not self._deferred_waiters:
                 self._live_burst = 0
             self._deferred_waiters += 1
             try:
-                while self._active or (self._live_waiters and not self._live_burst):
+                while (self._active or self._deferred_queue[0] is not token
+                       or (self._live_waiters and not self._live_burst)):
                     self._condition.wait()
                 self._active = True
                 self._live_burst = 0
             finally:
+                self._deferred_queue.remove(token)
                 self._deferred_waiters -= 1
+                self._condition.notify_all()
         try:
             yield self
         finally:
